@@ -1,0 +1,22 @@
+[package]
+name = "lowbattery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+battery-core = { path = "../battery-core" }
+# No "gpu": wgpu/Vulkan costs far more RAM than CPU rendering for a small UI.
+creamui = { version = "0.3", default-features = false, features = ["platform-winit", "image"] }
+log = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+tray-icon = { version = "0.26", default-features = false }
+tauri-winrt-notification = "0.8"
+# Same version tauri-winrt-notification already pulls in; WinRT StartupTask for MSIX autostart.
+windows = { version = "0.62", features = ["ApplicationModel", "ApplicationModel_Activation", "Foundation", "Win32_System_WinRT"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Registry", "Win32_System_Threading", "Win32_Security", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_LibraryLoader"] }
+
+[build-dependencies]
+# Embeds assets/lowbattery.ico into the exe (windres on mingw, rc.exe on MSVC).
+embed-resource = "3"

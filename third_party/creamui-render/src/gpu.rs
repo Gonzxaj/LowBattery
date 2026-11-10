@@ -1,0 +1,3076 @@
+//! GPU rendering of a [`DisplayList`]: every primitive becomes one instance
+//! of a single signed-distance-field pipeline, glyphs come from a coverage
+//! atlas, and draw calls only split where the image texture changes.
+//! Pipelines, the atlas and image textures live in [`GpuShared`], reused by
+//! every renderer on the same device.
+
+use crate::display_list::{
+    Bounds, Damage, DisplayList, DrawItem, ImagePrimitive, LayerSpace, Primitive,
+};
+use crate::text::{GlyphBitmap, GlyphKey};
+use bytemuck::{Pod, Zeroable};
+use creamui_platform::PlatformWindow;
+use creamui_theme::Color;
+use rustc_hash::FxHashMap;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use wgpu::util::DeviceExt;
+
+mod fullscreen;
+mod retained;
+use retained::{present_retained, update_retained, RetainedFrame};
+
+const KIND_QUAD: u32 = 0;
+const KIND_LINE: u32 = 1;
+const KIND_GLYPH: u32 = 2;
+const KIND_IMAGE: u32 = 3;
+const KIND_GRADIENT_QUAD: u32 = 4;
+const KIND_RADIAL_GRADIENT_QUAD: u32 = 5;
+const KIND_REPEATING_RADIAL_GRADIENT_QUAD: u32 = 6;
+const KIND_BITS: u32 = 4;
+const CLIP_TEXELS_PER_ROW: u32 = 1024;
+const MIN_INSTANCE_UPLOAD_GAP: usize = 8;
+const MAX_INSTANCE_UPLOAD_RANGES: usize = 8;
+const INITIAL_ATLAS_SIZE: u32 = 1024;
+/// A full atlas is cleared and refilled at the same size, instead of grown,
+/// only once it has lived this long; otherwise a frame whose own text nearly
+/// fills it would re-upload every glyph each frame.
+const ATLAS_RESET_COOLDOWN_FRAMES: u64 = 60;
+const ATLAS_SHRINK_EVERY_FRAMES: u64 = 600;
+const IMAGE_CACHE_FRAMES: u64 = 300;
+const MIN_INSTANCE_CAPACITY: u64 = 256;
+const DAMAGE_BATCH_INSTANCES: u32 = 256;
+
+static NEXT_ATLAS_ID: AtomicU64 = AtomicU64::new(1);
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct Instance {
+    bounds: [f32; 4],
+    data: [f32; 4],
+    color: [u8; 4],
+    border_color: [u8; 4],
+    /// Corner radius, border or line width, and glyph shear.
+    shape: [f32; 3],
+    /// Primitive kind in the low `KIND_BITS`, clip table index above them.
+    tag: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct Globals {
+    viewport: [f32; 2],
+    _pad: [f32; 2],
+}
+
+fn rgba(color: Color) -> [u8; 4] {
+    [color.r, color.g, color.b, color.a]
+}
+
+fn union_bounds(first: Bounds, second: Bounds) -> Bounds {
+    if first.is_empty() {
+        return second;
+    }
+    if second.is_empty() {
+        return first;
+    }
+    Bounds::new(
+        first.x0.min(second.x0),
+        first.y0.min(second.y0),
+        first.x1.max(second.x1),
+        first.y1.max(second.y1),
+    )
+}
+
+/// Creates the process-wide `wgpu` instance. Enumerating backends is the
+/// slow part of GPU startup, so callers create it off the UI thread.
+pub fn create_instance() -> wgpu::Instance {
+    let flags = wgpu::InstanceFlags::default();
+    // Ranchu's Vulkan debug-name hook dereferences guest object handles.
+    #[cfg(target_os = "android")]
+    let flags = flags | wgpu::InstanceFlags::DISCARD_HAL_LABELS;
+    wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::PRIMARY,
+        flags,
+        ..Default::default()
+    })
+}
+
+/// The instance plus, when an adapter was found, the adapter, device and
+/// queue a process renders with, requested before any window exists.
+pub struct PreparedGpu {
+    instance: wgpu::Instance,
+    device: Option<(wgpu::Adapter, wgpu::Device, wgpu::Queue)>,
+}
+
+impl PreparedGpu {
+    pub fn instance_only() -> Self {
+        PreparedGpu {
+            instance: create_instance(),
+            device: None,
+        }
+    }
+
+    pub fn into_parts(self) -> (wgpu::Instance, Option<GpuContext>) {
+        let context = self
+            .device
+            .map(|(adapter, device, queue)| GpuContext::new(adapter, device, queue));
+        (self.instance, context)
+    }
+}
+
+/// Creates the instance and requests an adapter and device without a
+/// surface, so the slow driver work can run on another thread while the
+/// first window is created. A window whose surface the adapter cannot
+/// present to requests its own (see [`GpuSurface::new`]).
+pub fn prepare() -> PreparedGpu {
+    let instance = create_instance();
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::LowPower,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+    }));
+    let device = adapter.and_then(
+        |adapter| match pollster::block_on(request_device(&adapter)) {
+            Ok((device, queue)) => Some((adapter, device, queue)),
+            Err(err) => {
+                log::warn!("creamui-render: GPU device request failed: {err}");
+                None
+            }
+        },
+    );
+    PreparedGpu { instance, device }
+}
+
+fn user_cache_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    return std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    #[cfg(target_os = "macos")]
+    return std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Library/Caches"));
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    return std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")));
+}
+
+/// A driver pipeline cache persisted under the user's cache directory, so
+/// later runs skip most shader compilation when creating pipelines.
+struct PipelineCacheFile {
+    cache: wgpu::PipelineCache,
+    path: PathBuf,
+    saved_len: usize,
+}
+
+impl PipelineCacheFile {
+    fn open(adapter: &wgpu::Adapter, device: &wgpu::Device) -> Option<Self> {
+        if !device.features().contains(wgpu::Features::PIPELINE_CACHE) {
+            return None;
+        }
+        let key = wgpu::util::pipeline_cache_key(&adapter.get_info())?;
+        let path = user_cache_dir()?.join("creamui").join(key);
+        let data = std::fs::read(&path).ok();
+        // SAFETY: the file only ever holds `PipelineCache::get_data` output
+        // for this key, which names the adapter and driver; with `fallback`
+        // the driver's own header check turns anything else into an empty
+        // cache.
+        let cache = unsafe {
+            device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
+                label: Some("creamui-pipeline-cache"),
+                data: data.as_deref(),
+                fallback: true,
+            })
+        };
+        Some(PipelineCacheFile {
+            cache,
+            path,
+            saved_len: data.map_or(0, |data| data.len()),
+        })
+    }
+
+    fn save(&mut self) {
+        let Some(data) = self.cache.get_data() else {
+            return;
+        };
+        if data.len() == self.saved_len {
+            return;
+        }
+        let partial = self.path.with_extension("partial");
+        let result = self
+            .path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(&partial, &data))
+            .and_then(|()| std::fs::rename(&partial, &self.path));
+        match result {
+            Ok(()) => self.saved_len = data.len(),
+            Err(err) => log::debug!(
+                "creamui-render: not saving the pipeline cache at {:?}: {err}",
+                self.path
+            ),
+        }
+    }
+}
+
+struct Shelf {
+    y: u32,
+    height: u32,
+    x: u32,
+    used: u64,
+    slots: Vec<u32>,
+}
+
+struct AtlasSlot {
+    rect: [u32; 4],
+    used: u64,
+    key: Option<GlyphKey>,
+    shelf: usize,
+}
+
+/// Glyphs remember their slot (see [`GlyphBitmap::atlas_slot`]), so a
+/// frame finds them without hashing; `entries` only serves glyphs whose
+/// remembered slot belongs to another atlas.
+struct GlyphAtlas {
+    id: u64,
+    texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+    size: u32,
+    shelves: Vec<Shelf>,
+    slots: Vec<AtlasSlot>,
+    free_slots: Vec<u32>,
+    clear_scratch: Vec<u8>,
+    entries: FxHashMap<GlyphKey, u32>,
+    created: u64,
+}
+
+impl GlyphAtlas {
+    fn new(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+        size: u32,
+        frame: u64,
+    ) -> Self {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("creamui-glyph-atlas"),
+            size: wgpu::Extent3d {
+                width: size,
+                height: size,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("creamui-atlas"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+        });
+        GlyphAtlas {
+            id: NEXT_ATLAS_ID.fetch_add(1, Ordering::Relaxed),
+            texture,
+            bind_group,
+            size,
+            shelves: Vec::new(),
+            slots: Vec::new(),
+            free_slots: Vec::new(),
+            clear_scratch: Vec::new(),
+            entries: FxHashMap::default(),
+            created: frame,
+        }
+    }
+
+    fn allocate(&mut self, width: u32, height: u32) -> Option<([u32; 2], usize)> {
+        let (w, h) = (width + 1, height + 1);
+        if w > self.size || h > self.size {
+            return None;
+        }
+        if let Some((index, shelf)) = self
+            .shelves
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, s)| s.height >= h && s.height <= h + h / 2 && s.x + w <= self.size)
+            .min_by_key(|(_, s)| s.height)
+        {
+            let at = [shelf.x, shelf.y];
+            shelf.x += w;
+            return Some((at, index));
+        }
+        let y = self.shelves.last().map_or(0, |s| s.y + s.height);
+        if y + h > self.size {
+            return None;
+        }
+        let index = self.shelves.len();
+        self.shelves.push(Shelf {
+            y,
+            height: h,
+            x: w,
+            used: 0,
+            slots: Vec::new(),
+        });
+        Some(([0, y], index))
+    }
+
+    fn reclaim_shelf(
+        &mut self,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        frame: u64,
+    ) -> Option<([u32; 2], usize)> {
+        let (w, h) = (width + 1, height + 1);
+        if w > self.size || h > self.size {
+            return None;
+        }
+        let (index, shelf) = self
+            .shelves
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, shelf)| shelf.height >= h && shelf.used < frame.saturating_sub(1))
+            .min_by_key(|(_, shelf)| (shelf.used, shelf.height))?;
+        let evicted = shelf.slots.len();
+        for slot in shelf.slots.drain(..) {
+            if let Some(key) = self.slots[slot as usize].key.take() {
+                self.entries.remove(&key);
+            }
+            self.free_slots.push(slot);
+        }
+        // Linear filtering must see zero coverage in the reused glyph padding.
+        self.clear_scratch
+            .resize((self.size * shelf.height) as usize, 0);
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: shelf.y,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &self.clear_scratch,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(self.size),
+                rows_per_image: Some(shelf.height),
+            },
+            wgpu::Extent3d {
+                width: self.size,
+                height: shelf.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        #[cfg(feature = "perf-metrics")]
+        creamui_core::metrics::record(|m| m.gpu_upload_bytes += self.clear_scratch.len() as u64);
+        log::debug!(
+            "creamui-render: reclaimed glyph shelf {index}, {evicted} glyphs, {} bytes",
+            self.clear_scratch.len()
+        );
+        shelf.x = w;
+        shelf.used = frame;
+        Some(([0, shelf.y], index))
+    }
+
+    fn get_or_insert(
+        &mut self,
+        queue: &wgpu::Queue,
+        glyph: &GlyphBitmap,
+        frame: u64,
+    ) -> Option<[u32; 4]> {
+        let index = glyph
+            .atlas_slot
+            .get()
+            .and_then(|(atlas, index)| {
+                (atlas == self.id
+                    && self
+                        .slots
+                        .get(index as usize)
+                        .is_some_and(|slot| slot.key == Some(glyph.key)))
+                .then_some(index)
+            })
+            .or_else(|| self.entries.get(&glyph.key).copied());
+        if let Some(index) = index {
+            glyph.atlas_slot.set(Some((self.id, index)));
+            let slot = &mut self.slots[index as usize];
+            slot.used = frame;
+            self.shelves[slot.shelf].used = frame;
+            return Some(slot.rect);
+        }
+        let ([x, y], shelf) = self
+            .allocate(glyph.width, glyph.height)
+            .or_else(|| self.reclaim_shelf(queue, glyph.width, glyph.height, frame))?;
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &glyph.coverage,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(glyph.width),
+                rows_per_image: Some(glyph.height),
+            },
+            wgpu::Extent3d {
+                width: glyph.width,
+                height: glyph.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        #[cfg(feature = "perf-metrics")]
+        creamui_core::metrics::record(|m| m.gpu_upload_bytes += glyph.coverage.len() as u64);
+        let rect = [x, y, glyph.width, glyph.height];
+        let slot = AtlasSlot {
+            rect,
+            used: frame,
+            key: Some(glyph.key),
+            shelf,
+        };
+        let index = if let Some(index) = self.free_slots.pop() {
+            self.slots[index as usize] = slot;
+            index
+        } else {
+            let index = self.slots.len() as u32;
+            self.slots.push(slot);
+            index
+        };
+        self.shelves[shelf].slots.push(index);
+        self.shelves[shelf].used = frame;
+        self.entries.insert(glyph.key, index);
+        glyph.atlas_slot.set(Some((self.id, index)));
+        Some(rect)
+    }
+
+    fn has_stale_entries(&self, frame: u64) -> bool {
+        self.slots
+            .iter()
+            .any(|slot| slot.key.is_some() && slot.used < frame)
+    }
+
+    /// Texels (padding included) of the glyphs used since `since`.
+    fn live_area(&self, since: u64) -> u64 {
+        self.slots
+            .iter()
+            .filter(|slot| slot.key.is_some() && slot.used >= since)
+            .map(|slot| (slot.rect[2] as u64 + 1) * (slot.rect[3] as u64 + 1))
+            .sum()
+    }
+}
+
+struct ImageTexture {
+    bind_group: wgpu::BindGroup,
+    /// How many times the source was halved before upload.
+    level: u32,
+    used: u64,
+    /// Renderers whose latest frame draws this texture.
+    holders: u32,
+    /// Streaming frames (video) are evicted almost immediately once no
+    /// widget draws them; keeping 300 of them would waste gigabytes of VRAM.
+    transient: bool,
+}
+
+/// How many times a `width` x `height` image can be halved while staying at
+/// least as large as `shown`, and at most `max` texels on a side.
+fn downscale_level(width: u32, height: u32, shown: [f32; 2], max: u32) -> u32 {
+    let mut level = 0;
+    while level < 31 {
+        let (w, h) = (width >> level, height >> level);
+        let (half_w, half_h) = (w >> 1, h >> 1);
+        let too_large = w > max || h > max;
+        let half_fits =
+            half_w > 0 && half_h > 0 && half_w as f32 >= shown[0] && half_h as f32 >= shown[1];
+        if !too_large && !half_fits {
+            break;
+        }
+        level += 1;
+    }
+    level
+}
+
+/// Box-filters premultiplied RGBA8 pixels down to half size.
+fn halve(width: u32, height: u32, pixels: &[u8]) -> (u32, u32, Vec<u8>) {
+    let (w, h) = ((width / 2).max(1), (height / 2).max(1));
+    let (last_x, last_y) = (width as usize - 1, height as usize - 1);
+    let stride = width as usize * 4;
+    let mut out = Vec::with_capacity(w as usize * h as usize * 4);
+    for y in 0..h as usize {
+        let rows = [
+            (2 * y).min(last_y) * stride,
+            (2 * y + 1).min(last_y) * stride,
+        ];
+        for x in 0..w as usize {
+            let columns = [(2 * x).min(last_x) * 4, (2 * x + 1).min(last_x) * 4];
+            for channel in 0..4 {
+                let sum: u32 = rows
+                    .iter()
+                    .flat_map(|row| columns.iter().map(move |column| row + column + channel))
+                    .map(|index| pixels[index] as u32)
+                    .sum();
+                out.push(((sum + 2) / 4) as u8);
+            }
+        }
+    }
+    (w, h, out)
+}
+
+/// Device resources shared by every [`GpuRenderer`] on one device: the
+/// shader and pipelines, the glyph atlas and uploaded images.
+pub struct GpuShared {
+    device: Rc<wgpu::Device>,
+    queue: Rc<wgpu::Queue>,
+    shader: wgpu::ShaderModule,
+    pipeline_layout: wgpu::PipelineLayout,
+    globals_layout: wgpu::BindGroupLayout,
+    atlas_layout: wgpu::BindGroupLayout,
+    image_layout: wgpu::BindGroupLayout,
+    pipelines: Vec<(wgpu::TextureFormat, Rc<wgpu::RenderPipeline>)>,
+    sampler: wgpu::Sampler,
+    empty_image: wgpu::BindGroup,
+    atlas: GlyphAtlas,
+    images: HashMap<u64, ImageTexture>,
+    frame: u64,
+    pipeline_cache: Option<PipelineCacheFile>,
+    fullscreen: Option<fullscreen::Pipelines>,
+}
+
+impl GpuShared {
+    pub fn new(device: Rc<wgpu::Device>, queue: Rc<wgpu::Queue>) -> Rc<RefCell<Self>> {
+        Self::with_pipeline_cache(device, queue, None)
+    }
+
+    fn with_pipeline_cache(
+        device: Rc<wgpu::Device>,
+        queue: Rc<wgpu::Queue>,
+        pipeline_cache: Option<PipelineCacheFile>,
+    ) -> Rc<RefCell<Self>> {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("creamui-shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("gpu.wgsl").into()),
+        });
+        let unfilterable = wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        };
+        let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("creamui-globals"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: unfilterable,
+                    count: None,
+                },
+            ],
+        });
+        let atlas_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("creamui-atlas"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: unfilterable,
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let image_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("creamui-image"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("creamui-pipeline-layout"),
+            bind_group_layouts: &[&globals_layout, &atlas_layout, &image_layout],
+            push_constant_ranges: &[],
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("creamui-image-sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let atlas = GlyphAtlas::new(&device, &atlas_layout, &sampler, INITIAL_ATLAS_SIZE, 0);
+        let empty = upload_image(&device, &queue, 1, 1, &[0; 4], false);
+        let empty_image = image_group(&device, &image_layout, &empty);
+        Rc::new(RefCell::new(GpuShared {
+            device,
+            queue,
+            shader,
+            pipeline_layout,
+            globals_layout,
+            atlas_layout,
+            image_layout,
+            pipelines: Vec::new(),
+            sampler,
+            empty_image,
+            atlas,
+            images: HashMap::new(),
+            frame: 0,
+            pipeline_cache,
+            fullscreen: None,
+        }))
+    }
+
+    fn pipeline(&mut self, format: wgpu::TextureFormat) -> Rc<wgpu::RenderPipeline> {
+        if let Some((_, pipeline)) = self.pipelines.iter().find(|(f, _)| *f == format) {
+            return pipeline.clone();
+        }
+        let started = std::time::Instant::now();
+        let pipeline = Rc::new(self.device.create_render_pipeline(
+            &wgpu::RenderPipelineDescriptor {
+                label: Some("creamui-pipeline"),
+                layout: Some(&self.pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &self.shader,
+                    entry_point: "vs",
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<Instance>() as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &wgpu::vertex_attr_array![
+                            0 => Float32x4,
+                            1 => Float32x4,
+                            2 => Unorm8x4,
+                            3 => Unorm8x4,
+                            4 => Float32x3,
+                            5 => Uint32,
+                        ],
+                    }],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &self.shader,
+                    entry_point: "fs",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleStrip,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: self.pipeline_cache.as_ref().map(|file| &file.cache),
+            },
+        ));
+        log::debug!(
+            "creamui-render: {format:?} pipeline created in {:?}{}",
+            started.elapsed(),
+            if self.pipeline_cache.is_some() {
+                " with a pipeline cache"
+            } else {
+                ""
+            }
+        );
+        if let Some(file) = &mut self.pipeline_cache {
+            file.save();
+        }
+        self.pipelines.push((format, pipeline.clone()));
+        pipeline
+    }
+
+    fn begin_frame(&mut self) -> u64 {
+        self.frame += 1;
+        let frame = self.frame;
+        if frame.is_multiple_of(ATLAS_SHRINK_EVERY_FRAMES) && self.atlas.size > INITIAL_ATLAS_SIZE {
+            let half = self.atlas.size / 2;
+            let live = self
+                .atlas
+                .live_area(frame.saturating_sub(ATLAS_SHRINK_EVERY_FRAMES));
+            if live * 4 <= (half as u64).pow(2) {
+                self.recreate_atlas(half);
+            }
+        }
+        frame
+    }
+
+    fn recreate_atlas(&mut self, size: u32) {
+        log::debug!(
+            "creamui-render: glyph atlas {}px -> {size}px",
+            self.atlas.size
+        );
+        self.atlas = GlyphAtlas::new(
+            &self.device,
+            &self.atlas_layout,
+            &self.sampler,
+            size,
+            self.frame,
+        );
+    }
+
+    /// Frees atlas space after this frame's glyphs overflowed it: clears it
+    /// when older glyphs can go, grows it otherwise. Returns `false` when
+    /// neither is possible.
+    fn make_atlas_room(&mut self) -> bool {
+        let frame = self.frame;
+        if frame - self.atlas.created >= ATLAS_RESET_COOLDOWN_FRAMES
+            && self.atlas.has_stale_entries(frame)
+        {
+            self.recreate_atlas(self.atlas.size);
+            return true;
+        }
+        let max = self.device.limits().max_texture_dimension_2d;
+        if self.atlas.size >= max {
+            return false;
+        }
+        self.recreate_atlas((self.atlas.size * 2).min(max));
+        true
+    }
+
+    /// Makes sure `prim`'s image has a texture at least as large as it is
+    /// drawn, uploading a downscaled copy when the source is larger.
+    fn prepare_image(&mut self, prim: &ImagePrimitive, frame: u64) {
+        let image = &prim.image;
+        let level = downscale_level(
+            image.width(),
+            image.height(),
+            if prim.effects.quarter_turns.is_multiple_of(2) {
+                [prim.bounds.width(), prim.bounds.height()]
+            } else {
+                [prim.bounds.height(), prim.bounds.width()]
+            },
+            self.device.limits().max_texture_dimension_2d,
+        );
+        let holders = match self.images.get_mut(&image.id()) {
+            Some(texture) if texture.level <= level => {
+                texture.used = frame;
+                return;
+            }
+            Some(texture) => texture.holders,
+            None => 0,
+        };
+        let pixels = image.pixels();
+        let (mut width, mut height) = (image.width(), image.height());
+        let mut scaled: Option<Vec<u8>> = None;
+        for _ in 0..level {
+            let (w, h, out) = halve(width, height, scaled.as_deref().unwrap_or(&pixels));
+            (width, height, scaled) = (w, h, Some(out));
+        }
+        // Large non-reloadable images are streaming frames (video, canvas):
+        // each is uploaded once and evicted, so spending ~4x the pixel work
+        // on a CPU mip chain per frame stalls the renderer. One level is
+        // enough — they are drawn near their native size.
+        let single_level = !image.is_reloadable() && width as u64 * height as u64 >= 512 * 512;
+        let texture = upload_image(
+            &self.device,
+            &self.queue,
+            width,
+            height,
+            scaled.as_deref().unwrap_or(&pixels),
+            single_level,
+        );
+        drop(pixels);
+        let discarded = image.discard_pixels();
+        log::debug!(
+            "creamui-render: uploaded image {} ({}x{}) at {width}x{height} with {} mip levels{}",
+            image.id(),
+            image.width(),
+            image.height(),
+            u32::BITS - width.max(height).leading_zeros(),
+            if discarded {
+                ", CPU pixels discarded"
+            } else {
+                ""
+            }
+        );
+        self.images.insert(
+            image.id(),
+            ImageTexture {
+                bind_group: image_group(&self.device, &self.image_layout, &texture),
+                level,
+                used: frame,
+                holders,
+                transient: single_level,
+            },
+        );
+    }
+
+    fn evict_images(&mut self) {
+        let horizon = self.frame.saturating_sub(IMAGE_CACHE_FRAMES);
+        let transient_horizon = self.frame.saturating_sub(2);
+        self.images.retain(|_, texture| {
+            texture.holders > 0
+                || texture.used
+                    >= if texture.transient {
+                        transient_horizon
+                    } else {
+                        horizon
+                    }
+        });
+    }
+
+    fn release_images(&mut self, ids: &[u64]) {
+        for id in ids {
+            if let Some(texture) = self.images.get_mut(id) {
+                texture.holders = texture.holders.saturating_sub(1);
+            }
+        }
+    }
+}
+
+fn upload_image(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    single_level: bool,
+) -> wgpu::Texture {
+    let mip_count = if single_level {
+        1
+    } else {
+        u32::BITS - width.max(height).leading_zeros()
+    };
+    let mut mip_pixels = Vec::with_capacity(if single_level {
+        pixels.len()
+    } else {
+        pixels.len() * 4 / 3
+    });
+    mip_pixels.extend_from_slice(pixels);
+    let (mut mip_width, mut mip_height) = (width, height);
+    let mut previous = None;
+    while !single_level && (mip_width > 1 || mip_height > 1) {
+        let (next_width, next_height, next) =
+            halve(mip_width, mip_height, previous.as_deref().unwrap_or(pixels));
+        mip_pixels.extend_from_slice(&next);
+        (mip_width, mip_height, previous) = (next_width, next_height, Some(next));
+    }
+    #[cfg(feature = "perf-metrics")]
+    creamui_core::metrics::record(|m| m.gpu_upload_bytes += mip_pixels.len() as u64);
+    device.create_texture_with_data(
+        queue,
+        &wgpu::TextureDescriptor {
+            label: Some("creamui-image"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: mip_count,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        },
+        wgpu::util::TextureDataOrder::LayerMajor,
+        &mip_pixels,
+    )
+}
+
+fn image_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    texture: &wgpu::Texture,
+) -> wgpu::BindGroup {
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("creamui-image"),
+        layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::TextureView(&view),
+        }],
+    })
+}
+
+struct Batch {
+    image: Option<u64>,
+    instances: std::ops::Range<u32>,
+    bounds: Bounds,
+}
+
+/// Renders display lists into any color target of its format, holding only
+/// per-target state; everything else comes from its [`GpuShared`].
+pub struct GpuRenderer {
+    shared: Rc<RefCell<GpuShared>>,
+    device: Rc<wgpu::Device>,
+    queue: Rc<wgpu::Queue>,
+    format: wgpu::TextureFormat,
+    pipeline: Rc<wgpu::RenderPipeline>,
+    globals: wgpu::Buffer,
+    globals_group: wgpu::BindGroup,
+    clip_texture: wgpu::Texture,
+    clip_rows: u32,
+    clip_texels: Vec<[f32; 4]>,
+    rounded_texels: Vec<[f32; 4]>,
+    gradient_texels: Vec<[f32; 4]>,
+    gradient_instances: Vec<usize>,
+    uploaded_clips: Vec<[f32; 4]>,
+    clip_ids: FxHashMap<Vec<u32>, u32>,
+    last_clip: Option<(crate::display_list::Clip, u16, u32)>,
+    instances: Vec<Instance>,
+    /// What `instance_buffer` holds, to upload only what a frame changed.
+    uploaded: Vec<Instance>,
+    last_upload: Vec<std::ops::Range<usize>>,
+    viewport: [f32; 2],
+    batches: Vec<Batch>,
+    damage_batches: Vec<Batch>,
+    instance_buffer: wgpu::Buffer,
+    frame_images: Vec<u64>,
+    held_images: Vec<u64>,
+    clear_pass: Option<fullscreen::ClearPass>,
+}
+
+impl GpuRenderer {
+    pub fn new(shared: Rc<RefCell<GpuShared>>, format: wgpu::TextureFormat) -> Self {
+        let mut resources = shared.borrow_mut();
+        let pipeline = resources.pipeline(format);
+        let (device, queue) = (resources.device.clone(), resources.queue.clone());
+        let globals = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("creamui-globals"),
+            size: std::mem::size_of::<Globals>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let clip_texture = clip_texture(&device, 1);
+        let globals_group =
+            globals_group(&device, &resources.globals_layout, &globals, &clip_texture);
+        drop(resources);
+        let instance_buffer = instance_buffer(&device, MIN_INSTANCE_CAPACITY);
+        GpuRenderer {
+            shared,
+            device,
+            queue,
+            format,
+            pipeline,
+            globals,
+            globals_group,
+            clip_texture,
+            clip_rows: 1,
+            clip_texels: Vec::new(),
+            rounded_texels: Vec::new(),
+            gradient_texels: Vec::new(),
+            gradient_instances: Vec::new(),
+            uploaded_clips: Vec::new(),
+            clip_ids: FxHashMap::default(),
+            last_clip: None,
+            instances: Vec::new(),
+            uploaded: Vec::new(),
+            last_upload: Vec::new(),
+            viewport: [0.0; 2],
+            batches: Vec::new(),
+            damage_batches: Vec::new(),
+            instance_buffer,
+            frame_images: Vec::new(),
+            held_images: Vec::new(),
+            clear_pass: None,
+        }
+    }
+
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    pub fn format(&self) -> wgpu::TextureFormat {
+        self.format
+    }
+
+    /// Index of the item's screen clip and layer offset in the clip table.
+    fn clip_index(&mut self, item: &DrawItem, spaces: &[LayerSpace]) -> u32 {
+        match self.last_clip.as_ref() {
+            Some((last, layer, index)) if last == &item.clip && *layer == item.layer => {
+                return *index
+            }
+            _ => {}
+        }
+        let clip = item.screen_clip(spaces);
+        let [dx, dy] = spaces[item.layer as usize].offset;
+        let b = clip.bounds;
+        let mut key = vec![
+            b.x0.to_bits(),
+            b.y0.to_bits(),
+            b.x1.to_bits(),
+            b.y1.to_bits(),
+            dx.to_bits(),
+            dy.to_bits(),
+        ];
+        let mut rounded = Vec::new();
+        for clip in clip.rounded_clips() {
+            let bounds = clip.bounds;
+            let texels = [
+                [bounds.x0, bounds.y0, bounds.x1, bounds.y1],
+                [clip.radius.max(0.001), 0.0, 0.0, 0.0],
+            ];
+            key.extend(texels.iter().flatten().map(|value| value.to_bits()));
+            rounded.extend(texels);
+        }
+        let next = self.clip_ids.len() as u32;
+        let index = *self.clip_ids.entry(key).or_insert_with(|| {
+            self.clip_texels.extend([
+                [b.x0, b.y0, b.x1, b.y1],
+                [
+                    dx,
+                    dy,
+                    self.rounded_texels.len() as f32,
+                    (rounded.len() / 2) as f32,
+                ],
+            ]);
+            self.rounded_texels.extend(rounded);
+            next
+        });
+        self.last_clip = Some((item.clip.clone(), item.layer, index));
+        index
+    }
+
+    /// Builds this frame's instances. Returns `false` if the glyph atlas
+    /// overflowed and the frame must be rebuilt.
+    fn build(&mut self, list: &DisplayList, shared: &mut GpuShared, frame: u64) -> bool {
+        self.instances.clear();
+        self.batches.clear();
+        self.clip_texels.clear();
+        self.rounded_texels.clear();
+        self.gradient_texels.clear();
+        self.gradient_instances.clear();
+        self.clip_ids.clear();
+        self.last_clip = None;
+        self.frame_images.clear();
+        let spaces = list.spaces();
+        let mut batch_image: Option<u64> = None;
+        let mut batch_start = 0u32;
+        let mut batch_bounds = Bounds::EMPTY;
+        for item in &list.items {
+            let image = match &item.primitive {
+                Primitive::Image(image) => Some(image.image.id()),
+                _ => None,
+            };
+            if image != batch_image && self.instances.len() as u32 > batch_start {
+                self.batches.push(Batch {
+                    image: batch_image,
+                    instances: batch_start..self.instances.len() as u32,
+                    bounds: batch_bounds,
+                });
+                batch_start = self.instances.len() as u32;
+                batch_bounds = Bounds::EMPTY;
+            }
+            batch_image = image;
+            let bounds = item.visible_bounds(&spaces).inflate(1.0);
+            batch_bounds = union_bounds(batch_bounds, bounds);
+            let clip = self.clip_index(item, &spaces) << KIND_BITS;
+            match &item.primitive {
+                Primitive::Quad(quad) => {
+                    let mut shape = [quad.radius, quad.border_width, 0.0];
+                    let (kind, color, border_color, data) = match quad.gradient.as_ref() {
+                        Some(gradient) => {
+                            if gradient.radial {
+                                if let Some(stops) = gradient.stops.as_deref() {
+                                    let simple = stops.len() == 2
+                                        && stops[0].offset == 0.0
+                                        && stops[1].offset == 1.0;
+                                    if !simple {
+                                        shape[1] = self.gradient_texels.len() as f32;
+                                        shape[2] = stops.len() as f32;
+                                        self.gradient_instances.push(self.instances.len());
+                                        for stop in stops {
+                                            let color = stop.color;
+                                            let alpha = color.a as f32 / 255.0;
+                                            self.gradient_texels.push([stop.offset, 0.0, 0.0, 0.0]);
+                                            self.gradient_texels.push([
+                                                color.r as f32 / 255.0 * alpha,
+                                                color.g as f32 / 255.0 * alpha,
+                                                color.b as f32 / 255.0 * alpha,
+                                                alpha,
+                                            ]);
+                                        }
+                                    }
+                                }
+                            }
+                            (
+                                if gradient.radial {
+                                    if gradient.repeating {
+                                        KIND_REPEATING_RADIAL_GRADIENT_QUAD
+                                    } else {
+                                        KIND_RADIAL_GRADIENT_QUAD
+                                    }
+                                } else {
+                                    KIND_GRADIENT_QUAD
+                                },
+                                gradient.start_color,
+                                gradient.end_color,
+                                if gradient.radial {
+                                    [
+                                        gradient.start[0],
+                                        gradient.start[1],
+                                        gradient.end[0] - gradient.start[0],
+                                        gradient.end[1] - gradient.start[1],
+                                    ]
+                                } else {
+                                    [
+                                        gradient.start[0],
+                                        gradient.start[1],
+                                        gradient.end[0],
+                                        gradient.end[1],
+                                    ]
+                                },
+                            )
+                        }
+                        None => (KIND_QUAD, quad.background, quad.border_color, [0.0; 4]),
+                    };
+                    self.instances.push(Instance {
+                        bounds: [
+                            quad.bounds.x0,
+                            quad.bounds.y0,
+                            quad.bounds.x1,
+                            quad.bounds.y1,
+                        ],
+                        data,
+                        color: rgba(color),
+                        border_color: rgba(border_color),
+                        shape,
+                        tag: kind | clip,
+                    });
+                }
+                Primitive::Line(line) => {
+                    let b = item.primitive.bounds();
+                    self.instances.push(Instance {
+                        bounds: [b.x0, b.y0, b.x1, b.y1],
+                        data: [line.from[0], line.from[1], line.to[0], line.to[1]],
+                        color: rgba(line.color),
+                        shape: [0.0, line.width, 0.0],
+                        tag: KIND_LINE | clip,
+                        ..Zeroable::zeroed()
+                    });
+                }
+                Primitive::Text(run) => {
+                    let visible = item.primitive.bounds().intersect(item.clip.bounds);
+                    for glyph in &run.layout.glyphs {
+                        let (x, y) = ((run.x + glyph.x) as f32, (run.y + glyph.y) as f32);
+                        let (w, h) = (glyph.bitmap.width as f32, glyph.bitmap.height as f32);
+                        if x > visible.x1
+                            || x + w * (1.0 + run.shear_factor()) < visible.x0
+                            || y > visible.y1
+                            || y + h < visible.y0
+                        {
+                            continue;
+                        }
+                        let Some(rect) =
+                            shared
+                                .atlas
+                                .get_or_insert(&shared.queue, &glyph.bitmap, frame)
+                        else {
+                            return false;
+                        };
+                        self.instances.push(Instance {
+                            bounds: [x, y, x + w, y + h],
+                            data: rect.map(|v| v as f32),
+                            color: rgba(run.glyph_color(glyph.byte_offset)),
+                            shape: [0.0, 0.0, run.shear_factor()],
+                            tag: KIND_GLYPH | clip,
+                            ..Zeroable::zeroed()
+                        });
+                    }
+                }
+                Primitive::Image(prim) => {
+                    shared.prepare_image(prim, frame);
+                    self.frame_images.push(prim.image.id());
+                    let b = prim.bounds;
+                    let transformed = prim.effects.has_color_transform();
+                    let matrix_index = if transformed {
+                        let index = self.gradient_texels.len() as f32;
+                        self.gradient_texels.extend(prim.effects.color_matrix);
+                        self.gradient_instances.push(self.instances.len());
+                        index
+                    } else {
+                        0.0
+                    };
+                    self.instances.push(Instance {
+                        bounds: [b.x0, b.y0, b.x1, b.y1],
+                        color: prim.tint.map_or([0; 4], rgba),
+                        data: [
+                            prim.effects.quarter_turns as f32,
+                            u8::from(transformed) as f32,
+                            0.0,
+                            0.0,
+                        ],
+                        shape: [prim.opacity, matrix_index, 0.0],
+                        tag: KIND_IMAGE | clip,
+                        ..Zeroable::zeroed()
+                    });
+                }
+            }
+        }
+        if self.instances.len() as u32 > batch_start {
+            self.batches.push(Batch {
+                image: batch_image,
+                instances: batch_start..self.instances.len() as u32,
+                bounds: batch_bounds,
+            });
+        }
+        true
+    }
+
+    fn hold_frame_images(&mut self, shared: &mut GpuShared) {
+        self.frame_images.sort_unstable();
+        self.frame_images.dedup();
+        for id in &self.frame_images {
+            if let Some(texture) = shared.images.get_mut(id) {
+                texture.holders += 1;
+            }
+        }
+        shared.release_images(&self.held_images);
+        std::mem::swap(&mut self.held_images, &mut self.frame_images);
+    }
+
+    fn upload_clips(&mut self, shared: &GpuShared) {
+        let header_texels = self.clip_texels.len();
+        for header in self.clip_texels.chunks_exact_mut(2) {
+            header[1][2] += header_texels as f32;
+        }
+        let gradient_base = header_texels + self.rounded_texels.len();
+        for &index in &self.gradient_instances {
+            self.instances[index].shape[1] += gradient_base as f32;
+        }
+        self.clip_texels.append(&mut self.rounded_texels);
+        self.clip_texels.append(&mut self.gradient_texels);
+        let row_texels = CLIP_TEXELS_PER_ROW as usize;
+        let rows = (self.clip_texels.len() as u32)
+            .div_ceil(CLIP_TEXELS_PER_ROW)
+            .max(1);
+        self.clip_texels
+            .resize(rows as usize * row_texels, [0.0; 4]);
+        let grown = rows > self.clip_rows;
+        if grown {
+            self.clip_rows = rows.next_power_of_two();
+            self.clip_texture = clip_texture(&self.device, self.clip_rows);
+            self.globals_group = globals_group(
+                &self.device,
+                &shared.globals_layout,
+                &self.globals,
+                &self.clip_texture,
+            );
+        }
+        if !grown && self.clip_texels == self.uploaded_clips {
+            return;
+        }
+        self.queue.write_texture(
+            self.clip_texture.as_image_copy(),
+            bytemuck::cast_slice(&self.clip_texels),
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(row_texels as u32 * 16),
+                rows_per_image: Some(rows),
+            },
+            wgpu::Extent3d {
+                width: row_texels as u32,
+                height: rows,
+                depth_or_array_layers: 1,
+            },
+        );
+        std::mem::swap(&mut self.clip_texels, &mut self.uploaded_clips);
+    }
+
+    fn prepare(&mut self, list: &DisplayList, shared: &mut GpuShared) {
+        #[cfg(feature = "perf-metrics")]
+        let _span = tracing::info_span!("gpu_prepare").entered();
+        let frame = shared.begin_frame();
+        while !self.build(list, shared, frame) {
+            if !shared.make_atlas_room() {
+                log::warn!("creamui-render: glyph atlas cannot fit this frame's text");
+                break;
+            }
+        }
+        self.hold_frame_images(shared);
+        shared.evict_images();
+        self.upload_clips(shared);
+
+        let viewport = [list.width as f32, list.height as f32];
+        if viewport != self.viewport {
+            self.viewport = viewport;
+            self.queue.write_buffer(
+                &self.globals,
+                0,
+                bytemuck::bytes_of(&Globals {
+                    viewport,
+                    _pad: [0.0; 2],
+                }),
+            );
+        }
+        self.upload_instances();
+    }
+
+    fn upload_instances(&mut self) {
+        let needed = (self.instances.len() as u64)
+            .next_power_of_two()
+            .max(MIN_INSTANCE_CAPACITY);
+        let capacity = self.instance_buffer.size() / std::mem::size_of::<Instance>() as u64;
+        let reallocated = needed > capacity || capacity > needed * 4;
+        if reallocated {
+            self.instance_buffer = instance_buffer(&self.device, needed);
+        }
+        self.last_upload.clear();
+        if reallocated {
+            if !self.instances.is_empty() {
+                self.last_upload.push(0..self.instances.len());
+            }
+        } else {
+            let mut coalesced = false;
+            for (index, instance) in self.instances.iter().enumerate() {
+                let changed = self
+                    .uploaded
+                    .get(index)
+                    .is_none_or(|old| bytemuck::bytes_of(instance) != bytemuck::bytes_of(old));
+                if !changed {
+                    continue;
+                }
+                if let Some(range) = self.last_upload.last_mut() {
+                    if coalesced || index - range.end <= MIN_INSTANCE_UPLOAD_GAP {
+                        range.end = index + 1;
+                        continue;
+                    }
+                }
+                self.last_upload.push(index..index + 1);
+                if self.last_upload.len() > MAX_INSTANCE_UPLOAD_RANGES {
+                    let first = self.last_upload[0].start;
+                    self.last_upload.clear();
+                    self.last_upload.push(first..index + 1);
+                    coalesced = true;
+                }
+            }
+        }
+        for range in &self.last_upload {
+            let bytes = bytemuck::cast_slice(&self.instances[range.clone()]);
+            #[cfg(feature = "perf-metrics")]
+            creamui_core::metrics::record(|m| m.gpu_upload_bytes += bytes.len() as u64);
+            let offset = (range.start * std::mem::size_of::<Instance>()) as u64;
+            self.queue
+                .write_buffer(&self.instance_buffer, offset, bytes);
+        }
+        log::trace!(
+            "creamui-render: uploaded instance ranges {:?} of {}",
+            self.last_upload,
+            self.instances.len()
+        );
+        std::mem::swap(&mut self.instances, &mut self.uploaded);
+    }
+
+    fn build_damage_batches(&mut self) {
+        self.damage_batches.clear();
+        for batch in &self.batches {
+            let mut start = batch.instances.start;
+            while start < batch.instances.end {
+                let end = (start + DAMAGE_BATCH_INSTANCES).min(batch.instances.end);
+                let mut bounds = Bounds::EMPTY;
+                for instance in &self.uploaded[start as usize..end as usize] {
+                    let index = (instance.tag >> KIND_BITS) as usize * 2;
+                    let clip = self.uploaded_clips[index];
+                    let extra = self.uploaded_clips[index + 1];
+                    let glyph = instance.tag & ((1 << KIND_BITS) - 1) == KIND_GLYPH;
+                    let offset = if glyph {
+                        [extra[0].round(), extra[1].round()]
+                    } else {
+                        [extra[0], extra[1]]
+                    };
+                    let b = instance.bounds;
+                    let shear = if glyph {
+                        (b[3] - b[1]) * instance.shape[2]
+                    } else {
+                        0.0
+                    };
+                    let rect = Bounds::new(b[0], b[1], b[2] + shear, b[3])
+                        .translate(offset)
+                        .inflate(1.0)
+                        .intersect(Bounds::new(clip[0], clip[1], clip[2], clip[3]));
+                    bounds = union_bounds(bounds, rect);
+                }
+                self.damage_batches.push(Batch {
+                    image: batch.image,
+                    instances: start..end,
+                    bounds,
+                });
+                start = end;
+            }
+        }
+    }
+
+    /// Renders `list` into `target`, clearing it first.
+    pub fn render(&mut self, list: &DisplayList, target: &wgpu::TextureView) {
+        self.render_damage(list, target, &Damage::Full);
+    }
+
+    /// Pixels outside `damage` must already contain the preceding frame.
+    pub fn render_damage(
+        &mut self,
+        list: &DisplayList,
+        target: &wgpu::TextureView,
+        damage: &Damage,
+    ) {
+        let regions: Vec<_> = damage
+            .regions(list.viewport())
+            .into_iter()
+            .map(|region| region.round_out().intersect(list.viewport()))
+            .filter(|region| !region.is_empty())
+            .collect();
+        if regions.is_empty() {
+            return;
+        }
+        let full = matches!(damage, Damage::Full);
+        log::trace!(
+            "creamui-render: GPU redraw {} regions, {} pixels, full={full}",
+            regions.len(),
+            regions
+                .iter()
+                .map(|region| region.width() * region.height())
+                .sum::<f32>()
+        );
+        let shared = self.shared.clone();
+        let mut shared = shared.borrow_mut();
+        let shared = &mut *shared;
+        self.prepare(list, shared);
+        if !full {
+            self.build_damage_batches();
+            if self.clear_pass.is_none() {
+                let cache = shared.pipeline_cache.as_ref().map(|file| &file.cache);
+                let pipelines = shared
+                    .fullscreen
+                    .get_or_insert_with(|| fullscreen::Pipelines::new(&self.device));
+                self.clear_pass = Some(pipelines.clear(&self.device, self.format, cache));
+                if let Some(file) = &mut shared.pipeline_cache {
+                    file.save();
+                }
+            }
+            self.clear_pass
+                .as_mut()
+                .expect("partial rendering has a clear pass")
+                .set_color(&self.queue, list.clear);
+        }
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("creamui-frame"),
+            });
+        {
+            let clear = list.clear;
+            let a = clear.a as f64 / 255.0;
+            let load = if full {
+                wgpu::LoadOp::Clear(wgpu::Color {
+                    r: clear.r as f64 / 255.0 * a,
+                    g: clear.g as f64 / 255.0 * a,
+                    b: clear.b as f64 / 255.0 * a,
+                    a,
+                })
+            } else {
+                wgpu::LoadOp::Load
+            };
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("creamui-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            for region in regions {
+                let x = region.x0 as u32;
+                let y = region.y0 as u32;
+                let width = region.x1 as u32 - x;
+                let height = region.y1 as u32 - y;
+                pass.set_scissor_rect(x, y, width, height);
+                if !full {
+                    self.clear_pass
+                        .as_ref()
+                        .expect("partial rendering has a clear pass")
+                        .draw(&mut pass);
+                    #[cfg(feature = "perf-metrics")]
+                    creamui_core::metrics::record(|m| m.draw_calls += 1);
+                }
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &self.globals_group, &[]);
+                pass.set_bind_group(1, &shared.atlas.bind_group, &[]);
+                pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
+                let batches = if full {
+                    &self.batches
+                } else {
+                    &self.damage_batches
+                };
+                for batch in batches {
+                    if batch.bounds.intersect(region).is_empty() {
+                        continue;
+                    }
+                    let group = batch
+                        .image
+                        .and_then(|id| shared.images.get(&id))
+                        .map_or(&shared.empty_image, |texture| &texture.bind_group);
+                    pass.set_bind_group(2, group, &[]);
+                    pass.draw(0..4, batch.instances.clone());
+                    #[cfg(feature = "perf-metrics")]
+                    creamui_core::metrics::record(|m| {
+                        m.draw_calls += 1;
+                        m.gpu_instances_drawn += batch.instances.len() as u64;
+                    });
+                }
+                #[cfg(feature = "perf-metrics")]
+                creamui_core::metrics::record(|m| {
+                    m.gpu_pixels_redrawn += width as u64 * height as u64
+                });
+            }
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    pub fn instance_count(&self) -> usize {
+        self.uploaded.len()
+    }
+
+    pub fn batch_count(&self) -> usize {
+        self.batches.len()
+    }
+}
+
+impl Drop for GpuRenderer {
+    fn drop(&mut self) {
+        if let Ok(mut shared) = self.shared.try_borrow_mut() {
+            shared.release_images(&self.held_images);
+        }
+    }
+}
+
+fn instance_buffer(device: &wgpu::Device, capacity: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("creamui-instances"),
+        size: capacity * std::mem::size_of::<Instance>() as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+/// Clip data looked up by index from the shader.
+fn clip_texture(device: &wgpu::Device, rows: u32) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("creamui-clips"),
+        size: wgpu::Extent3d {
+            width: CLIP_TEXELS_PER_ROW,
+            height: rows,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba32Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    })
+}
+
+fn globals_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    globals: &wgpu::Buffer,
+    clips: &wgpu::Texture,
+) -> wgpu::BindGroup {
+    let view = clips.create_view(&wgpu::TextureViewDescriptor::default());
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("creamui-globals"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: globals.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+        ],
+    })
+}
+
+async fn request_device(
+    adapter: &wgpu::Adapter,
+) -> Result<(wgpu::Device, wgpu::Queue), wgpu::RequestDeviceError> {
+    adapter
+        .request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("creamui-device"),
+                required_features: adapter.features() & wgpu::Features::PIPELINE_CACHE,
+                required_limits: wgpu::Limits::downlevel_webgl2_defaults()
+                    .using_resolution(adapter.limits()),
+                memory_hints: wgpu::MemoryHints::MemoryUsage,
+            },
+            None,
+        )
+        .await
+}
+
+/// The adapter/device/queue negotiated for the first GPU window in a
+/// process, reused by every later one so only the first window pays for
+/// `request_adapter`/`request_device`.
+pub struct GpuContext {
+    adapter: wgpu::Adapter,
+    device: Rc<wgpu::Device>,
+    shared: Rc<RefCell<GpuShared>>,
+    adapter_name: String,
+}
+
+impl GpuContext {
+    fn request(
+        instance: &wgpu::Instance,
+        compatible_surface: &wgpu::Surface<'static>,
+    ) -> Result<Self, String> {
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: Some(compatible_surface),
+            force_fallback_adapter: false,
+        }))
+        .ok_or("no compatible GPU adapter")?;
+        let (device, queue) =
+            pollster::block_on(request_device(&adapter)).map_err(|e| format!("device: {e}"))?;
+        Ok(Self::new(adapter, device, queue))
+    }
+
+    fn new(adapter: wgpu::Adapter, device: wgpu::Device, queue: wgpu::Queue) -> Self {
+        device.on_uncaptured_error(Box::new(|err| {
+            log::error!("creamui-render: wgpu error: {err}");
+        }));
+        let info = adapter.get_info();
+        let pipeline_cache = PipelineCacheFile::open(&adapter, &device);
+        let (device, queue) = (Rc::new(device), Rc::new(queue));
+        GpuContext {
+            shared: GpuShared::with_pipeline_cache(device.clone(), queue, pipeline_cache),
+            adapter,
+            device,
+            adapter_name: format!("{} ({:?})", info.name, info.backend),
+        }
+    }
+}
+
+/// A window surface presented through [`GpuRenderer`].
+pub struct GpuSurface {
+    renderer: GpuRenderer,
+    surface: wgpu::Surface<'static>,
+    config: wgpu::SurfaceConfiguration,
+    view_format: wgpu::TextureFormat,
+    adapter_name: String,
+    retained: Option<RetainedFrame>,
+}
+
+impl GpuSurface {
+    /// `gpu_context` is reused when its adapter can present to this window
+    /// and otherwise replaced by one requested for this window's surface,
+    /// so usually only the first GPU window in a process (or [`prepare`])
+    /// pays for `request_adapter`/`request_device`.
+    pub fn new(
+        window: Arc<dyn PlatformWindow>,
+        instance: &wgpu::Instance,
+        transparent: bool,
+        gpu_context: &mut Option<GpuContext>,
+    ) -> Result<Self, String> {
+        let t0 = std::time::Instant::now();
+        let size = window.inner_size();
+        let surface = instance
+            .create_surface(window)
+            .map_err(|e| format!("surface: {e}"))?;
+        if let Some(context) = gpu_context {
+            if !context.adapter.is_surface_supported(&surface) {
+                log::warn!(
+                    "creamui-render: {} cannot present to this window; requesting another adapter",
+                    context.adapter_name
+                );
+                *gpu_context = None;
+            }
+        }
+        if gpu_context.is_none() {
+            *gpu_context = Some(GpuContext::request(instance, &surface)?);
+        }
+        let context = gpu_context.as_ref().expect("just initialized above");
+        let (adapter, device) = (&context.adapter, &context.device);
+
+        let caps = surface.get_capabilities(adapter);
+        let format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| !f.is_srgb())
+            .or_else(|| caps.formats.first().copied())
+            .ok_or("surface reports no formats")?;
+        let view_format = format.remove_srgb_suffix();
+        let alpha_mode = if transparent {
+            [
+                wgpu::CompositeAlphaMode::PreMultiplied,
+                wgpu::CompositeAlphaMode::Inherit,
+                wgpu::CompositeAlphaMode::PostMultiplied,
+            ]
+            .into_iter()
+            .find(|mode| caps.alpha_modes.contains(mode))
+            .unwrap_or(caps.alpha_modes[0])
+        } else {
+            [wgpu::CompositeAlphaMode::Opaque]
+                .into_iter()
+                .find(|mode| caps.alpha_modes.contains(mode))
+                .unwrap_or(caps.alpha_modes[0])
+        };
+        let copy_usage = caps.usages & wgpu::TextureUsages::COPY_DST;
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | copy_usage,
+            format,
+            width: size.width.max(1),
+            height: size.height.max(1),
+            present_mode: wgpu::PresentMode::Fifo,
+            alpha_mode,
+            view_formats: if view_format == format {
+                vec![]
+            } else {
+                vec![view_format]
+            },
+            desired_maximum_frame_latency: 1,
+        };
+        surface.configure(device, &config);
+        let renderer = GpuRenderer::new(context.shared.clone(), view_format);
+        log::debug!(
+            "creamui-render: GPU surface ready on {} as {format:?}/{alpha_mode:?}, copy={}, in {:?}",
+            context.adapter_name,
+            !copy_usage.is_empty(),
+            t0.elapsed()
+        );
+        Ok(GpuSurface {
+            renderer,
+            surface,
+            config,
+            view_format,
+            adapter_name: context.adapter_name.clone(),
+            retained: None,
+        })
+    }
+
+    pub fn adapter_name(&self) -> &str {
+        &self.adapter_name
+    }
+
+    /// Draws and presents `list`. Returns `false` when the surface was not
+    /// ready and the frame must be retried.
+    pub fn present(&mut self, list: &DisplayList, damage: &Damage) -> bool {
+        if (list.width, list.height) != (self.config.width, self.config.height) {
+            self.config.width = list.width;
+            self.config.height = list.height;
+            self.surface.configure(self.renderer.device(), &self.config);
+        }
+        let frame = match self.surface.get_current_texture() {
+            Ok(frame) => frame,
+            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                self.surface.configure(self.renderer.device(), &self.config);
+                return false;
+            }
+            Err(err) => {
+                log::warn!("creamui-render: failed to acquire surface texture: {err}");
+                return false;
+            }
+        };
+        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(self.view_format),
+            ..Default::default()
+        });
+        let retained = update_retained(
+            &mut self.retained,
+            &mut self.renderer,
+            list,
+            damage,
+            self.config.format,
+        );
+        present_retained(
+            &self.renderer,
+            retained,
+            &frame.texture,
+            &view,
+            self.config.usage.contains(wgpu::TextureUsages::COPY_DST),
+        );
+        #[cfg(feature = "perf-metrics")]
+        let _span = tracing::info_span!("present").entered();
+        frame.present();
+        true
+    }
+}
+
+/// Offscreen rendering with pixel readback, for tests, benchmarks and
+/// frame dumps without a window.
+pub struct HeadlessGpu {
+    renderer: GpuRenderer,
+    adapter_name: String,
+    retained: Option<RetainedFrame>,
+}
+
+impl HeadlessGpu {
+    /// Uses the first available adapter; `CUI_GPU_FALLBACK=1` forces a
+    /// software adapter such as llvmpipe.
+    pub fn new() -> Result<Self, String> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            ..Default::default()
+        });
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: None,
+            force_fallback_adapter: std::env::var("CUI_GPU_FALLBACK").as_deref() == Ok("1"),
+        }))
+        .ok_or("no GPU adapter")?;
+        let info = adapter.get_info();
+        let (device, queue) =
+            pollster::block_on(request_device(&adapter)).map_err(|e| format!("device: {e}"))?;
+        let shared = GpuShared::new(Rc::new(device), Rc::new(queue));
+        Ok(HeadlessGpu {
+            renderer: GpuRenderer::new(shared, wgpu::TextureFormat::Rgba8Unorm),
+            adapter_name: format!("{} ({:?})", info.name, info.backend),
+            retained: None,
+        })
+    }
+
+    pub fn adapter_name(&self) -> &str {
+        &self.adapter_name
+    }
+
+    pub fn renderer(&self) -> &GpuRenderer {
+        &self.renderer
+    }
+
+    /// Renders `list` and waits for the GPU to finish.
+    pub fn render(&mut self, list: &DisplayList) -> wgpu::Texture {
+        let texture = self
+            .renderer
+            .device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("creamui-headless"),
+                size: wgpu::Extent3d {
+                    width: list.width,
+                    height: list.height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.renderer.render(list, &view);
+        self.renderer.device.poll(wgpu::Maintain::Wait);
+        texture
+    }
+
+    /// Preserves pixels outside `damage`; allocation or resizing forces a full draw.
+    pub fn render_damage(&mut self, list: &DisplayList, damage: &Damage) -> &wgpu::Texture {
+        let format = self.renderer.format;
+        &update_retained(&mut self.retained, &mut self.renderer, list, damage, format).texture
+    }
+
+    pub fn render_damage_to_pixels(&mut self, list: &DisplayList, damage: &Damage) -> Vec<u8> {
+        self.render_damage(list, damage);
+        read_pixels(
+            &self.renderer,
+            &self
+                .retained
+                .as_ref()
+                .expect("retained frame is allocated")
+                .texture,
+        )
+    }
+
+    /// Renders `list` and reads back premultiplied RGBA8 pixels.
+    pub fn render_to_pixels(&mut self, list: &DisplayList) -> Vec<u8> {
+        let texture = self.render(list);
+        read_pixels(&self.renderer, &texture)
+    }
+}
+
+fn read_pixels(renderer: &GpuRenderer, texture: &wgpu::Texture) -> Vec<u8> {
+    let (width, height) = (texture.width(), texture.height());
+    let padded = (width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+    let device = &renderer.device;
+    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("creamui-readback"),
+        contents: &vec![0; (padded * height) as usize],
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("creamui-readback"),
+    });
+    encoder.copy_texture_to_buffer(
+        texture.as_image_copy(),
+        wgpu::ImageCopyBuffer {
+            buffer: &buffer,
+            layout: wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(padded),
+                rows_per_image: Some(height),
+            },
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    renderer.queue.submit(std::iter::once(encoder.finish()));
+    let slice = buffer.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |result| {
+        if let Err(err) = result {
+            log::error!("creamui-render: readback failed: {err}");
+        }
+    });
+    device.poll(wgpu::Maintain::Wait);
+    let mapped = slice.get_mapped_range();
+    let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+    for row in mapped.chunks_exact(padded as usize) {
+        pixels.extend_from_slice(&row[..(width * 4) as usize]);
+    }
+    pixels
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::display_list::Damage;
+    use crate::raster::Rasterizer;
+    use crate::recorder::SceneRecorder;
+    use creamui_core::{Painter, Point, Rect, ResolvedRadialColorStop, RgbaImage, TextAlign};
+    use creamui_theme::ColorScheme;
+    use std::ops::{Deref, DerefMut};
+    use std::sync::{Mutex, MutexGuard};
+
+    static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct TestGpu {
+        gpu: HeadlessGpu,
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl Deref for TestGpu {
+        type Target = HeadlessGpu;
+
+        fn deref(&self) -> &Self::Target {
+            &self.gpu
+        }
+    }
+
+    impl DerefMut for TestGpu {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.gpu
+        }
+    }
+
+    fn headless() -> Option<TestGpu> {
+        let guard = GPU_TEST_LOCK.lock().unwrap();
+        match HeadlessGpu::new() {
+            Ok(gpu) => Some(TestGpu { gpu, _guard: guard }),
+            Err(err) => {
+                eprintln!("skipping GPU test: {err}");
+                None
+            }
+        }
+    }
+
+    fn rect(x: f32, y: f32, w: f32, h: f32) -> Rect {
+        Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+        }
+    }
+
+    fn scene() -> DisplayList {
+        let mut r = SceneRecorder::new();
+        r.begin(96, 64, 1.0, Color::rgb(20, 20, 24), ColorScheme::default());
+        r.fill_rect(rect(4.0, 4.0, 40.0, 24.0), Color::rgb(200, 40, 40), 6.0);
+        r.stroke_rect(
+            rect(50.0, 4.0, 40.0, 24.0),
+            Color::rgb(40, 200, 40),
+            2.0,
+            4.0,
+        );
+        r.stroke_line(
+            Point { x: 4.0, y: 40.0 },
+            Point { x: 90.0, y: 40.0 },
+            Color::rgb(40, 40, 200),
+            3.0,
+        );
+        r.push_clip_rounded(rect(4.0, 44.0, 40.0, 16.0), 8.0);
+        r.fill_rect(rect(0.0, 40.0, 60.0, 30.0), Color::rgb(250, 250, 250), 0.0);
+        r.pop_clip();
+        r.fill_text(
+            rect(50.0, 44.0, 44.0, 16.0),
+            "Ab",
+            Color::rgb(255, 255, 0),
+            13.0,
+            TextAlign::Start,
+        );
+        let image = RgbaImage::new(2, 1, vec![255, 0, 0, 255, 0, 0, 255, 255]).unwrap();
+        r.draw_image(rect(70.0, 30.0, 20.0, 4.0), &image, None);
+        r.finish()
+    }
+
+    #[test]
+    fn gpu_output_matches_the_cpu_rasterizer() {
+        let Some(mut gpu) = headless() else { return };
+        let list = scene();
+        let gpu_pixels = gpu.render_to_pixels(&list);
+        let mut cpu = Rasterizer::new(list.width, list.height);
+        cpu.render(&list, &Damage::Full);
+        let cpu_pixels = cpu.pixmap().data();
+        let mut worst = 0u8;
+        let mut differing = 0usize;
+        for (g, c) in gpu_pixels.chunks_exact(4).zip(cpu_pixels.chunks_exact(4)) {
+            let diff = g.iter().zip(c).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+            worst = worst.max(diff);
+            if diff > 48 {
+                differing += 1;
+            }
+        }
+        let total = gpu_pixels.len() / 4;
+        assert!(
+            differing * 50 < total,
+            "{differing} of {total} pixels differ noticeably (worst {worst}) on {}",
+            gpu.adapter_name()
+        );
+        assert_eq!(&gpu_pixels[..4], &[20, 20, 24, 255]);
+        let center = (16 * 96 + 24) * 4;
+        assert_eq!(&gpu_pixels[center..center + 4], &[200, 40, 40, 255]);
+    }
+
+    #[test]
+    fn image_color_matrices_and_quarter_turns_match_cpu_without_reuploading() {
+        let Some(mut gpu) = headless() else { return };
+        let image = RgbaImage::new(
+            2,
+            2,
+            vec![
+                128, 0, 0, 128, 0, 255, 0, 255, 0, 0, 255, 255, 100, 50, 25, 128,
+            ],
+        )
+        .unwrap();
+        let matrices = [
+            creamui_core::ImageEffects::default().color_matrix,
+            [
+                [-1.0, 0.0, 0.0, 1.0],
+                [0.0, -1.0, 0.0, 1.0],
+                [0.0, 0.0, -1.0, 1.0],
+            ],
+            [[0.2126, 0.7152, 0.0722, 0.0]; 3],
+            [
+                [1.2, 0.0, 0.0, -0.1],
+                [0.0, 0.8, 0.0, 0.1],
+                [0.0, 0.0, 1.3, 0.0],
+            ],
+        ];
+        let mut cached = None;
+        for matrix in matrices {
+            for quarter_turns in 0..4 {
+                let mut recorder = SceneRecorder::new();
+                recorder.begin(48, 40, 1.0, Color::rgb(20, 30, 40), ColorScheme::default());
+                recorder.push_clip_rounded(rect(5.0, 4.0, 38.0, 32.0), 4.0);
+                recorder.draw_image_effects(
+                    rect(-8.0, -4.0, 64.0, 48.0),
+                    &image,
+                    None,
+                    0.75,
+                    creamui_core::ImageEffects {
+                        quarter_turns,
+                        color_matrix: matrix,
+                    },
+                );
+                recorder.pop_clip();
+                let list = recorder.finish();
+                let output = gpu.render_to_pixels(&list);
+                let mut cpu = Rasterizer::new(48, 40);
+                cpu.render(&list, &Damage::Full);
+                let mut worst = 0;
+                for y in 8..32 {
+                    for x in 8..40 {
+                        let offset = (y * 48 + x) * 4;
+                        for channel in 0..4 {
+                            worst = worst.max(
+                                output[offset + channel]
+                                    .abs_diff(cpu.pixmap().data()[offset + channel]),
+                            );
+                        }
+                    }
+                }
+                assert!(
+                    worst <= 5,
+                    "turns={quarter_turns}, matrix={matrix:?}, difference={worst}"
+                );
+                let shared = gpu.renderer().shared.borrow();
+                assert_eq!(shared.images.len(), 1);
+                let binding = &shared.images[&image.id()].bind_group as *const _ as usize;
+                if let Some(previous) = cached {
+                    assert_eq!(binding, previous);
+                }
+                cached = Some(binding);
+            }
+        }
+    }
+
+    #[test]
+    fn clipped_translucent_images_match_cpu() {
+        let Some(mut gpu) = headless() else { return };
+        let image = RgbaImage::new(2, 1, vec![255, 0, 0, 255, 0, 0, 255, 255]).unwrap();
+        let mut recorder = SceneRecorder::new();
+        recorder.begin(32, 32, 1.0, Color::rgb(0, 0, 0), ColorScheme::default());
+        recorder.push_clip(rect(4.0, 4.0, 24.0, 24.0));
+        recorder.draw_image_opacity(rect(-8.0, 4.0, 48.0, 24.0), &image, None, 0.5);
+        recorder.pop_clip();
+        let list = recorder.finish();
+        let gpu_pixels = gpu.render_to_pixels(&list);
+        let mut cpu = Rasterizer::new(32, 32);
+        cpu.render(&list, &Damage::Full);
+        for (x, y) in [(0, 16), (8, 16), (24, 16), (31, 16)] {
+            let offset = ((y * 32 + x) * 4) as usize;
+            for channel in 0..4 {
+                let gpu = gpu_pixels[offset + channel];
+                let cpu = cpu.pixmap().data()[offset + channel];
+                assert!(
+                    gpu.abs_diff(cpu) <= 4,
+                    "pixel ({x}, {y}) channel {channel}: {gpu} vs {cpu}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn radial_gradients_match_cpu_with_alpha_scale_and_scroll() {
+        let Some(mut gpu) = headless() else { return };
+        for (end_alpha, radii, repeating) in [
+            (255, [24.0, 24.0], false),
+            (40, [24.0, 9.0], false),
+            (0, [24.0, 9.0], false),
+            (40, [24.0, 9.0], true),
+        ] {
+            let mut recorder = SceneRecorder::new();
+            recorder.begin(96, 64, 2.0, Color::rgba(0, 0, 0, 0), ColorScheme::default());
+            recorder.push_scroll_layer(rect(4.0, 4.0, 40.0, 24.0), 0.0, Point { x: 0.0, y: 5.0 });
+            recorder.fill_radial_gradient_ellipse_repeating(
+                rect(4.0, -1.0, 40.0, 36.0),
+                Color::rgb(255, 30, 0),
+                Color::rgba(0, 60, 255, end_alpha),
+                Point { x: 16.0, y: 12.0 },
+                radii,
+                repeating,
+                0.0,
+            );
+            recorder.pop_clip();
+            let list = recorder.finish();
+            let gpu_pixels = gpu.render_to_pixels(&list);
+            let mut cpu = Rasterizer::new(list.width, list.height);
+            cpu.render(&list, &Damage::Full);
+            let worst = gpu_pixels
+                .iter()
+                .zip(cpu.pixmap().data())
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap();
+            assert!(
+                worst <= 3,
+                "alpha={end_alpha}, radii={radii:?}, repeating={repeating}: worst channel difference {worst} on {}",
+                gpu.adapter_name()
+            );
+        }
+    }
+
+    #[test]
+    fn radial_multistop_gradients_match_cpu() {
+        let Some(mut gpu) = headless() else { return };
+        let stops = [
+            ResolvedRadialColorStop {
+                offset: 0.1,
+                color: Color::rgb(255, 0, 0),
+            },
+            ResolvedRadialColorStop {
+                offset: 0.35,
+                color: Color::rgba(0, 255, 0, 120),
+            },
+            ResolvedRadialColorStop {
+                offset: 0.6,
+                color: Color::rgba(0, 0, 255, 0),
+            },
+        ];
+        for repeating in [false, true] {
+            let mut recorder = SceneRecorder::new();
+            recorder.begin(96, 64, 1.0, Color::rgba(0, 0, 0, 0), ColorScheme::default());
+            recorder.fill_radial_gradient_stops(
+                rect(0.0, 0.0, 96.0, 64.0),
+                &stops,
+                Point { x: 12.5, y: 31.5 },
+                [24.0, 12.0],
+                repeating,
+                8.0,
+            );
+            let list = recorder.finish();
+            let gpu_pixels = gpu.render_to_pixels(&list);
+            let mut cpu = Rasterizer::new(list.width, list.height);
+            cpu.render(&list, &Damage::Full);
+            let worst = gpu_pixels
+                .iter()
+                .zip(cpu.pixmap().data())
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap();
+            assert!(
+                worst <= 3,
+                "repeating={repeating}: worst channel difference {worst} on {}",
+                gpu.adapter_name()
+            );
+        }
+    }
+
+    #[test]
+    fn linear_gradients_match_cpu_with_alpha_scale_and_scroll() {
+        let Some(mut gpu) = headless() else { return };
+        for end_alpha in [255, 40, 0] {
+            let mut recorder = SceneRecorder::new();
+            recorder.begin(96, 64, 2.0, Color::rgba(0, 0, 0, 0), ColorScheme::default());
+            recorder.push_scroll_layer(rect(4.0, 4.0, 40.0, 24.0), 0.0, Point { x: 0.0, y: 5.0 });
+            recorder.fill_linear_gradient(
+                rect(4.0, -1.0, 40.0, 36.0),
+                Color::rgb(255, 30, 0),
+                Color::rgba(0, 60, 255, end_alpha),
+                90.0,
+                0.0,
+            );
+            recorder.pop_clip();
+            let list = recorder.finish();
+            let gpu_pixels = gpu.render_to_pixels(&list);
+            let mut cpu = Rasterizer::new(list.width, list.height);
+            cpu.render(&list, &Damage::Full);
+            let worst = gpu_pixels
+                .iter()
+                .zip(cpu.pixmap().data())
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap();
+            assert!(
+                worst <= 3,
+                "alpha={end_alpha}: worst channel difference {worst} on {}",
+                gpu.adapter_name()
+            );
+        }
+    }
+
+    #[test]
+    fn scroll_layers_match_the_cpu_rasterizer() {
+        let Some(mut gpu) = headless() else { return };
+        let mut r = SceneRecorder::new();
+        r.begin(96, 64, 1.0, Color::rgb(20, 20, 24), ColorScheme::default());
+        r.fill_rect(rect(0.0, 0.0, 96.0, 64.0), Color::rgb(230, 230, 230), 0.0);
+        let offset = 13.0;
+        r.push_scroll_layer(
+            rect(8.0, 8.0, 80.0, 48.0),
+            6.0,
+            creamui_core::Point { x: 0.0, y: offset },
+        );
+        for i in 0..6 {
+            let y = 8.0 + i as f32 * 12.0 - offset;
+            r.fill_rect(rect(10.0, y, 70.0, 10.0), Color::rgb(40, 80, 200), 3.0);
+            r.stroke_line(
+                Point {
+                    x: 12.0,
+                    y: y + 5.0,
+                },
+                Point {
+                    x: 70.0,
+                    y: y + 5.0,
+                },
+                Color::rgb(250, 200, 0),
+                2.0,
+            );
+        }
+        r.pop_scroll_layer();
+        let list = r.finish();
+        let gpu_pixels = gpu.render_to_pixels(&list);
+        let mut cpu = Rasterizer::new(list.width, list.height);
+        cpu.render(&list, &Damage::Full);
+        let differing = gpu_pixels
+            .chunks_exact(4)
+            .zip(cpu.pixmap().data().chunks_exact(4))
+            .filter(|(g, c)| g.iter().zip(*c).any(|(a, b)| a.abs_diff(*b) > 48))
+            .count();
+        assert!(
+            differing * 50 < gpu_pixels.len() / 4,
+            "{differing} pixels differ"
+        );
+        let row = ((8.0 + 12.0 - offset + 2.0) as usize * 96 + 40) * 4;
+        assert_eq!(&gpu_pixels[row..row + 4], &[40, 80, 200, 255]);
+    }
+
+    #[test]
+    fn nested_rounded_clips_and_scroll_layers_keep_outer_corners() {
+        let Some(mut gpu) = headless() else { return };
+        for (scroll, outer_radius, inner_radius) in
+            [(false, 20.0, 3.0), (false, 3.0, 20.0), (true, 20.0, 3.0)]
+        {
+            let mut recorder = SceneRecorder::new();
+            recorder.begin(64, 64, 1.0, Color::rgb(10, 20, 30), ColorScheme::default());
+            recorder.push_clip_rounded(rect(1.0, 1.0, 60.0, 60.0), outer_radius);
+            if scroll {
+                recorder.push_scroll_layer(
+                    rect(1.0, 1.0, 60.0, 60.0),
+                    inner_radius,
+                    Point { x: 10.0, y: 0.0 },
+                );
+            } else {
+                recorder.push_clip_rounded(rect(1.0, 1.0, 60.0, 60.0), inner_radius);
+            }
+            recorder.fill_rect(
+                rect(if scroll { 10.0 } else { 0.0 }, 0.0, 64.0, 64.0),
+                Color::rgb(255, 0, 0),
+                0.0,
+            );
+            recorder.pop_clip();
+            recorder.pop_clip();
+            let list = recorder.finish();
+            let gpu_pixels = gpu.render_to_pixels(&list);
+            let mut cpu = Rasterizer::new(64, 64);
+            cpu.render(&list, &Damage::Full);
+            for (x, y, expected) in [(3, 3, [10, 20, 30, 255]), (30, 30, [255, 0, 0, 255])] {
+                let offset = (y * 64 + x) * 4;
+                assert_eq!(&gpu_pixels[offset..offset + 4], &expected);
+                assert_eq!(&cpu.pixmap().data()[offset..offset + 4], &expected);
+            }
+        }
+    }
+
+    #[test]
+    fn batches_only_split_on_images() {
+        let Some(mut gpu) = headless() else { return };
+        gpu.render(&scene());
+        assert_eq!(gpu.renderer().batch_count(), 2);
+        assert!(gpu.renderer().instance_count() >= 7);
+    }
+
+    #[test]
+    fn atlas_overflow_within_one_frame_grows_the_atlas() {
+        let Some(mut gpu) = headless() else { return };
+        let mut r = SceneRecorder::new();
+        r.begin(2048, 2048, 1.0, Color::rgb(0, 0, 0), ColorScheme::default());
+        let text: String = ('!'..='~').collect();
+        for size in [100.0, 200.0] {
+            r.fill_text(
+                rect(0.0, 0.0, 2048.0, 2048.0),
+                &text,
+                Color::rgb(255, 255, 255),
+                size,
+                TextAlign::Start,
+            );
+        }
+        let list = r.finish();
+        gpu.render(&list);
+        assert!(gpu.renderer().shared.borrow().atlas.size > INITIAL_ATLAS_SIZE);
+    }
+
+    fn bitmap(glyph: u16, size: u32) -> GlyphBitmap {
+        GlyphBitmap {
+            key: GlyphKey {
+                face: 0,
+                glyph,
+                px: 0,
+            },
+            width: size,
+            height: size,
+            left: 0,
+            top: 0,
+            coverage: vec![255; (size * size) as usize].into_boxed_slice(),
+            atlas_slot: std::cell::Cell::default(),
+        }
+    }
+
+    #[test]
+    fn a_full_atlas_is_reset_when_it_holds_stale_glyphs_and_grown_otherwise() {
+        let Some(gpu) = headless() else { return };
+        let mut shared = gpu.renderer().shared.borrow_mut();
+        let queue = shared.queue.clone();
+        shared
+            .atlas
+            .get_or_insert(&queue, &bitmap(1, 16), 0)
+            .unwrap();
+
+        shared.frame = ATLAS_RESET_COOLDOWN_FRAMES;
+        let frame = shared.frame;
+        shared
+            .atlas
+            .get_or_insert(&queue, &bitmap(2, 16), frame)
+            .unwrap();
+        assert!(shared.make_atlas_room());
+        assert_eq!(shared.atlas.size, INITIAL_ATLAS_SIZE);
+        assert!(shared.atlas.slots.is_empty());
+
+        shared
+            .atlas
+            .get_or_insert(&queue, &bitmap(3, 16), frame)
+            .unwrap();
+        assert!(shared.make_atlas_room());
+        assert_eq!(shared.atlas.size, INITIAL_ATLAS_SIZE * 2);
+    }
+
+    #[test]
+    fn partial_damage_culls_unrelated_instance_ranges_in_a_wide_scene() {
+        let Some(mut gpu) = headless() else { return };
+        let record = |changed| {
+            let mut recorder = SceneRecorder::new();
+            recorder.begin(100, 500, 1.0, Color::rgb(0, 0, 0), ColorScheme::default());
+            for index in 0..1000 {
+                let color = if changed && index == 300 {
+                    Color::rgb(240, 60, 30)
+                } else {
+                    Color::rgb(50, 60, 80)
+                };
+                recorder.fill_rect(
+                    rect(
+                        (index % 20) as f32 * 5.0,
+                        (index / 20) as f32 * 10.0,
+                        4.0,
+                        6.0,
+                    ),
+                    color,
+                    0.0,
+                );
+            }
+            recorder.finish()
+        };
+        let initial = record(false);
+        gpu.render_damage(&initial, &Damage::Full);
+        let next = record(true);
+        let damage = crate::display_list::damage(Some(&initial), &next);
+        #[cfg(feature = "perf-metrics")]
+        creamui_core::metrics::reset_frame_metrics();
+        let pixels = gpu.render_damage_to_pixels(&next, &damage);
+        #[cfg(feature = "perf-metrics")]
+        {
+            let metrics = creamui_core::metrics::frame_metrics();
+            assert_eq!(metrics.gpu_instances_drawn, 256);
+            assert_eq!(metrics.gpu_pixels_redrawn, 40);
+        }
+        assert_eq!(pixels, gpu.render_to_pixels(&next));
+    }
+
+    #[test]
+    fn retained_damage_matches_full_gpu_frames_with_alpha_and_clips() {
+        let Some(mut gpu) = headless() else { return };
+        let mut previous = None;
+        let image = RgbaImage::new(
+            2,
+            2,
+            vec![
+                255, 0, 0, 128, 0, 255, 0, 200, 0, 0, 255, 128, 255, 255, 255, 240,
+            ],
+        )
+        .unwrap();
+        for phase in 0..4 {
+            let mut recorder = SceneRecorder::new();
+            recorder.begin(
+                160,
+                100,
+                1.0,
+                Color::rgba(20, 30, 40, 80),
+                ColorScheme::default(),
+            );
+            recorder.fill_rect(rect(0.0, 0.0, 25.0, 100.0), Color::rgb(20, 80, 140), 0.0);
+            recorder.push_clip_rounded(rect(40.0, 8.0, 75.0, 75.0), 12.0);
+            recorder.push_clip_rounded(rect(45.0, 12.0, 65.0, 65.0), 8.0);
+            if phase < 3 {
+                recorder.fill_rect(
+                    rect(50.0 + phase as f32 * 8.0, 20.0, 28.0, 28.0),
+                    Color::rgba(220, 30, 100, 120),
+                    6.0,
+                );
+                recorder.draw_image(
+                    rect(55.0, 36.0 + phase as f32 * 4.0, 30.0, 24.0),
+                    &image,
+                    None,
+                );
+            }
+            recorder.fill_text(
+                rect(46.0, 60.0, 60.0, 18.0),
+                if phase % 2 == 0 { "alpha" } else { "beta" },
+                Color::rgba(240, 240, 240, 160),
+                12.0,
+                TextAlign::Start,
+            );
+            recorder.pop_clip();
+            recorder.pop_clip();
+            let list = recorder.finish();
+            assert!(list.items.iter().any(|item| matches!(&item.primitive, Primitive::Text(run) if !run.layout.glyphs.is_empty())));
+            let damage = crate::display_list::damage(previous.as_ref(), &list);
+            if phase > 0 {
+                assert!(matches!(damage, Damage::Partial(_)));
+            }
+            let partial = gpu.render_damage_to_pixels(&list, &damage);
+            let full = gpu.render_to_pixels(&list);
+            assert_eq!(partial, full, "phase {phase}");
+            previous = Some(list);
+        }
+    }
+
+    #[test]
+    fn partial_gpu_frames_preserve_fractionally_scrolled_rounded_layers() {
+        let Some(mut gpu) = headless() else { return };
+        let mut previous = None;
+        for offset in [0.0, 2.5, 6.25, 1.0] {
+            let mut recorder = SceneRecorder::new();
+            recorder.begin(
+                240,
+                140,
+                2.0,
+                Color::rgba(10, 20, 30, 120),
+                ColorScheme::default(),
+            );
+            recorder.push_clip_rounded(rect(18.0, 12.0, 85.0, 38.0), 8.0);
+            recorder.push_scroll_layer(
+                rect(20.0, 15.0, 80.0, 30.0),
+                6.0,
+                Point { x: 0.0, y: offset },
+            );
+            for row in 0..4 {
+                recorder.fill_rect(
+                    rect(22.0, 15.0 + row as f32 * 12.0, 70.0, 10.0),
+                    Color::rgba(50, 80 + row * 30, 220, 150),
+                    3.0,
+                );
+            }
+            recorder.pop_scroll_layer();
+            recorder.pop_clip();
+            let list = recorder.finish();
+            let damage = crate::display_list::damage(previous.as_ref(), &list);
+            if previous.is_some() {
+                assert!(matches!(damage, Damage::Partial(_)));
+            }
+            assert_eq!(
+                gpu.render_damage_to_pixels(&list, &damage),
+                gpu.render_to_pixels(&list)
+            );
+            previous = Some(list);
+        }
+    }
+
+    #[test]
+    fn retained_damage_handles_fractional_regions_idle_frames_and_resize() {
+        let Some(mut gpu) = headless() else { return };
+        let mut recorder = SceneRecorder::new();
+        recorder.begin(40, 40, 1.0, Color::rgb(0, 0, 0), ColorScheme::default());
+        let initial = recorder.finish();
+        gpu.render_damage(&initial, &Damage::None);
+        recorder.begin(40, 40, 1.0, Color::rgb(0, 0, 0), ColorScheme::default());
+        recorder.fill_rect(
+            rect(0.0, 0.0, 20.0, 20.0),
+            Color::rgba(240, 80, 50, 128),
+            0.0,
+        );
+        let list = recorder.finish();
+        let damage = Damage::Partial(vec![Bounds::new(-2.2, -3.6, 20.4, 20.5)]);
+        let partial = gpu.render_damage_to_pixels(&list, &damage);
+        assert_eq!(partial, gpu.render_to_pixels(&list));
+        #[cfg(feature = "perf-metrics")]
+        creamui_core::metrics::reset_frame_metrics();
+        assert_eq!(partial, gpu.render_damage_to_pixels(&list, &Damage::None));
+        #[cfg(feature = "perf-metrics")]
+        assert_eq!(creamui_core::metrics::frame_metrics().gpu_pixels_redrawn, 0);
+        recorder.begin(
+            55,
+            25,
+            1.0,
+            Color::rgba(10, 20, 30, 100),
+            ColorScheme::default(),
+        );
+        recorder.fill_rect(rect(30.0, 5.0, 20.0, 10.0), Color::rgb(0, 255, 0), 0.0);
+        let resized = recorder.finish();
+        assert_eq!(
+            gpu.render_damage_to_pixels(&resized, &Damage::None),
+            gpu.render_to_pixels(&resized)
+        );
+    }
+
+    #[cfg(feature = "perf-metrics")]
+    #[test]
+    fn partial_gpu_frames_redraw_only_damaged_pixels() {
+        let Some(mut gpu) = headless() else { return };
+        let mut recorder = SceneRecorder::new();
+        recorder.begin(100, 100, 1.0, Color::rgb(0, 0, 0), ColorScheme::default());
+        let initial = recorder.finish();
+        gpu.render_damage(&initial, &Damage::Full);
+        recorder.begin(100, 100, 1.0, Color::rgb(0, 0, 0), ColorScheme::default());
+        recorder.fill_rect(rect(10.0, 10.0, 10.0, 10.0), Color::rgb(255, 0, 0), 0.0);
+        let next = recorder.finish();
+        let damage = crate::display_list::damage(Some(&initial), &next);
+        creamui_core::metrics::reset_frame_metrics();
+        gpu.render_damage(&next, &damage);
+        assert_eq!(
+            creamui_core::metrics::frame_metrics().gpu_pixels_redrawn,
+            144
+        );
+    }
+
+    #[test]
+    fn alternating_gpu_destinations_receive_complete_retained_frames() {
+        let Some(mut gpu) = headless() else { return };
+        let device = gpu.renderer.device.clone();
+        let targets: Vec<_> = (0..3)
+            .map(|_| {
+                device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("creamui-test-present-target"),
+                    size: wgpu::Extent3d {
+                        width: 80,
+                        height: 40,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    usage: wgpu::TextureUsages::COPY_DST
+                        | wgpu::TextureUsages::COPY_SRC
+                        | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
+                })
+            })
+            .collect();
+        let mut retained = None;
+        let mut previous = None;
+        for phase in 0..9 {
+            let mut recorder = SceneRecorder::new();
+            recorder.begin(
+                80,
+                40,
+                1.0,
+                Color::rgba(10, 20, 30, 70),
+                ColorScheme::default(),
+            );
+            recorder.fill_rect(
+                rect(5.0 + phase as f32 * 3.0, 10.0, 15.0, 15.0),
+                Color::rgba(220, 100, 30, 120),
+                3.0,
+            );
+            let list = recorder.finish();
+            let damage = crate::display_list::damage(previous.as_ref(), &list);
+            let frame = update_retained(
+                &mut retained,
+                &mut gpu.renderer,
+                &list,
+                &damage,
+                wgpu::TextureFormat::Rgba8UnormSrgb,
+            );
+            let target = &targets[phase % targets.len()];
+            let view = target.create_view(&wgpu::TextureViewDescriptor {
+                format: Some(wgpu::TextureFormat::Rgba8Unorm),
+                ..Default::default()
+            });
+            present_retained(&gpu.renderer, frame, target, &view, phase % 2 == 0);
+            assert_eq!(
+                read_pixels(&gpu.renderer, target),
+                gpu.render_to_pixels(&list),
+                "phase {phase}"
+            );
+            previous = Some(list);
+        }
+    }
+
+    #[test]
+    fn cold_shelves_are_reclaimed_without_invalidating_hot_glyphs() {
+        let Some(gpu) = headless() else { return };
+        let shared = gpu.renderer().shared.borrow();
+        let mut atlas =
+            GlyphAtlas::new(&shared.device, &shared.atlas_layout, &shared.sampler, 33, 0);
+        let glyphs: Vec<_> = (1..=9).map(|key| bitmap(key, 10)).collect();
+        for glyph in &glyphs {
+            atlas.get_or_insert(&shared.queue, glyph, 0).unwrap();
+        }
+        let hot: Vec<_> = glyphs[..3]
+            .iter()
+            .map(|glyph| atlas.get_or_insert(&shared.queue, glyph, 2).unwrap())
+            .collect();
+        let id = atlas.id;
+        let replacement = bitmap(10, 10);
+        assert_eq!(
+            atlas.get_or_insert(&shared.queue, &replacement, 2),
+            Some([0, 11, 10, 10])
+        );
+        assert_eq!(atlas.id, id);
+        assert_eq!(atlas.size, 33);
+        for (glyph, rect) in glyphs[..3].iter().zip(hot) {
+            assert_eq!(atlas.get_or_insert(&shared.queue, glyph, 2), Some(rect));
+        }
+        assert!(!atlas.entries.contains_key(&glyphs[5].key));
+        assert_eq!(
+            atlas.get_or_insert(&shared.queue, &glyphs[5], 2),
+            Some([11, 11, 10, 10])
+        );
+        assert_eq!(atlas.slots.len(), 9);
+        assert!(atlas
+            .get_or_insert(&shared.queue, &bitmap(11, 10), 2)
+            .is_some());
+        assert_eq!(atlas.free_slots.len(), 0);
+    }
+
+    #[cfg(feature = "perf-metrics")]
+    #[test]
+    fn atlas_pressure_uploads_one_cold_shelf_and_keeps_active_masks_resident() {
+        let Some(gpu) = headless() else { return };
+        let shared = gpu.renderer().shared.borrow();
+        let mut atlas = GlyphAtlas::new(
+            &shared.device,
+            &shared.atlas_layout,
+            &shared.sampler,
+            INITIAL_ATLAS_SIZE,
+            0,
+        );
+        let glyphs: Vec<_> = (0..31 * 31).map(|key| bitmap(key, 32)).collect();
+        for glyph in &glyphs {
+            atlas.get_or_insert(&shared.queue, glyph, 0).unwrap();
+        }
+        for glyph in &glyphs[..31 * 15] {
+            atlas.get_or_insert(&shared.queue, glyph, 2).unwrap();
+        }
+        creamui_core::metrics::reset_frame_metrics();
+        atlas
+            .get_or_insert(&shared.queue, &bitmap(2000, 32), 2)
+            .unwrap();
+        let uploaded = creamui_core::metrics::frame_metrics().gpu_upload_bytes;
+        assert_eq!(uploaded, 1024 * 33 + 32 * 32);
+        assert!(uploaded < (31 * 15 * 32 * 32) / 10);
+        creamui_core::metrics::reset_frame_metrics();
+        for glyph in &glyphs[..31 * 15] {
+            atlas.get_or_insert(&shared.queue, glyph, 2).unwrap();
+        }
+        assert_eq!(creamui_core::metrics::frame_metrics().gpu_upload_bytes, 0);
+    }
+
+    #[test]
+    fn reclaimed_glyphs_and_reused_slot_handles_match_cpu_pixels() {
+        use crate::display_list::{Clip, DrawItem, TextRun};
+        use crate::text::{PlacedGlyph, TextLayout};
+
+        let Some(mut gpu) = headless() else { return };
+        let glyphs: Vec<_> = (1..=9).map(|key| Rc::new(bitmap(key, 10))).collect();
+        let mut replacement = bitmap(10, 8);
+        replacement.coverage.fill(128);
+        let replacement = Rc::new(replacement);
+        {
+            let mut shared = gpu.renderer().shared.borrow_mut();
+            shared.atlas =
+                GlyphAtlas::new(&shared.device, &shared.atlas_layout, &shared.sampler, 33, 0);
+            let queue = shared.queue.clone();
+            for glyph in &glyphs {
+                shared.atlas.get_or_insert(&queue, glyph, 0).unwrap();
+            }
+            for glyph in &glyphs[..3] {
+                shared.atlas.get_or_insert(&queue, glyph, 2).unwrap();
+            }
+            shared.atlas.get_or_insert(&queue, &replacement, 2).unwrap();
+            shared.frame = 2;
+        }
+        let mut list = DisplayList::new(64, 20, Color::rgb(0, 0, 0));
+        let layout = TextLayout {
+            glyphs: vec![
+                PlacedGlyph {
+                    bitmap: glyphs[0].clone(),
+                    x: 2,
+                    y: 2,
+                    byte_offset: 0,
+                },
+                PlacedGlyph {
+                    bitmap: replacement,
+                    x: 22,
+                    y: 2,
+                    byte_offset: 1,
+                },
+                PlacedGlyph {
+                    bitmap: glyphs[5].clone(),
+                    x: 42,
+                    y: 2,
+                    byte_offset: 2,
+                },
+            ],
+            ink: [2, 2, 52, 12],
+            height: 10.0,
+        };
+        list.items.push(DrawItem {
+            primitive: Primitive::Text(TextRun {
+                layout: Rc::new(layout),
+                x: 0,
+                y: 0,
+                color: Color::rgb(255, 255, 255),
+                selection: None,
+                italic: false,
+            }),
+            clip: Clip {
+                bounds: list.viewport(),
+                rounded: None,
+            },
+            layer: 0,
+        });
+        let pixels = gpu.render_to_pixels(&list);
+        let mut cpu = Rasterizer::new(list.width, list.height);
+        cpu.render(&list, &Damage::Full);
+        assert_eq!(pixels, cpu.pixmap().data());
+        assert_eq!(gpu.renderer().shared.borrow().atlas.size, 33);
+    }
+
+    #[test]
+    fn glyphs_remember_their_slot_per_atlas() {
+        let Some(gpu) = headless() else { return };
+        let mut shared = gpu.renderer().shared.borrow_mut();
+        let queue = shared.queue.clone();
+        let glyph = bitmap(7, 8);
+        let rect = shared.atlas.get_or_insert(&queue, &glyph, 1).unwrap();
+        assert_eq!(glyph.atlas_slot.get(), Some((shared.atlas.id, 0)));
+
+        let other_device = HeadlessGpu::new().unwrap();
+        let mut other = other_device.renderer().shared.borrow_mut();
+        let other_queue = other.queue.clone();
+        other.atlas.get_or_insert(&other_queue, &glyph, 1).unwrap();
+        assert_eq!(glyph.atlas_slot.get(), Some((other.atlas.id, 0)));
+
+        assert_eq!(shared.atlas.get_or_insert(&queue, &glyph, 2), Some(rect));
+        assert_eq!(shared.atlas.slots.len(), 1);
+        assert_eq!(shared.atlas.slots[0].used, 2);
+    }
+
+    #[test]
+    fn a_mostly_unused_atlas_shrinks() {
+        let Some(gpu) = headless() else { return };
+        let mut shared = gpu.renderer().shared.borrow_mut();
+        shared.recreate_atlas(INITIAL_ATLAS_SIZE * 4);
+        shared.frame = ATLAS_SHRINK_EVERY_FRAMES - 1;
+        shared.begin_frame();
+        assert_eq!(shared.atlas.size, INITIAL_ATLAS_SIZE * 2);
+    }
+
+    #[test]
+    fn shelf_allocation_packs_and_rejects() {
+        let Some(gpu) = headless() else { return };
+        let shared = gpu.renderer().shared.borrow();
+        let mut atlas =
+            GlyphAtlas::new(&shared.device, &shared.atlas_layout, &shared.sampler, 33, 0);
+        assert_eq!(atlas.allocate(10, 10), Some(([0, 0], 0)));
+        assert_eq!(atlas.allocate(10, 10), Some(([11, 0], 0)));
+        assert_eq!(atlas.allocate(10, 20), Some(([0, 11], 1)));
+        assert_eq!(atlas.allocate(40, 1), None);
+        assert_eq!(atlas.allocate(10, 10), Some(([22, 0], 0)));
+        assert_eq!(atlas.allocate(10, 10), None);
+    }
+
+    #[test]
+    fn instances_stay_compact() {
+        assert_eq!(std::mem::size_of::<Instance>(), 56);
+    }
+
+    #[test]
+    fn downscale_level_keeps_at_least_the_shown_size() {
+        assert_eq!(downscale_level(5120, 2880, [240.0, 135.0], 16384), 4);
+        assert_eq!(downscale_level(64, 64, [64.0, 64.0], 16384), 0);
+        assert_eq!(downscale_level(64, 64, [200.0, 10.0], 16384), 0);
+        assert_eq!(downscale_level(8192, 16, [8192.0, 16.0], 2048), 2);
+    }
+
+    #[test]
+    fn halving_averages_two_by_two_blocks() {
+        let pixels = [
+            [0, 0, 0, 0],
+            [100, 100, 100, 100],
+            [50, 50, 50, 50],
+            [200, 200, 200, 200],
+            [20, 20, 20, 20],
+            [40, 40, 40, 40],
+        ]
+        .concat();
+        let (w, h, out) = halve(3, 2, &pixels);
+        assert_eq!((w, h), (1, 1));
+        assert_eq!(out, vec![80, 80, 80, 80]);
+        let (w, h, out) = halve(1, 2, &[[10; 4], [30; 4]].concat());
+        assert_eq!((w, h), (1, 1));
+        assert_eq!(out, vec![20, 20, 20, 20]);
+    }
+
+    fn image_scene(image: &RgbaImage, width: f32) -> DisplayList {
+        let mut r = SceneRecorder::new();
+        r.begin(64, 64, 1.0, Color::rgb(0, 0, 0), ColorScheme::default());
+        r.draw_image(rect(0.0, 0.0, width, width), image, None);
+        r.finish()
+    }
+
+    #[test]
+    fn large_images_upload_downscaled_and_drop_reloadable_pixels() {
+        let Some(mut gpu) = headless() else { return };
+        let reloads = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let image = RgbaImage::reloadable(64, 64, vec![255; 64 * 64 * 4], {
+            let reloads = reloads.clone();
+            move || {
+                reloads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                vec![255; 64 * 64 * 4]
+            }
+        })
+        .unwrap();
+
+        gpu.render(&image_scene(&image, 8.0));
+        assert_eq!(gpu.renderer().shared.borrow().images[&image.id()].level, 3);
+        assert!(!image.discard_pixels(), "the upload already discarded them");
+
+        gpu.render(&image_scene(&image, 32.0));
+        assert_eq!(gpu.renderer().shared.borrow().images[&image.id()].level, 1);
+        assert_eq!(reloads.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        gpu.render(&image_scene(&image, 16.0));
+        assert_eq!(gpu.renderer().shared.borrow().images[&image.id()].level, 1);
+        assert_eq!(reloads.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn cached_image_mipmaps_filter_later_downscaling() {
+        let Some(mut gpu) = headless() else { return };
+        let mut pixels = Vec::with_capacity(64 * 64 * 4);
+        for _y in 0..64 {
+            for x in 0..64 {
+                let channel = if x % 16 == 7 || x % 16 == 8 { 255 } else { 0 };
+                pixels.extend([channel, channel, channel, 255]);
+            }
+        }
+        let image = RgbaImage::new(64, 64, pixels).unwrap();
+        gpu.render(&image_scene(&image, 64.0));
+        assert_eq!(gpu.renderer().shared.borrow().images[&image.id()].level, 0);
+
+        let output = gpu.render_to_pixels(&image_scene(&image, 4.0));
+        assert_eq!(gpu.renderer().shared.borrow().images[&image.id()].level, 0);
+        for y in 0..4 {
+            for x in 0..4 {
+                let pixel = &output[(y * 64 + x) * 4..(y * 64 + x + 1) * 4];
+                assert!(pixel[0].abs_diff(32) <= 2, "pixel at ({x}, {y}): {pixel:?}");
+                assert_eq!(pixel[3], 255);
+            }
+        }
+
+        let odd = RgbaImage::new(5, 3, vec![200; 5 * 3 * 4]).unwrap();
+        let output = gpu.render_to_pixels(&image_scene(&odd, 5.0));
+        assert_eq!(&output[0..4], &[200, 200, 200, 255]);
+    }
+
+    #[test]
+    fn renderers_on_one_device_share_glyphs_and_images() {
+        let Some(mut gpu) = headless() else { return };
+        let shared = gpu.renderer().shared.clone();
+        let mut second = GpuRenderer::new(shared.clone(), wgpu::TextureFormat::Rgba8Unorm);
+        let list = scene();
+        let target = gpu.render(&list);
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let glyphs = shared.borrow().atlas.slots.len();
+        second.render(&list, &view);
+        assert_eq!(shared.borrow().atlas.slots.len(), glyphs);
+        assert_eq!(shared.borrow().images.len(), 1);
+        assert_eq!(shared.borrow().pipelines.len(), 1);
+        let id = *shared.borrow().images.keys().next().unwrap();
+        assert_eq!(shared.borrow().images[&id].holders, 2);
+        drop(second);
+        assert_eq!(shared.borrow().images[&id].holders, 1);
+    }
+
+    #[test]
+    fn only_the_changed_instances_are_uploaded() {
+        let Some(mut gpu) = headless() else { return };
+        let frame = |color| {
+            let mut r = SceneRecorder::new();
+            r.begin(64, 64, 1.0, Color::rgb(0, 0, 0), ColorScheme::default());
+            for i in 0..10 {
+                let color = if i == 4 { color } else { Color::rgb(1, 2, 3) };
+                r.fill_rect(rect(i as f32, 0.0, 1.0, 1.0), color, 0.0);
+            }
+            r.finish()
+        };
+        gpu.render(&frame(Color::rgb(9, 9, 9)));
+        assert_eq!(gpu.renderer().last_upload, [0..10]);
+        gpu.render(&frame(Color::rgb(8, 8, 8)));
+        assert_eq!(gpu.renderer().last_upload, [4..5]);
+        gpu.render(&frame(Color::rgb(8, 8, 8)));
+        assert!(gpu.renderer().last_upload.is_empty());
+    }
+
+    #[test]
+    fn changed_instance_ends_upload_as_separate_ranges() {
+        let Some(mut gpu) = headless() else { return };
+        let frame = |first: Color, last: Color| {
+            let mut recorder = SceneRecorder::new();
+            recorder.begin(64, 64, 1.0, Color::rgb(0, 0, 0), ColorScheme::default());
+            for index in 0..20 {
+                let color = match index {
+                    0 => first,
+                    19 => last,
+                    _ => Color::rgb(1, 2, 3),
+                };
+                recorder.fill_rect(rect(index as f32, 0.0, 1.0, 1.0), color, 0.0);
+            }
+            recorder.finish()
+        };
+        gpu.render(&frame(Color::rgb(10, 20, 30), Color::rgb(40, 50, 60)));
+        let pixels =
+            gpu.render_to_pixels(&frame(Color::rgb(70, 80, 90), Color::rgb(100, 110, 120)));
+        assert_eq!(gpu.renderer().last_upload, [0..1, 19..20]);
+        assert_eq!(&pixels[0..4], &[70, 80, 90, 255]);
+        assert_eq!(&pixels[19 * 4..20 * 4], &[100, 110, 120, 255]);
+    }
+
+    #[test]
+    fn the_instance_buffer_shrinks_after_a_large_frame() {
+        let Some(mut gpu) = headless() else { return };
+        let mut r = SceneRecorder::new();
+        r.begin(64, 64, 1.0, Color::rgb(0, 0, 0), ColorScheme::default());
+        for i in 0..5000 {
+            r.fill_rect(
+                rect((i % 64) as f32, 0.0, 1.0, 1.0),
+                Color::rgb(1, 2, 3),
+                0.0,
+            );
+        }
+        gpu.render(&r.finish());
+        let large = gpu.renderer().instance_buffer.size();
+        gpu.render(&scene());
+        assert!(gpu.renderer().instance_buffer.size() < large);
+    }
+}

@@ -1,0 +1,2 @@
+// Icon id 1: explorer, taskbar and Start menu use it; os.rs loads it for WM_SETICON.
+1 ICON "../../assets/lowbattery.ico"

@@ -1,0 +1,33 @@
+# MSIX packaging from Linux: Microsoft's makemsix (github.com/microsoft/msix-packaging,
+# MIT) + osslsigncode (sideload signing) + ImageMagick (logo assets).
+#
+# Build notes (each one was a real failure):
+# - tag v1.7 doesn't compile with current clang ("templates must have C++ linkage"),
+#   fixed on master -> pinned master commit below;
+# - master needs CMake >= 3.29 -> bookworm-backports (3.31);
+# - trixie's ICU 76 headers need C++17 but the project builds as C++14 -> bookworm (ICU 72).
+FROM debian:bookworm-slim AS makemsix
+RUN echo "deb http://deb.debian.org/debian bookworm-backports main" > /etc/apt/sources.list.d/backports.list \
+ && apt-get update && apt-get install -y --no-install-recommends \
+      git ca-certificates make clang libicu-dev zlib1g-dev \
+ && apt-get install -y --no-install-recommends -t bookworm-backports cmake \
+ && rm -rf /var/lib/apt/lists/*
+ARG MSIX_COMMIT=25a65f5c1690930813bcc10cdf1d59fa865f2bb1
+RUN git clone https://github.com/microsoft/msix-packaging /msix && git -C /msix checkout "$MSIX_COMMIT"
+WORKDIR /msix
+RUN ./makelinux.sh --pack --skip-tests --skip-samples -b MinSizeRel \
+ && mkdir -p /out \
+ && cp "$(find .vs -type f -name makemsix -perm -u+x | head -1)" /out/makemsix \
+ && cp "$(find .vs -name 'libmsix.so*' | head -1)" /out/libmsix.so
+
+# Same distro as the builder so libmsix finds the ICU it was linked against.
+FROM debian:bookworm-slim
+# osslsigncode >= 2.6 is needed to sign MSIX; bookworm has 2.5, backports 2.9.
+RUN echo "deb http://deb.debian.org/debian bookworm-backports main" > /etc/apt/sources.list.d/backports.list \
+ && apt-get update && apt-get install -y --no-install-recommends \
+      libicu72 openssl imagemagick ca-certificates \
+ && apt-get install -y --no-install-recommends -t bookworm-backports osslsigncode \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=makemsix /out/makemsix /usr/local/bin/makemsix
+COPY --from=makemsix /out/libmsix.so /usr/local/lib/libmsix.so
+RUN ldconfig

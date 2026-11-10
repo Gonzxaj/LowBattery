@@ -1,0 +1,7 @@
+# Limited smoke test only: Wine has no Bluetooth/HID battery stack.
+# Runs the exe in --demo mode under a virtual display and takes screenshots.
+FROM debian:trixie-slim
+RUN dpkg --add-architecture i386 && apt-get update \
+ && apt-get install -y --no-install-recommends wine wine64 xvfb x11-utils imagemagick xdotool fonts-liberation curl python3 \
+ && rm -rf /var/lib/apt/lists/*
+ENV WINEDEBUG=-all

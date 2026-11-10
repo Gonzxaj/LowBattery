@@ -1,0 +1,23 @@
+[package]
+name = "battery-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+# windows-native: pure-Rust Win32 HID backend, no C toolchain needed.
+hidapi = { version = "2.6", default-features = false, features = ["windows-native"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
+    "Win32_Devices_DeviceQuery",
+    "Win32_Devices_HumanInterfaceDevice",
+    "Win32_Storage_FileSystem",
+    "Win32_Storage_Packaging_Appx",
+] }

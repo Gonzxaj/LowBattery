@@ -1,0 +1,7520 @@
+//! Window creation and the reactive render loop.
+//!
+//! [`run`] opens one window; [`AppBuilder`] opens several, all sharing one
+//! platform event loop and, for GPU windows, one `wgpu` instance. Every
+//! window keeps its own reactive state, so a signal change in one never
+//! touches another's frame.
+//!
+//! Signal writes and input only invalidate a window. On the next
+//! `RedrawRequested` the window rebuilds and lays out its widgets if needed,
+//! records a display list, diffs it against the frame on screen and hands
+//! only the changed regions to its presenter.
+
+use crate::backend::RenderBackend;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::cpu::SoftwareSurface;
+use crate::devtools::{devtools_for_new_window, DevtoolsCommand, FrameReport, WindowDevtools};
+use crate::display_list::{self, DisplayList};
+#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+use crate::gpu::GpuSurface;
+use crate::raster::Rasterizer;
+use crate::recorder::SceneRecorder;
+#[cfg(target_arch = "wasm32")]
+use crate::web::WebState;
+use creamui_core::runtime::{IntoView, MountedView, Mutation, SharedRuntime, View};
+use creamui_core::{
+    BoxedWidget, CursorIcon, Key, KeyInput, Modifiers, Point, Rect, Renderer, Scene, Size,
+    TitlebarMode, TitlebarState, WindowButton, WindowControls, WindowControlsBackend,
+    WindowDragHandle,
+};
+#[cfg(all(feature = "platform-android", target_os = "android"))]
+use creamui_platform::AndroidApp;
+use creamui_platform::{
+    ActiveEventLoop, ApplicationHandler, BlurRegion, CaptionButton, CompositorIntegrationRequest,
+    ControlFlow, CursorIcon as PlatformCursorIcon, DragIcon, EventLoop, EventLoopProxy,
+    InputSerial, Key as PlatformKey, LogicalPosition, LogicalSize, Modifiers as PlatformModifiers,
+    MouseButton, MouseScrollDelta, PlatformWindow, PopupOptions as PlatformPopupOptions,
+    PopupPlacement, ResizeDirection, WindowAttributes as PlatformWindowAttributes,
+    WindowDecorationMode, WindowDecorations, WindowEvent, WindowId, WindowLevel, WindowRole,
+};
+use creamui_reactive::{create_effect, Effect, Signal};
+use creamui_theme::{Color, Theme, ThemeProvider};
+use std::any::Any;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::rc::{Rc, Weak};
+use std::sync::Arc;
+use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
+
+#[cfg(feature = "system-theme")]
+#[path = "system_appearance.rs"]
+mod system_appearance;
+#[cfg(feature = "system-theme")]
+thread_local! {
+    static SYSTEM_APPEARANCE: creamui_theme::SystemAppearanceProvider = Default::default();
+}
+
+/// How long the text-input caret stays in each visibility phase while
+/// blinking (on, then off, then on again).
+const CARET_BLINK_INTERVAL: Duration = Duration::from_millis(530);
+/// Frame period assumed when the platform cannot report the display's.
+const DEFAULT_FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
+const REFRESH_QUERY_INTERVAL: Duration = Duration::from_secs(1);
+const TOUCH_SCROLL_SLOP: f32 = 8.0;
+
+#[derive(Clone)]
+struct ViewportProvider {
+    viewport: Signal<Size>,
+}
+
+impl ViewportProvider {
+    fn get(&self) -> Size {
+        self.viewport.get()
+    }
+}
+
+/// Reads the current window's logical viewport in pixels.
+///
+/// Only callable while a window is building its widget tree. The tree is
+/// rebuilt whenever the viewport changes, so views can derive responsive
+/// layout directly from this value.
+pub fn use_viewport() -> Size {
+    creamui_reactive::use_context::<ViewportProvider>().get()
+}
+
+/// Reads the compositor's effective decoration result for this window.
+/// Rebuilds subscribed content when ownership or the hybrid control rectangle changes.
+/// `Pending` is not a client-side fallback: wait for the first configure.
+pub fn use_window_decorations() -> WindowDecorations {
+    creamui_reactive::use_context::<Signal<WindowDecorations>>().get()
+}
+
+pub use creamui_platform::SafeArea;
+
+#[derive(Clone)]
+struct SafeAreaProvider {
+    safe_area: Signal<SafeArea>,
+}
+
+/// Logical-pixel bands of this window still left for the application.
+///
+/// Only callable while a window is building its widget tree. The status
+/// bar, navigation bar, display cutout, and on-screen keyboard occupy these
+/// bands, and taps there are delivered to the system rather than the
+/// application. The tree rebuilds when the bands change.
+///
+/// [`SystemBars::Inset`] consumes the bands: the layout viewport already
+/// starts below them, and this hook returns [`SafeArea::ZERO`].
+/// [`SystemBars::EdgeToEdge`] leaves the viewport fullscreen, and this hook
+/// returns the bands so the app can pad the controls that must stay
+/// reachable while backgrounds extend underneath.
+///
+/// Desktop client areas are [`SafeArea::ZERO`]. Android reads window insets
+/// plus the native content rectangle. A browser page reads
+/// `env(safe-area-inset-*)`, which stays zero unless the page sets
+/// `viewport-fit=cover`.
+pub fn use_safe_area() -> SafeArea {
+    creamui_reactive::use_context::<SafeAreaProvider>()
+        .safe_area
+        .get()
+}
+
+/// How a window shares the screen with the status bar, navigation bar,
+/// display cutout, and on-screen keyboard.
+///
+/// Desktop windows report an empty safe area, so both modes lay out the
+/// same rectangle there. Android and a browser page with
+/// `viewport-fit=cover` are where the choice shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SystemBars {
+    /// The layout viewport is the rectangle the system bars leave free.
+    /// Widgets cannot draw underneath them. The covered bands are painted
+    /// with the system-bar color, and [`use_safe_area`] is empty because
+    /// the window already consumed those insets. The keyboard shrinks the
+    /// viewport.
+    #[default]
+    Inset,
+    /// The layout viewport is the whole surface. System bars overlay the
+    /// app. [`use_safe_area`] reports the covered bands so the app can pad
+    /// what must stay reachable and let the rest extend underneath.
+    EdgeToEdge,
+}
+
+#[derive(Clone)]
+struct SystemBarsProvider {
+    mode: Signal<SystemBars>,
+}
+
+/// The window's current [`SystemBars`] mode.
+///
+/// Only callable while a window is building its widget tree. The tree
+/// rebuilds when the mode changes.
+pub fn use_system_bars() -> SystemBars {
+    creamui_reactive::use_context::<SystemBarsProvider>()
+        .mode
+        .get()
+}
+
+/// Width classes for adaptive layouts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScreenClass {
+    Compact,
+    Medium,
+    Expanded,
+}
+
+impl ScreenClass {
+    pub const COMPACT_MAX_WIDTH: f32 = 640.0;
+    pub const MEDIUM_MAX_WIDTH: f32 = 960.0;
+
+    pub fn from_viewport(viewport: Size) -> Self {
+        if viewport.width < Self::COMPACT_MAX_WIDTH {
+            Self::Compact
+        } else if viewport.width < Self::MEDIUM_MAX_WIDTH {
+            Self::Medium
+        } else {
+            Self::Expanded
+        }
+    }
+}
+
+/// Classifies the current viewport using CreamUI's adaptive width classes.
+pub fn use_screen_class() -> ScreenClass {
+    ScreenClass::from_viewport(use_viewport())
+}
+
+/// What happens when the user asks the window manager to close a window.
+///
+/// [`CloseBehavior::Close`] is the normal desktop-window behavior. Use
+/// [`CloseBehavior::Hide`] for a main window controlled by a system tray:
+/// its UI and [`WindowHandle`] stay alive, and [`WindowHandle::show`] can
+/// restore it without rebuilding the window. Native hiding is not available
+/// on Wayland; portable tray applications should close and recreate their
+/// window through [`AppHandle::append_window`] instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CloseBehavior {
+    #[default]
+    Close,
+    Hide,
+}
+
+/// Writes `value` to `signal` only if it differs, avoiding a needless
+/// re-render when a window manager fires a resize event with no real change.
+fn set_if_changed<T: Clone + PartialEq + 'static>(signal: &Signal<T>, value: T) {
+    if signal.peek() != value {
+        signal.set(value);
+    }
+}
+
+/// Window actions and decoration state handed to in-window titlebars.
+struct TitlebarBridge {
+    window: SharedWindow,
+    decorations: Signal<WindowDecorations>,
+    close_requested: Rc<Cell<bool>>,
+    requested: Cell<bool>,
+    applied: Cell<bool>,
+}
+
+impl TitlebarBridge {
+    /// Titlebars ask during their first build, which can precede the
+    /// platform window; the request is replayed once the window exists.
+    fn apply(&self) {
+        if !self.requested.get() || self.applied.get() {
+            return;
+        }
+        if let Some(window) = self.window.borrow().as_ref() {
+            self.applied.set(true);
+            log::debug!("creamui-render: requesting an application titlebar");
+            window.set_compositor_integration(Some(CompositorIntegrationRequest::Titlebar));
+            window.request_redraw();
+        }
+    }
+}
+
+struct SharedTitlebar(Rc<TitlebarBridge>);
+
+impl WindowControlsBackend for SharedTitlebar {
+    fn state(&self) -> TitlebarState {
+        titlebar_state(self.0.decorations.get())
+    }
+    fn request_titlebar(&self) {
+        self.0.requested.set(true);
+        self.0.apply();
+    }
+    fn minimize(&self) {
+        if let Some(window) = self.0.window.borrow().as_ref() {
+            window.set_minimized(true);
+        }
+    }
+    fn toggle_maximize(&self) {
+        if let Some(window) = self.0.window.borrow().as_ref() {
+            window.set_maximized(!self.0.decorations.peek().maximized);
+        }
+    }
+    fn close(&self) {
+        self.0.close_requested.set(true);
+        if let Some(window) = self.0.window.borrow().as_ref() {
+            window.request_redraw();
+        }
+    }
+}
+
+fn titlebar_state(decorations: WindowDecorations) -> TitlebarState {
+    let controls = decorations.controls;
+    TitlebarState {
+        mode: match decorations.mode {
+            WindowDecorationMode::Pending => TitlebarMode::Pending,
+            WindowDecorationMode::Server => TitlebarMode::Server,
+            WindowDecorationMode::Client => TitlebarMode::Client,
+            WindowDecorationMode::Hybrid => TitlebarMode::Overlay,
+            WindowDecorationMode::None => TitlebarMode::None,
+        },
+        overlay: Rect {
+            x: controls.x as f32,
+            y: controls.y as f32,
+            width: controls.width as f32,
+            height: controls.height as f32,
+        },
+        maximized: decorations.maximized,
+        hovered: decorations.hovered.map(|button| match button {
+            CaptionButton::Minimize => WindowButton::Minimize,
+            CaptionButton::Maximize => WindowButton::Maximize,
+            CaptionButton::Close => WindowButton::Close,
+        }),
+    }
+}
+
+fn translate_cursor_icon(icon: CursorIcon) -> PlatformCursorIcon {
+    match icon {
+        CursorIcon::Default => PlatformCursorIcon::Default,
+        CursorIcon::Text => PlatformCursorIcon::Text,
+        CursorIcon::Pointer => PlatformCursorIcon::Pointer,
+        CursorIcon::NotAllowed => PlatformCursorIcon::NotAllowed,
+        CursorIcon::ResizeHorizontal => PlatformCursorIcon::ResizeHorizontal,
+        CursorIcon::ResizeVertical => PlatformCursorIcon::ResizeVertical,
+        CursorIcon::ResizeNwse => PlatformCursorIcon::ResizeNwse,
+        CursorIcon::ResizeNesw => PlatformCursorIcon::ResizeNesw,
+    }
+}
+
+fn resize_cursor(direction: ResizeDirection) -> CursorIcon {
+    match direction {
+        ResizeDirection::East | ResizeDirection::West => CursorIcon::ResizeHorizontal,
+        ResizeDirection::North | ResizeDirection::South => CursorIcon::ResizeVertical,
+        ResizeDirection::NorthWest | ResizeDirection::SouthEast => CursorIcon::ResizeNwse,
+        ResizeDirection::NorthEast | ResizeDirection::SouthWest => CursorIcon::ResizeNesw,
+    }
+}
+
+/// Translates a platform logical key into CreamUI's backend-agnostic [`Key`].
+/// Returns `None` for keys with no CreamUI meaning (modifiers, function
+/// keys, etc.) — those are silently ignored rather than delivered.
+pub(crate) fn translate_key(key: &PlatformKey) -> Option<Key> {
+    match key {
+        PlatformKey::Character(s) => s.chars().next().map(Key::Char),
+        PlatformKey::Space => Some(Key::Char(' ')),
+        PlatformKey::Backspace => Some(Key::Backspace),
+        PlatformKey::Delete => Some(Key::Delete),
+        PlatformKey::Enter => Some(Key::Enter),
+        PlatformKey::Tab => Some(Key::Tab),
+        PlatformKey::Escape => Some(Key::Escape),
+        PlatformKey::Left => Some(Key::Left),
+        PlatformKey::Right => Some(Key::Right),
+        PlatformKey::Up => Some(Key::Up),
+        PlatformKey::Down => Some(Key::Down),
+        PlatformKey::PageUp => Some(Key::PageUp),
+        PlatformKey::PageDown => Some(Key::PageDown),
+        PlatformKey::Home => Some(Key::Home),
+        PlatformKey::End => Some(Key::End),
+        _ => None,
+    }
+}
+
+/// Options for a window CreamUI opens, set once at startup. Transparent
+/// windows need a clear color with alpha.
+#[derive(Debug, Clone)]
+pub struct WindowOptions {
+    pub title: String,
+    pub width: u32,
+    pub height: u32,
+    /// Optional logical screen position used when creating the window.
+    pub position: Option<(i32, i32)>,
+    pub resizable: bool,
+    /// Requests a platform-owned frame (server-side on native Wayland).
+    /// The compositor may require client decorations instead; inspect
+    /// [`use_window_decorations`] or [`WindowHandle::decorations`] for the result.
+    /// `false` explicitly requests an undecorated surface.
+    pub decorations: bool,
+    pub transparent: bool,
+    /// Compositor-side background blur. `Content` follows the painted
+    /// translucent backgrounds each frame; other regions apply at creation. Requires
+    /// `transparent` and the `blur-kwin`/`blur-blair` platform feature
+    /// matching the running compositor; `None` otherwise.
+    pub blur: Option<BlurRegion>,
+    /// Gives keyboard focus to the first focusable widget on the initial frame.
+    pub focus_first: bool,
+    pub role: WindowRole,
+    /// How a close request from the window manager is handled.
+    pub close_behavior: CloseBehavior,
+    /// Which backend renders the window: GPU (`wgpu`, the default with the
+    /// `gpu` feature, falling back to CPU when no adapter is usable) or CPU-only. Can be
+    /// force-overridden at launch with `CUI_OVERRIDE_RENDER_BACKEND=gpu|cpu`
+    /// regardless of what's set here — see [`RenderBackend::resolve`].
+    pub backend: RenderBackend,
+    /// Made available to `use_theme()` while this window's `build_ui` runs.
+    pub theme: Theme,
+    /// Whether the layout viewport stops at the system bars or draws
+    /// underneath them. See [`SystemBars`].
+    pub system_bars: SystemBars,
+}
+
+impl Default for WindowOptions {
+    fn default() -> Self {
+        WindowOptions {
+            title: "CreamUI".to_string(),
+            width: 800,
+            height: 600,
+            position: None,
+            resizable: true,
+            decorations: true,
+            transparent: false,
+            blur: None,
+            focus_first: false,
+            role: WindowRole::Normal,
+            close_behavior: CloseBehavior::Close,
+            backend: RenderBackend::default(),
+            theme: Theme::default(),
+            system_bars: SystemBars::Inset,
+        }
+    }
+}
+
+impl WindowOptions {
+    #[cfg(feature = "system-theme")]
+    pub fn system_theme(mut self) -> Result<Self, creamui_theme_loader::ThemeLoadError> {
+        let resolved = creamui_theme_loader::SystemThemeLoader::new().load()?;
+        if let Some(font_family) = &resolved.font_family {
+            creamui_fonts::use_system_font(font_family);
+        }
+        self.theme = resolved.theme;
+        Ok(self)
+    }
+
+    /// Sets the initial logical screen position before the native window is
+    /// created. This is preferable to moving the window after creation,
+    /// especially on Wayland where compositors may ignore late moves.
+    pub fn at_position(mut self, x: i32, y: i32) -> Self {
+        self.position = Some((x, y));
+        self
+    }
+
+    /// Requests compositor-side background blur behind `region`.
+    pub fn blurred(mut self, region: BlurRegion) -> Self {
+        self.blur = Some(region);
+        self
+    }
+
+    pub fn top_panel(mut self) -> Self {
+        self.role = WindowRole::TopPanel;
+        self
+    }
+
+    pub fn bottom_panel(mut self) -> Self {
+        self.role = WindowRole::BottomPanel;
+        self
+    }
+
+    /// Sets whether the window lays out inside the system bars or draws
+    /// underneath them. Change it later with
+    /// [`WindowHandle::set_system_bars`].
+    pub fn system_bars(mut self, mode: SystemBars) -> Self {
+        self.system_bars = mode;
+        self
+    }
+}
+
+/// Configuration for a popup anchored to a rectangle in its parent window.
+/// The Wayland backend uses the input serial to create an `xdg_popup`.
+#[derive(Clone)]
+pub struct PopupOptions {
+    pub(crate) parent: WindowHandle,
+    pub(crate) anchor: Rect,
+    pub(crate) input_serial: Option<InputSerial>,
+    placement: PopupPlacement,
+    resize_to_fit: bool,
+    on_error: Option<Rc<dyn Fn(String)>>,
+    is_current: Option<Rc<dyn Fn() -> bool>>,
+}
+
+impl PopupOptions {
+    pub fn new(parent: WindowHandle, anchor: Rect) -> Self {
+        let input_serial = parent
+            .window
+            .borrow()
+            .as_ref()
+            .and_then(|window| window.input_serial())
+            .or_else(|| parent.last_input_serial.get());
+        Self {
+            parent,
+            anchor,
+            input_serial,
+            placement: PopupPlacement::Below,
+            resize_to_fit: false,
+            on_error: None,
+            is_current: None,
+        }
+    }
+
+    pub fn at_cursor(parent: WindowHandle, point: Point) -> Self {
+        let size = parent.logical_size();
+        let anchor = Rect {
+            x: if size.width > 0.0 {
+                point.x.clamp(0.0, (size.width - 1.0).max(0.0))
+            } else {
+                point.x.max(0.0)
+            },
+            y: if size.height > 0.0 {
+                point.y.clamp(0.0, (size.height - 1.0).max(0.0))
+            } else {
+                point.y.max(0.0)
+            },
+            width: 1.0,
+            height: 1.0,
+        };
+        Self::new(parent, anchor).placed(PopupPlacement::RightTop)
+    }
+
+    pub fn resize_to_fit(mut self, enabled: bool) -> Self {
+        self.resize_to_fit = enabled;
+        self
+    }
+
+    pub fn on_error(mut self, handler: impl Fn(String) + 'static) -> Self {
+        self.on_error = Some(Rc::new(handler));
+        self
+    }
+
+    pub fn while_current(mut self, current: impl Fn() -> bool + 'static) -> Self {
+        self.is_current = Some(Rc::new(current));
+        self
+    }
+
+    pub fn supports_native_popup(&self) -> bool {
+        self.input_serial.is_some() && self.parent.supports_native_popups()
+    }
+
+    pub fn with_input_serial(mut self, input_serial: InputSerial) -> Self {
+        self.input_serial = Some(input_serial);
+        self
+    }
+
+    pub fn above(mut self) -> Self {
+        self.placement = PopupPlacement::Above;
+        self
+    }
+
+    pub fn below(mut self) -> Self {
+        self.placement = PopupPlacement::Below;
+        self
+    }
+
+    pub fn placed(mut self, placement: PopupPlacement) -> Self {
+        self.placement = placement;
+        self
+    }
+}
+
+impl std::fmt::Debug for PopupOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PopupOptions")
+            .field("anchor", &self.anchor)
+            .field("input_serial", &self.input_serial)
+            .field("placement", &self.placement)
+            .finish()
+    }
+}
+
+/// Panic payload and source location captured by the panic hook installed
+/// in [`install_panic_dispatch`], passed to an [`AppBuilder::on_panic`]
+/// handler.
+pub struct PanicDetails {
+    pub message: String,
+    pub location: Option<String>,
+}
+
+type PanicHandler = Rc<dyn Fn(&PanicDetails)>;
+
+thread_local! {
+    static PANIC_HANDLER: RefCell<Option<PanicHandler>> = const { RefCell::new(None) };
+}
+
+/// Wraps the process's current panic hook with a dispatcher that checks
+/// `PANIC_HANDLER` first: if set, calls it with the panic's details instead
+/// of running the previous hook; otherwise runs the previous hook
+/// unchanged. Installed at most once per process via `Once`.
+fn install_panic_dispatch() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let handled = PANIC_HANDLER.with(|cell| {
+                let handler = cell.borrow().clone();
+                match handler {
+                    Some(handler) => {
+                        handler(&PanicDetails {
+                            message: panic_payload_message(info.payload()),
+                            location: info.location().map(|l| l.to_string()),
+                        });
+                        true
+                    }
+                    None => false,
+                }
+            });
+            if !handled {
+                previous_hook(info);
+            }
+        }));
+    });
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+/// Runs `build(size)`, catching a panic when a handler is registered via
+/// [`AppBuilder::on_panic`] and returning a blank widget in that case
+/// instead of unwinding past the caller. Runs `build` directly (no
+/// `catch_unwind` overhead) when no handler is registered.
+fn build_ui_with_recovery(build: &Rc<dyn Fn(Size) -> BoxedWidget>, size: Size) -> BoxedWidget {
+    let has_handler = PANIC_HANDLER.with(|cell| cell.borrow().is_some());
+    if !has_handler {
+        return build(size);
+    }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(size))) {
+        Ok(widget) => widget,
+        Err(_) => Box::new(BlankWidget),
+    }
+}
+
+fn with_window_scope<R>(
+    theme: &ThemeProvider,
+    viewport: &Signal<Size>,
+    safe_area: &Signal<SafeArea>,
+    system_bars: &Signal<SystemBars>,
+    window_drag: &WindowDragHandle,
+    decorations: &Signal<WindowDecorations>,
+    window_controls: &WindowControls,
+    f: impl FnOnce() -> R,
+) -> R {
+    creamui_reactive::with_context_scope(|| {
+        creamui_reactive::provide_context(theme.clone());
+        creamui_reactive::provide_context(ViewportProvider {
+            viewport: viewport.clone(),
+        });
+        creamui_reactive::provide_context(SafeAreaProvider {
+            safe_area: safe_area.clone(),
+        });
+        creamui_reactive::provide_context(SystemBarsProvider {
+            mode: system_bars.clone(),
+        });
+        creamui_reactive::provide_context(window_drag.clone());
+        creamui_reactive::provide_context(decorations.clone());
+        creamui_reactive::provide_context(window_controls.clone());
+        f()
+    })
+}
+
+/// Where the app's layout box sits on the surface.
+struct ContentFrame {
+    origin: creamui_core::Point,
+    layout: Size,
+    exposed: SafeArea,
+}
+
+fn content_frame(mode: SystemBars, occupied: SafeArea, surface: Size) -> ContentFrame {
+    let occupied = occupied.clamp(surface.width, surface.height);
+    match mode {
+        SystemBars::EdgeToEdge => ContentFrame {
+            origin: creamui_core::Point::default(),
+            layout: surface,
+            exposed: occupied,
+        },
+        SystemBars::Inset => ContentFrame {
+            origin: creamui_core::Point {
+                x: occupied.left,
+                y: occupied.top,
+            },
+            layout: Size {
+                width: (surface.width - occupied.left - occupied.right).max(0.0),
+                height: (surface.height - occupied.top - occupied.bottom).max(0.0),
+            },
+            exposed: SafeArea::ZERO,
+        },
+    }
+}
+
+fn color_is_light(color: Color) -> bool {
+    let channel = |component: u8| {
+        let value = component as f32 / 255.0;
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let luminance =
+        0.2126 * channel(color.r) + 0.7152 * channel(color.g) + 0.0722 * channel(color.b);
+    luminance > 0.5
+}
+
+/// System-bar policy shared by the pipeline and [`WindowHandle`].
+#[derive(Clone)]
+struct SystemChrome {
+    mode: Signal<SystemBars>,
+    /// Bands the platform reports, before the layout mode consumes them.
+    occupied: Signal<SafeArea>,
+    /// Fill for the bands [`SystemBars::Inset`] leaves outside the layout,
+    /// and the color used to choose status/navigation icon contrast.
+    color: Rc<Cell<Option<Color>>>,
+    applied_light_background: Rc<Cell<Option<bool>>>,
+}
+
+struct BlankWidget;
+impl creamui_core::Widget for BlankWidget {
+    fn style(&self) -> creamui_core::Style {
+        creamui_core::layout::Style::default().into()
+    }
+    fn paint(&self, _painter: &mut dyn creamui_core::Painter, _rect: creamui_core::Rect) {}
+}
+
+/// Enables verbose logging when `CUI_DEBUG=1` is set in the environment,
+/// without overriding an explicit `RUST_LOG`.
+#[cfg(feature = "logger")]
+fn init_logging() {
+    if std::env::var("CUI_DEBUG").as_deref() == Ok("1") && std::env::var("RUST_LOG").is_err() {
+        std::env::set_var("RUST_LOG", "creamui_render=debug,creamui_core=debug");
+    }
+    let _ = env_logger::try_init();
+}
+
+/// Which backend turns a window's display lists into pixels, picked once
+/// per window per [`WindowOptions::backend`].
+enum Presenter {
+    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+    Gpu(GpuSurface),
+    #[cfg(not(target_arch = "wasm32"))]
+    Software(SoftwareSurface),
+    #[cfg(target_arch = "wasm32")]
+    Web(WebState),
+}
+
+impl Presenter {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn new(
+        window: &Arc<dyn PlatformWindow>,
+        backend: RenderBackend,
+        transparent: bool,
+        #[cfg(feature = "gpu")] gpu_instance: Option<&wgpu::Instance>,
+        #[cfg(feature = "gpu")] gpu_context: &mut Option<crate::gpu::GpuContext>,
+    ) -> Result<Self, String> {
+        #[cfg(feature = "gpu")]
+        if let (RenderBackend::Gpu, Some(instance)) = (backend, gpu_instance) {
+            match GpuSurface::new(window.clone(), instance, transparent, gpu_context) {
+                Ok(surface) => return Ok(Presenter::Gpu(surface)),
+                Err(err) => log::warn!(
+                    "creamui-render: GPU backend unavailable ({err}), falling back to CPU"
+                ),
+            }
+        }
+        #[cfg(not(feature = "gpu"))]
+        let _ = (backend, transparent);
+        SoftwareSurface::new(window.clone()).map(Presenter::Software)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn new(window: &Arc<dyn PlatformWindow>) -> Self {
+        Presenter::Web(WebState::new(window.clone()))
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+            Presenter::Gpu(_) => "gpu",
+            #[cfg(not(target_arch = "wasm32"))]
+            Presenter::Software(_) => "cpu",
+            #[cfg(target_arch = "wasm32")]
+            Presenter::Web(_) => "web",
+        }
+    }
+
+    fn adapter(&self) -> Option<Rc<str>> {
+        match self {
+            #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+            Presenter::Gpu(surface) => Some(surface.adapter_name().into()),
+            _ => None,
+        }
+    }
+
+    /// Whether presenting blocks until the display can take a new frame.
+    fn paces_presents(&self) -> bool {
+        match self {
+            #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+            Presenter::Gpu(_) => true,
+            _ => false,
+        }
+    }
+
+    fn needs_raster(&self) -> bool {
+        match self {
+            #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+            Presenter::Gpu(_) => false,
+            _ => true,
+        }
+    }
+}
+
+struct FrameState {
+    recorder: SceneRecorder,
+    renderer: Renderer,
+    scene: Option<Scene>,
+    /// The newest recorded frame, not yet presented.
+    pending: Option<DisplayList>,
+    /// The frame currently on screen.
+    presented: Option<DisplayList>,
+    raster: Option<Rasterizer>,
+    devtools: Option<Box<dyn WindowDevtools>>,
+    report: FrameReport,
+    last_report: FrameReport,
+    inspected_content: Option<DisplayList>,
+    adapter: Option<Rc<str>>,
+}
+
+impl FrameState {
+    fn retry_frame(&mut self, list: DisplayList) {
+        // A failed frame may already have shifted raster pixels for scrolling.
+        if let Some(previous) = self.presented.take() {
+            self.recorder.recycle(previous);
+        }
+        self.pending = Some(list);
+    }
+}
+
+/// Coalesces invalidations into at most one build, layout, record and
+/// present per compositor frame.
+struct Pipeline {
+    #[cfg(feature = "router")]
+    router_host: creamui_router::RouterHost,
+    content_blur: bool,
+    applied_blur: RefCell<Vec<(i32, i32, i32, i32)>>,
+    frame: RefCell<FrameState>,
+    /// Full window, including the bands system bars cover.
+    surface: Signal<Size>,
+    /// Rectangle `build_ui` lays out into. Smaller than [`Self::surface`]
+    /// when [`SystemBars::Inset`] consumes system bars.
+    viewport: Signal<Size>,
+    safe_area: Signal<SafeArea>,
+    chrome: SystemChrome,
+    decorations: Signal<WindowDecorations>,
+    scale_factor: Signal<f64>,
+    window: SharedWindow,
+    source: UiSource,
+    theme: ThemeProvider,
+    follow_system_theme: Cell<bool>,
+    #[cfg(feature = "system-theme")]
+    system_appearance: creamui_theme::SystemAppearanceProvider,
+    window_drag: WindowDragHandle,
+    titlebar: Rc<TitlebarBridge>,
+    window_controls: WindowControls,
+    clear_color: Color,
+    focused: Cell<Option<usize>>,
+    /// A legacy widget tree may reveal a text field in response to a click
+    /// or shortcut. Focus it after that freshly-built scene is available.
+    pending_text_input_focus: Cell<bool>,
+    caret_visible: Cell<bool>,
+    pending_root: RefCell<Option<BoxedWidget>>,
+    needs_layout: Cell<bool>,
+    needs_paint: Cell<bool>,
+    dump_frame_path: Option<String>,
+}
+
+/// Content returned by a window builder. Views mount once; widgets rebuild.
+pub trait WindowContent: IntoView + 'static {
+    const RETAINED: bool;
+}
+
+impl WindowContent for View {
+    const RETAINED: bool = true;
+}
+
+impl WindowContent for BoxedWidget {
+    const RETAINED: bool = false;
+}
+
+impl<W: creamui_core::Widget + 'static> WindowContent for Box<W> {
+    const RETAINED: bool = false;
+}
+
+#[derive(Clone)]
+enum UiSource {
+    Legacy(Rc<dyn Fn(Size) -> BoxedWidget>),
+    Runtime(RuntimeSource),
+}
+
+#[derive(Clone)]
+struct RuntimeSource {
+    runtime: SharedRuntime,
+    owned: Option<Rc<OwnedWindowView>>,
+}
+
+struct OwnedWindowView {
+    build: RefCell<Option<Box<dyn FnOnce(Size) -> View>>>,
+    mounted: RefCell<Option<MountedView>>,
+}
+
+impl RuntimeSource {
+    fn mount(&self, size: Size) {
+        let Some(owned) = &self.owned else {
+            return;
+        };
+        let Some(build) = owned.build.borrow_mut().take() else {
+            return;
+        };
+        let mount = || MountedView::mount_into(self.runtime.clone(), build(size));
+        let mounted = if PANIC_HANDLER.with(|handler| handler.borrow().is_some()) {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(mount)) {
+                Ok(mounted) => mounted,
+                Err(_) => MountedView::mount_into(self.runtime.clone(), Box::new(BlankWidget)),
+            }
+        } else {
+            mount()
+        };
+        *owned.mounted.borrow_mut() = Some(mounted);
+    }
+
+    fn dispose(&self) {
+        if let Some(owned) = &self.owned {
+            let mounted = owned.mounted.borrow_mut().take();
+            drop(mounted);
+        }
+    }
+}
+
+impl UiSource {
+    fn runtime(runtime: SharedRuntime) -> Self {
+        Self::Runtime(RuntimeSource {
+            runtime,
+            owned: None,
+        })
+    }
+
+    fn from_builder<V: WindowContent>(build: impl Fn(Size) -> V + 'static) -> Self {
+        if V::RETAINED {
+            Self::Runtime(RuntimeSource {
+                runtime: SharedRuntime::new(creamui_core::runtime::Runtime::new()),
+                owned: Some(Rc::new(OwnedWindowView {
+                    build: RefCell::new(Some(Box::new(move |size| build(size).into_view()))),
+                    mounted: RefCell::new(None),
+                })),
+            })
+        } else {
+            Self::Legacy(Rc::new(move |size| match build(size).into_view() {
+                View::Legacy(widget) => widget,
+                _ => panic!("rebuilding window content must return a legacy widget"),
+            }))
+        }
+    }
+}
+
+impl Pipeline {
+    fn with_scope<R>(&self, f: impl FnOnce() -> R) -> R {
+        with_window_scope(
+            &self.theme,
+            &self.viewport,
+            &self.safe_area,
+            &self.chrome.mode,
+            &self.window_drag,
+            &self.decorations,
+            &self.window_controls,
+            || {
+                #[cfg(feature = "router")]
+                creamui_reactive::provide_context(self.router_host.clone());
+                #[cfg(feature = "system-theme")]
+                creamui_reactive::provide_context(self.system_appearance.clone());
+                f()
+            },
+        )
+    }
+
+    fn content_frame(&self) -> ContentFrame {
+        content_frame(
+            self.chrome.mode.peek(),
+            self.chrome.occupied.peek(),
+            self.surface.peek(),
+        )
+    }
+
+    /// Publishes the layout viewport and the safe area the app should see
+    /// for the current mode. Writes are batched so the window effect runs
+    /// once.
+    fn sync_frame(&self) {
+        let frame = self.content_frame();
+        creamui_reactive::batch(|| {
+            set_if_changed(&self.viewport, frame.layout);
+            set_if_changed(&self.safe_area, frame.exposed);
+        });
+        self.apply_system_bar_icons();
+    }
+
+    fn apply_system_bar_icons(&self) {
+        let color = self.chrome.color.get().unwrap_or(self.clear_color);
+        let light_background = color_is_light(color);
+        if self.chrome.applied_light_background.get() == Some(light_background) {
+            return;
+        }
+        if self.window.borrow().as_ref().is_some_and(|window| {
+            creamui_platform::sync_system_bars(window.as_ref(), light_background)
+        }) {
+            self.chrome
+                .applied_light_background
+                .set(Some(light_background));
+        }
+    }
+
+    fn system_bar_clear(&self) -> Color {
+        if self.chrome.mode.peek() == SystemBars::Inset {
+            self.chrome.color.get().unwrap_or(self.clear_color)
+        } else {
+            self.clear_color
+        }
+    }
+
+    fn request_redraw(&self) {
+        if let Some(window) = self.window.borrow().as_ref() {
+            window.request_redraw();
+        }
+    }
+
+    /// Rebuilds the widget tree from `build_ui`. Runs inside the window's
+    /// reactive effect so it stays subscribed to whatever it reads; layout
+    /// and paint wait for the next frame.
+    fn build(&self) {
+        let UiSource::Legacy(build_ui) = &self.source else {
+            self.invalidate_layout();
+            return;
+        };
+        let _mode = self.chrome.mode.get();
+        let started = Instant::now();
+        let root = self.with_scope(|| {
+            #[cfg(feature = "perf-metrics")]
+            let _span = tracing::info_span!("ui_build").entered();
+            build_ui_with_recovery(build_ui, self.viewport.get())
+        });
+        *self.pending_root.borrow_mut() = Some(root);
+        if let Ok(mut frame) = self.frame.try_borrow_mut() {
+            frame.report.build += started.elapsed();
+        }
+        self.invalidate_layout();
+    }
+
+    fn invalidate_layout(&self) {
+        self.needs_layout.set(true);
+        self.invalidate_paint();
+    }
+
+    fn invalidate_paint(&self) {
+        if !self.needs_paint.replace(true) {
+            self.request_redraw();
+        }
+    }
+
+    /// The platform dropped the window's pixels (restored from minimized,
+    /// shown again after `hide()`): forget the last presented frame so the next
+    /// one is a full repaint instead of a diff that would leave the rest blank.
+    fn invalidate_surface(&self) {
+        let mut frame = self.frame.borrow_mut();
+        if let Some(list) = frame.presented.take() {
+            frame.recorder.recycle(list);
+        }
+        drop(frame);
+        self.invalidate_paint();
+    }
+
+    fn physical_size(&self) -> (Size, u32, u32, f64) {
+        let logical = self.surface.peek();
+        let scale = self.scale_factor.peek();
+        let width = (logical.width as f64 * scale).round().max(1.0) as u32;
+        let height = (logical.height as f64 * scale).round().max(1.0) as u32;
+        (logical, width, height, scale)
+    }
+
+    /// Performs whatever layout and recording is outstanding. Returns whether
+    /// a new display list was recorded.
+    fn update(&self) -> bool {
+        if !self.needs_paint.get() {
+            return false;
+        }
+        self.with_scope(|| {
+            if matches!(&self.source, UiSource::Runtime(_)) {
+                self.needs_layout.set(false);
+                self.needs_paint.set(false);
+                self.record();
+                return;
+            }
+            let UiSource::Legacy(build_ui) = &self.source else {
+                unreachable!()
+            };
+            let mut layout_pending = false;
+            if self.needs_layout.replace(false) {
+                let root = self.pending_root.borrow_mut().take();
+                let mut root = root.unwrap_or_else(|| {
+                    let started = Instant::now();
+                    let root = build_ui_with_recovery(build_ui, self.viewport.peek());
+                    self.frame.borrow_mut().report.build += started.elapsed();
+                    root
+                });
+                for pass in 0..8 {
+                    let changed = {
+                        let mut frame = self.frame.borrow_mut();
+                        let started = Instant::now();
+                        let placed = self.content_frame();
+                        frame.renderer.place(
+                            root,
+                            placed.layout,
+                            placed.origin,
+                            self.surface.peek(),
+                        );
+                        frame.report.layout += started.elapsed();
+                        frame.report.rebuilt = true;
+                        frame.renderer.layout_feedback()
+                    };
+                    if !changed {
+                        break;
+                    }
+                    if pass == 7 {
+                        log::warn!("creamui-render: layout feedback did not converge in 8 passes");
+                        layout_pending = true;
+                        break;
+                    }
+                    let started = Instant::now();
+                    root = build_ui_with_recovery(build_ui, self.viewport.peek());
+                    self.frame.borrow_mut().report.build += started.elapsed();
+                }
+            }
+            self.needs_paint.set(false);
+            self.record();
+            if layout_pending {
+                self.invalidate_layout();
+            }
+        });
+        true
+    }
+
+    fn record(&self) {
+        let (logical, width, height, scale) = self.physical_size();
+        let colors = self.theme.get().colors;
+        let started = Instant::now();
+        let mut focus_callbacks: Vec<(Rc<dyn Fn(bool)>, bool)> = Vec::new();
+        let mut frame = self.frame.borrow_mut();
+        let FrameState {
+            recorder,
+            renderer,
+            scene,
+            pending,
+            devtools,
+            report,
+            inspected_content,
+            ..
+        } = &mut *frame;
+        recorder.collect_background_blur = self.content_blur;
+        recorder.begin(width, height, scale as f32, self.system_bar_clear(), colors);
+        let previous_focus = scene.as_ref().and_then(|scene| {
+            self.focused
+                .get()
+                .and_then(|index| scene.focus_id_at(index))
+        });
+        renderer.set_runtime_inspection_enabled(
+            devtools
+                .as_ref()
+                .is_some_and(|tools| tools.runtime_inspection_enabled()),
+        );
+        match &self.source {
+            UiSource::Legacy(_) => {
+                if let Some(next) =
+                    renderer.paint(recorder, self.focused.get(), self.caret_visible.get())
+                {
+                    let previous_index = self.focused.get();
+                    let entering_modal = scene
+                        .as_ref()
+                        .is_none_or(|previous| previous.modal_focus().is_none());
+                    let focused = if self.pending_text_input_focus.replace(false) {
+                        next.first_text_input()
+                    } else if scene.is_some() {
+                        previous_focus.and_then(|id| next.focus_index(id))
+                    } else {
+                        self.focused
+                            .get()
+                            .filter(|&index| next.focus_id_at(index).is_some())
+                    };
+                    let focused =
+                        focused.or_else(|| entering_modal.then(|| next.modal_focus()).flatten());
+                    if previous_index != focused {
+                        let previous_handler = previous_index.and_then(|index| {
+                            scene
+                                .as_ref()
+                                .and_then(|previous| previous.on_focus_change_at(index))
+                        });
+                        if let Some(handler) = previous_handler {
+                            focus_callbacks.push((handler, false));
+                        }
+                        if let Some(handler) =
+                            focused.and_then(|index| next.on_focus_change_at(index))
+                        {
+                            focus_callbacks.push((handler, true));
+                        }
+                    }
+                    self.focused.set(focused);
+                    *scene = Some(next);
+                }
+            }
+            UiSource::Runtime(_) => {
+                let placed = self.content_frame();
+                renderer.render_runtime_in(placed.layout, placed.origin, logical, recorder);
+                if let Some(snapshot) = renderer.take_runtime_inspection() {
+                    if let Some(tools) = devtools.as_mut() {
+                        let content = recorder.current_list();
+                        let damage: Vec<_> =
+                            display_list::diff(inspected_content.as_ref(), content)
+                                .changed(content.viewport())
+                                .regions(content.viewport())
+                                .into_iter()
+                                .map(|bounds| Rect {
+                                    x: bounds.x0 / scale as f32,
+                                    y: bounds.y0 / scale as f32,
+                                    width: bounds.width() / scale as f32,
+                                    height: bounds.height() / scale as f32,
+                                })
+                                .collect();
+                        let previous = inspected_content
+                            .get_or_insert_with(|| DisplayList::new(width, height, content.clear));
+                        previous.width = content.width;
+                        previous.height = content.height;
+                        previous.clear = content.clear;
+                        previous.items.clone_from(&content.items);
+                        previous.layers.clone_from(&content.layers);
+                        log::trace!("creamui-render: inspected {} runtime nodes at layout epoch {} with {} damage regions", snapshot.nodes.len(), snapshot.layout_epoch, damage.len());
+                        tools.runtime_inspected(snapshot, &damage);
+                    }
+                } else {
+                    *inspected_content = None;
+                }
+                report.rebuilt = true;
+            }
+        }
+        if let Some(devtools) = devtools.as_ref() {
+            devtools.paint_overlay(recorder, logical);
+        }
+        if self.content_blur && *self.applied_blur.borrow() != recorder.blur_regions {
+            if let Some(window) = self.window.borrow().as_ref() {
+                window.set_blur_region(Some(BlurRegion::Regions(
+                    recorder.blur_regions.clone().into(),
+                )));
+                self.applied_blur
+                    .borrow_mut()
+                    .clone_from(&recorder.blur_regions);
+            }
+        }
+        let list = recorder.finish();
+        report.display_items = list.items.len();
+        if let Some(stale) = pending.replace(list) {
+            recorder.recycle(stale);
+        }
+        report.record += started.elapsed();
+        drop(frame);
+        for (callback, focused) in focus_callbacks {
+            callback(focused);
+        }
+    }
+
+    /// Presents the pending display list, touching only what changed since
+    /// the last presented one. Returns whether a frame reached `presenter`.
+    fn present(&self, presenter: Option<&mut Presenter>) -> bool {
+        let mut frame = self.frame.borrow_mut();
+        let Some(list) = frame.pending.take() else {
+            return false;
+        };
+        let diff = display_list::diff(frame.presented.as_ref(), &list);
+        if diff.is_none() {
+            frame.report = FrameReport::default();
+            frame.recorder.recycle(list);
+            return false;
+        }
+        let viewport = list.viewport();
+        let needs_raster =
+            presenter.as_ref().is_none_or(|p| p.needs_raster()) || self.dump_frame_path.is_some();
+        let started = Instant::now();
+        let damage = if needs_raster {
+            frame
+                .raster
+                .get_or_insert_with(|| Rasterizer::new(list.width, list.height))
+                .apply(&list, &diff)
+        } else {
+            diff.changed(viewport)
+        };
+        let regions = damage.regions(viewport);
+        frame.report.raster += started.elapsed();
+
+        let started = Instant::now();
+        let reached_presenter = presenter.is_some();
+        if let Some(presenter) = presenter {
+            if let Some(window) = self.window.borrow().as_ref() {
+                window.pre_present_notify();
+            }
+            frame.report.backend = presenter.name();
+            let presented = match presenter {
+                #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+                Presenter::Gpu(surface) => surface.present(&list, &damage),
+                #[cfg(not(target_arch = "wasm32"))]
+                Presenter::Software(surface) => {
+                    let raster = frame
+                        .raster
+                        .as_ref()
+                        .expect("software frames are rasterized");
+                    surface.present(raster.pixmap(), &regions)
+                }
+                #[cfg(target_arch = "wasm32")]
+                Presenter::Web(web) => {
+                    let raster = frame.raster.as_ref().expect("web frames are rasterized");
+                    web.present(raster.pixmap(), &regions);
+                    true
+                }
+            };
+            if !presented {
+                frame.retry_frame(list);
+                drop(frame);
+                self.request_redraw();
+                return false;
+            }
+        }
+        frame.report.present += started.elapsed();
+
+        if let Some(path) = &self.dump_frame_path {
+            if let Some(raster) = frame.raster.as_ref() {
+                if let Err(err) = raster.pixmap().save_png(path) {
+                    log::warn!("creamui-render: failed to write CUI_DUMP_FRAME to {path}: {err}");
+                }
+            }
+        }
+
+        let FrameState {
+            recorder,
+            presented,
+            devtools,
+            report,
+            last_report,
+            adapter,
+            ..
+        } = &mut *frame;
+        report.adapter = adapter.clone();
+        report.damaged_regions = regions.len();
+        report.damaged_pixels = damage.area(viewport) as u64;
+        report.frame_pixels = (viewport.width() * viewport.height()) as u64;
+        report.cached_text_layouts = recorder.text().cached_layouts();
+        report.cached_glyphs = recorder.text().cached_glyphs();
+        #[cfg(feature = "perf-metrics")]
+        creamui_core::metrics::record(|m| {
+            m.damaged_rect_count += regions.len() as u64;
+            m.damaged_pixel_area += report.damaged_pixels;
+        });
+        report.metrics = creamui_core::metrics::frame_metrics();
+        creamui_core::metrics::reset_frame_metrics();
+        log::trace!(
+            "creamui-render: frame {} in {:?} ({} items, {} px damaged)",
+            report.backend,
+            report.total(),
+            report.display_items,
+            report.damaged_pixels
+        );
+        if let Some(devtools) = devtools.as_mut() {
+            devtools.frame_presented(report);
+        }
+        *last_report = std::mem::take(report);
+        if let Some(old) = presented.replace(list) {
+            recorder.recycle(old);
+        }
+        reached_presenter
+    }
+
+    fn animated(&self) -> bool {
+        self.frame.borrow().recorder.animated()
+    }
+
+    fn devtools_refresh(&self) -> Option<Duration> {
+        self.frame
+            .borrow()
+            .devtools
+            .as_ref()
+            .and_then(|devtools| devtools.refresh_interval())
+    }
+}
+
+type SharedWindow = Rc<RefCell<Option<Arc<dyn PlatformWindow>>>>;
+
+/// Handle for the application event loop.
+///
+/// It is deliberately cheap to clone and is passed to tray actions and can
+/// also be retrieved from [`WindowHandle::app`]. It is tied to CreamUI's UI
+/// thread (like signals and widgets), so use it from window callbacks, tray
+/// callbacks, or [`AppBuilder::on_started`] rather than sending it to a
+/// worker thread.
+#[derive(Clone)]
+pub struct AppHandle {
+    commands: Rc<RefCell<AppCommands>>,
+}
+
+struct AppCommands {
+    system_theme: Option<Theme>,
+    windows: Vec<PendingWindow>,
+    exit_requested: bool,
+    proxy: EventLoopProxy<AppEvent>,
+    next_job_id: u64,
+    background_jobs: HashMap<u64, Box<dyn FnOnce(Box<dyn Any + Send>)>>,
+}
+
+impl AppHandle {
+    /// Queues a new top-level window. If the event loop is already running,
+    /// it is created at the end of the current event turn; otherwise it is
+    /// created as soon as [`AppBuilder::run`] starts. Android supports one
+    /// activity window; additional requests log a warning without invoking
+    /// `on_window_ready`.
+    pub fn append_window<V: WindowContent>(
+        &self,
+        options: WindowOptions,
+        clear_color: Color,
+        on_window_ready: impl FnOnce(WindowHandle) + 'static,
+        build_ui: impl Fn(Size) -> V + 'static,
+    ) {
+        let mut commands = self.commands.borrow_mut();
+        let mut options = options;
+        if let Some(theme) = commands.system_theme {
+            options.theme = theme;
+        }
+        let follow_system_theme = commands.system_theme.is_some();
+        commands.windows.push(PendingWindow {
+            follow_system_theme,
+            options,
+            popup: None,
+            clear_color,
+            on_window_ready: Box::new(on_window_ready),
+            source: UiSource::from_builder(build_ui),
+        });
+    }
+
+    pub fn append_runtime_window(
+        &self,
+        options: WindowOptions,
+        clear_color: Color,
+        on_window_ready: impl FnOnce(WindowHandle) + 'static,
+        runtime: SharedRuntime,
+    ) {
+        let mut commands = self.commands.borrow_mut();
+        let mut options = options;
+        if let Some(theme) = commands.system_theme {
+            options.theme = theme;
+        }
+        let follow_system_theme = commands.system_theme.is_some();
+        commands.windows.push(PendingWindow {
+            follow_system_theme,
+            options,
+            popup: None,
+            clear_color,
+            on_window_ready: Box::new(on_window_ready),
+            source: UiSource::runtime(runtime),
+        });
+    }
+
+    /// Queues a popup relative to a rectangle in its parent window. Its
+    /// requested size remains subject to platform negotiation. Android rejects
+    /// native popups; use hosted overlays instead.
+    pub fn append_popup<V: WindowContent>(
+        &self,
+        options: WindowOptions,
+        popup: PopupOptions,
+        clear_color: Color,
+        on_window_ready: impl FnOnce(WindowHandle) + 'static,
+        build_ui: impl Fn(Size) -> V + 'static,
+    ) {
+        let mut commands = self.commands.borrow_mut();
+        let mut options = options;
+        if let Some(theme) = commands.system_theme {
+            options.theme = theme;
+        }
+        let follow_system_theme = commands.system_theme.is_some();
+        commands.windows.push(PendingWindow {
+            follow_system_theme,
+            options,
+            popup: Some(popup),
+            clear_color,
+            on_window_ready: Box::new(on_window_ready),
+            source: UiSource::from_builder(build_ui),
+        });
+    }
+
+    /// Ends the application event loop and drops every remaining window and
+    /// system tray icon.
+    pub fn exit(&self) {
+        self.commands.borrow_mut().exit_requested = true;
+    }
+
+    /// Runs `work` on a new background thread; once it finishes, `on_done`
+    /// runs on the UI thread with the result, safe to touch `Signal`s from.
+    /// `work` must be `Send` (it crosses the thread boundary); `on_done`
+    /// does not, since it only ever runs here.
+    pub fn spawn_background<T, F, D>(&self, work: F, on_done: D)
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+        D: FnOnce(T) + 'static,
+    {
+        let (job_id, proxy) = {
+            let mut commands = self.commands.borrow_mut();
+            let job_id = commands.next_job_id;
+            commands.next_job_id += 1;
+            commands.background_jobs.insert(
+                job_id,
+                Box::new(move |value: Box<dyn Any + Send>| {
+                    let value = *value
+                        .downcast::<T>()
+                        .expect("creamui-render: background job result type mismatch");
+                    on_done(value);
+                }),
+            );
+            (job_id, commands.proxy.clone())
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        std::thread::spawn(move || {
+            let result: Box<dyn Any + Send> = Box::new(work());
+            let _ = proxy.send_event(AppEvent::BackgroundJob(job_id, result));
+        });
+        // No threads on wasm32: run inline and resolve immediately so
+        // `spawn_background` behaves like a (blocking) no-op there rather
+        // than silently dropping the job.
+        #[cfg(target_arch = "wasm32")]
+        {
+            let result: Box<dyn Any + Send> = Box::new(work());
+            let _ = proxy.send_event(AppEvent::BackgroundJob(job_id, result));
+        }
+    }
+}
+
+/// Looks up and runs the `on_done` continuation registered by
+/// [`AppHandle::spawn_background`] for `job_id`, if it hasn't already been
+/// resolved (e.g. by a duplicate/stale event). Factored out of
+/// [`AppHandler::user_event`] so it's callable without a real
+/// `ActiveEventLoop`.
+fn resolve_background_job(
+    commands: &Rc<RefCell<AppCommands>>,
+    job_id: u64,
+    value: Box<dyn Any + Send>,
+) {
+    let callback = commands.borrow_mut().background_jobs.remove(&job_id);
+    if let Some(callback) = callback {
+        callback(value);
+    }
+}
+
+#[cfg(all(feature = "tray", target_os = "linux"))]
+pub use creamui_tray::TrayIcon;
+
+/// Builder for a native Linux system-tray icon and its context-menu actions.
+///
+/// Available with the `tray` feature. It uses freedesktop's
+/// StatusNotifierItem protocol over D-Bus — it does not depend on GTK. Each
+/// menu action receives an [`AppHandle`], so it can update a [`Signal`] and/or
+/// append windows without plumbing a separate channel.
+#[cfg(all(feature = "tray", target_os = "linux"))]
+pub struct TrayBuilder {
+    icon: TrayIcon,
+    tooltip: Option<String>,
+    items: Vec<TrayMenuItem>,
+}
+
+#[cfg(all(feature = "tray", target_os = "linux"))]
+struct TrayMenuItem {
+    id: String,
+    label: String,
+    enabled: bool,
+    action: Rc<dyn Fn(&AppHandle)>,
+}
+
+#[cfg(all(feature = "tray", target_os = "linux"))]
+impl TrayBuilder {
+    /// Starts a system tray definition with a raw RGBA [`TrayIcon`].
+    pub fn new(icon: TrayIcon) -> Self {
+        Self {
+            icon,
+            tooltip: None,
+            items: Vec::new(),
+        }
+    }
+
+    /// Adds an accessible title for tray implementations that display one.
+    pub fn tooltip(mut self, tooltip: impl Into<String>) -> Self {
+        self.tooltip = Some(tooltip.into());
+        self
+    }
+
+    /// Adds an enabled context-menu item. `id` only needs to be unique
+    /// within this tray.
+    pub fn item(
+        mut self,
+        id: impl Into<String>,
+        label: impl Into<String>,
+        action: impl Fn(&AppHandle) + 'static,
+    ) -> Self {
+        self.items.push(TrayMenuItem {
+            id: id.into(),
+            label: label.into(),
+            enabled: true,
+            action: Rc::new(action),
+        });
+        self
+    }
+
+    /// Adds a disabled, non-interactive context-menu item.
+    pub fn disabled_item(mut self, id: impl Into<String>, label: impl Into<String>) -> Self {
+        self.items.push(TrayMenuItem {
+            id: id.into(),
+            label: label.into(),
+            enabled: false,
+            action: Rc::new(|_| {}),
+        });
+        self
+    }
+
+    /// Adds the conventional action that quits the entire application.
+    pub fn quit_item(self, id: impl Into<String>, label: impl Into<String>) -> Self {
+        self.item(id, label, |app| app.exit())
+    }
+
+    fn install(
+        self,
+        tray_index: usize,
+        proxy: EventLoopProxy<AppEvent>,
+    ) -> Result<InstalledTray, String> {
+        let mut actions = HashMap::new();
+        let mut native =
+            creamui_tray::TrayBuilder::new(self.icon).with_id(format!("creamui-tray-{tray_index}"));
+        if let Some(tooltip) = self.tooltip {
+            native = native.title(tooltip);
+        }
+        for item in self.items {
+            // Prefix the public id so several CreamUI trays may safely use
+            // natural ids such as "show" and "quit".
+            let id = format!("creamui-tray-{tray_index}-{}", item.id);
+            native = if item.enabled {
+                native.item(id.clone(), item.label)
+            } else {
+                native.disabled_item(id.clone(), item.label)
+            };
+            actions.insert(id, item.action);
+        }
+        let native = native
+            .build(move |event| {
+                let _ = proxy.send_event(AppEvent::TrayMenu(event.id));
+            })
+            .map_err(|error| error.to_string())?;
+        Ok(InstalledTray {
+            _native: native,
+            actions,
+        })
+    }
+}
+
+#[cfg(all(feature = "tray", target_os = "linux"))]
+struct InstalledTray {
+    _native: creamui_tray::Tray,
+    actions: HashMap<String, Rc<dyn Fn(&AppHandle)>>,
+}
+
+type KeyboardHandler =
+    Rc<RefCell<Option<Rc<dyn Fn(creamui_platform::KeyEvent, PlatformModifiers) -> bool>>>>;
+type PointerPresenceHandler = Rc<RefCell<Option<Rc<dyn Fn(bool)>>>>;
+type PointerMoveHandler = Rc<RefCell<Option<Rc<dyn Fn(Point)>>>>;
+type PointerButtonHandler = Rc<RefCell<Option<Rc<dyn Fn(MouseButton, bool, Point) -> bool>>>>;
+type FileDropHandler = Rc<RefCell<Option<Rc<dyn Fn(Vec<std::path::PathBuf>, Point)>>>>;
+
+/// A handle to a live window, for desktop-shell operations (resize, move,
+/// always-on-top) issued from outside the render loop — e.g. a click
+/// handler. Cheap to clone; every clone shares the same underlying window.
+///
+/// Handed to a window's `on_window_ready` callback once that window has
+/// actually been created (platform windows don't exist until the event loop
+/// resumes, so this can't be available any earlier). All methods are no-ops
+/// if called after the window has closed.
+#[derive(Clone)]
+pub struct WindowHandle {
+    window: SharedWindow,
+    theme: ThemeProvider,
+    chrome: SystemChrome,
+    decorations: Signal<WindowDecorations>,
+    on_chrome_changed: Rc<dyn Fn()>,
+    close_requested: Rc<Cell<bool>>,
+    focus_lost_handler: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
+    close_handler: Rc<RefCell<Option<Rc<dyn Fn() -> bool>>>>,
+    keyboard_handler: KeyboardHandler,
+    pointer_presence_handler: PointerPresenceHandler,
+    pointer_move_handler: PointerMoveHandler,
+    pointer_button_handler: PointerButtonHandler,
+    file_drop_handler: FileDropHandler,
+    last_input_serial: Rc<Cell<Option<InputSerial>>>,
+    native_drag_active: Signal<bool>,
+    app: AppHandle,
+    runtime: Option<SharedRuntime>,
+    pipeline: Weak<Pipeline>,
+}
+
+impl WindowHandle {
+    /// Returns false from the handler to defer a native or programmatic close.
+    pub fn on_close_requested(&self, handler: impl Fn() -> bool + 'static) {
+        *self.close_handler.borrow_mut() = Some(Rc::new(handler));
+    }
+    pub fn supports_native_popups(&self) -> bool {
+        self.window
+            .borrow()
+            .as_ref()
+            .is_some_and(|window| window.supports_native_popups())
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.close_requested.get() || self.window.borrow().is_none()
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.window
+            .borrow()
+            .as_ref()
+            .is_some_and(|window| window.is_ready())
+    }
+
+    pub fn logical_size(&self) -> Size {
+        self.window
+            .borrow()
+            .as_ref()
+            .map_or(Size::default(), |window| {
+                let size = window.inner_size();
+                let scale = window.scale_factor();
+                Size {
+                    width: (size.width as f64 / scale) as f32,
+                    height: (size.height as f64 / scale) as f32,
+                }
+            })
+    }
+
+    pub fn set_title(&self, title: &str) {
+        if let Some(window) = self.window.borrow().as_ref() {
+            window.set_title(title);
+        }
+    }
+
+    pub fn request_repaint(&self) {
+        if let Some(pipeline) = self.pipeline.upgrade() {
+            pipeline.invalidate_paint();
+        }
+    }
+
+    /// Reports pointer presence independently of child widget hover regions.
+    pub fn on_pointer_presence(&self, handler: impl Fn(bool) + 'static) {
+        *self.pointer_presence_handler.borrow_mut() = Some(Rc::new(handler));
+    }
+
+    /// Reports every pointer move over the window (logical coordinates).
+    /// Useful for chrome that auto-hides while the pointer is idle, e.g.
+    /// media-player overlays.
+    pub fn on_pointer_moved(&self, handler: impl Fn(Point) + 'static) {
+        *self.pointer_move_handler.borrow_mut() = Some(Rc::new(handler));
+    }
+
+    /// Reports pointer button transitions ahead of widget dispatch, with the
+    /// button, whether it was pressed, and the logical pointer position.
+    /// Returning `true` consumes the event so click, drag, focus, and window
+    /// handling never see it; returning `false` keeps normal dispatch. This
+    /// runs before widget context-menu dispatch. The widget layer
+    /// itself handles left-button clicks and drags.
+    pub fn on_pointer_button(&self, handler: impl Fn(MouseButton, bool, Point) -> bool + 'static) {
+        *self.pointer_button_handler.borrow_mut() = Some(Rc::new(handler));
+    }
+
+    /// Reports files dropped onto the window (`text/uri-list` drops).
+    pub fn on_files_dropped(&self, handler: impl Fn(Vec<std::path::PathBuf>) + 'static) {
+        *self.file_drop_handler.borrow_mut() = Some(Rc::new(move |paths, _| handler(paths)));
+    }
+    /// Reports dropped files and their window-local drop position.
+    pub fn on_files_dropped_at(&self, handler: impl Fn(Vec<std::path::PathBuf>, Point) + 'static) {
+        *self.file_drop_handler.borrow_mut() = Some(Rc::new(handler));
+    }
+
+    /// Final decoration ownership; initially `Pending` on negotiating backends.
+    /// A read inside a reactive effect subscribes it to compositor changes.
+    pub fn decorations(&self) -> WindowDecorations {
+        self.decorations.get()
+    }
+
+    pub fn set_min_size(&self, size: Option<(u32, u32)>) {
+        if let Some(window) = self.window.borrow().as_ref() {
+            window.set_min_inner_size(size.map(|(width, height)| {
+                LogicalSize::new(width.max(1) as f64, height.max(1) as f64)
+            }));
+        }
+    }
+
+    /// Requests a new logical-pixel window size. The actual resize (and any
+    /// resulting `Resized` event) happens asynchronously, same as a user
+    /// dragging the window border.
+    pub fn resize(&self, width: u32, height: u32) {
+        if let Some(window) = self.window.borrow().as_ref() {
+            window.request_inner_size(LogicalSize::new(width as f64, height as f64));
+        }
+    }
+
+    /// Moves the window's top-left corner to a logical-pixel screen position.
+    pub fn set_position(&self, x: i32, y: i32) {
+        if let Some(window) = self.window.borrow().as_ref() {
+            window.set_outer_position(LogicalPosition::new(x as f64, y as f64));
+        }
+    }
+
+    /// Returns the window's top-left position in logical screen pixels.
+    pub fn position(&self) -> Option<(i32, i32)> {
+        let window = self.window.borrow();
+        let window = window.as_ref()?;
+        let position = window.outer_position()?;
+        let scale = window.scale_factor();
+        Some((
+            (position.x as f64 / scale) as i32,
+            (position.y as f64 / scale) as i32,
+        ))
+    }
+
+    /// Returns the current monitor's logical size in pixels.
+    pub fn monitor_size(&self) -> Option<(i32, i32)> {
+        let window = self.window.borrow();
+        let window = window.as_ref()?;
+        let size = window.monitor_size()?;
+        let scale = window.scale_factor();
+        Some((
+            (size.width as f64 / scale) as i32,
+            (size.height as f64 / scale) as i32,
+        ))
+    }
+
+    /// Pins (or unpins) the window above all others — the standard
+    /// desktop-shell/widget-overlay behavior.
+    pub fn set_always_on_top(&self, enabled: bool) {
+        if let Some(window) = self.window.borrow().as_ref() {
+            window.set_window_level(if enabled {
+                WindowLevel::AlwaysOnTop
+            } else {
+                WindowLevel::Normal
+            });
+        }
+    }
+
+    /// Requests (or clears, with `None`) compositor-side background blur
+    /// behind the window. A no-op without a matching `blur-*` platform
+    /// feature or compositor support.
+    pub fn set_blur_region(&self, region: Option<BlurRegion>) {
+        if let Some(window) = self.window.borrow().as_ref() {
+            window.set_blur_region(region);
+        }
+    }
+
+    /// Requests compositor-managed hybrid window controls. This is a no-op
+    /// unless a platform integration feature is enabled and the compositor
+    /// advertises a compatible protocol.
+    pub fn set_compositor_integration(&self, request: Option<CompositorIntegrationRequest>) {
+        if let Some(window) = self.window.borrow().as_ref() {
+            window.set_compositor_integration(request);
+        }
+    }
+
+    /// Requests that this window close.
+    pub fn close(&self) {
+        self.close_requested.set(true);
+        if let Some(window) = self.window.borrow().as_ref() {
+            window.request_redraw();
+        }
+    }
+
+    /// Starts a real drag-and-drop grab, tracked/rendered by the
+    /// compositor across every surface on the output. Uses the input
+    /// serial of this window's most recent pointer-button-press, per the
+    /// platform's requirement that a drag must originate from one.
+    pub fn start_drag(&self, mime_types: &[String], icon: Option<DragIcon>) -> Result<(), String> {
+        let serial = self
+            .last_input_serial
+            .get()
+            .ok_or_else(|| "no pointer press to start a drag from".to_owned())?;
+        let window = self.window.borrow();
+        let window = window
+            .as_ref()
+            .ok_or_else(|| "window not yet created".to_owned())?;
+        window.start_drag(serial, mime_types, icon)?;
+        self.native_drag_active.set(true);
+        Ok(())
+    }
+
+    pub fn is_dragging(&self) -> bool {
+        self.native_drag_active.get()
+    }
+
+    pub fn start_drag_with_data(
+        &self,
+        data: &[(String, Vec<u8>)],
+        icon: Option<DragIcon>,
+    ) -> Result<(), String> {
+        let serial = self
+            .last_input_serial
+            .get()
+            .ok_or_else(|| "no pointer press to start a drag from".to_owned())?;
+        let window = self.window.borrow();
+        let window = window
+            .as_ref()
+            .ok_or_else(|| "window not yet created".to_owned())?;
+        window.start_drag_with_data(serial, data, icon)?;
+        self.native_drag_active.set(true);
+        Ok(())
+    }
+
+    /// Registers a callback invoked when the native window loses focus.
+    /// Registering a new callback replaces the previous one.
+    pub fn on_focus_lost(&self, handler: impl Fn() + 'static) {
+        *self.focus_lost_handler.borrow_mut() = Some(Rc::new(handler));
+    }
+
+    /// Moves keyboard focus to the first visible text input in this window.
+    /// This is useful when an application reveals a transient search field.
+    pub fn focus_text_input(&self) {
+        if let Some(runtime) = &self.runtime {
+            runtime.with_mut(|runtime| {
+                let focus = runtime.first_text_input();
+                runtime.set_focused(focus);
+            });
+            if let Some(window) = self.window.borrow().as_ref() {
+                window.request_redraw();
+            }
+        } else if let Some(pipeline) = self.pipeline.upgrade() {
+            pipeline.pending_text_input_focus.set(true);
+            pipeline.invalidate_paint();
+        }
+    }
+
+    /// Handles native key events before focus traversal, widget shortcuts and devtools.
+    /// Return `true` to consume the event. Useful for terminal emulators, where
+    /// Tab and function keys must reach the child process unchanged.
+    pub fn on_keyboard_input(
+        &self,
+        handler: impl Fn(creamui_platform::KeyEvent, PlatformModifiers) -> bool + 'static,
+    ) {
+        *self.keyboard_handler.borrow_mut() = Some(Rc::new(handler));
+    }
+
+    pub fn set_shortcuts_inhibited(&self, inhibited: bool) -> Result<(), String> {
+        self.window
+            .borrow()
+            .as_ref()
+            .ok_or_else(|| "Window is not ready".to_owned())?
+            .set_shortcuts_inhibited(inhibited)
+    }
+
+    /// Hides the window while retaining its UI state and native resources.
+    /// Use [`show`](Self::show) to make it visible again. Wayland does not
+    /// support changing a window's visibility; use `close` plus
+    /// [`AppHandle::append_window`] for portable background apps.
+    pub fn hide(&self) {
+        if let Some(window) = self.window.borrow().as_ref() {
+            window.set_visible(false);
+        }
+    }
+
+    /// Shows a previously hidden window and requests keyboard focus where
+    /// the platform allows it.
+    pub fn show(&self) {
+        if let Some(window) = self.window.borrow().as_ref() {
+            window.set_visible(true);
+            window.set_minimized(false);
+            window.focus();
+            // Hidden or minimized windows lose their pixels on some platforms
+            // (Windows): the unchanged frame would otherwise never be presented.
+            if let Some(pipeline) = self.pipeline.upgrade() {
+                pipeline.invalidate_surface();
+            }
+            window.request_redraw();
+        }
+    }
+
+    /// Returns whether the native window still exists. A handle remains safe
+    /// to retain after `close()`, but it no longer refers to an open window.
+    pub fn is_open(&self) -> bool {
+        self.window.borrow().is_some()
+    }
+
+    /// Returns the owning application, for app-level work such as opening
+    /// another window or exiting from a window callback.
+    pub fn app(&self) -> AppHandle {
+        self.app.clone()
+    }
+
+    /// Applies a mutation to the retained runtime owned by this window and
+    /// schedules its next frame. Returns `false` for legacy widget windows.
+    pub fn apply_runtime_mutation(&self, mutation: Mutation) -> bool {
+        let Some(runtime) = &self.runtime else {
+            return false;
+        };
+        runtime.transaction(|tx| tx.apply(mutation));
+        true
+    }
+
+    /// Minimizes or restores the window.
+    pub fn set_minimized(&self, minimized: bool) {
+        if let Some(window) = self.window.borrow().as_ref() {
+            window.set_minimized(minimized);
+        }
+    }
+
+    /// Minimizes the window.
+    pub fn minimize(&self) {
+        self.set_minimized(true);
+    }
+
+    /// Maximizes or restores the window.
+    pub fn set_maximized(&self, maximized: bool) {
+        if let Some(window) = self.window.borrow().as_ref() {
+            window.set_maximized(maximized);
+        }
+    }
+
+    /// Maximizes the window.
+    pub fn maximize(&self) {
+        self.set_maximized(true);
+    }
+
+    /// Starts the platform's native window drag gesture.
+    pub fn drag_window(&self) {
+        if let Some(window) = self.window.borrow().as_ref() {
+            start_window_move(window.as_ref(), self.last_input_serial.get());
+        }
+    }
+
+    /// Reads the window's current theme.
+    pub fn theme(&self) -> Theme {
+        self.theme.get()
+    }
+
+    /// Replaces the window's theme. `use_theme()` reflects it on the next
+    /// rebuild, which this schedules immediately. This window stops following
+    /// the automatic system theme; the system appearance hook remains live.
+    pub fn set_theme(&self, theme: Theme) {
+        if let Some(pipeline) = self.pipeline.upgrade() {
+            pipeline.follow_system_theme.set(false);
+        }
+        self.theme.set(theme);
+    }
+
+    /// The window's current system-bar mode.
+    pub fn system_bars(&self) -> SystemBars {
+        self.chrome.mode.peek()
+    }
+
+    /// Lays the window out inside the system bars, or draws underneath them.
+    /// Takes effect on the next frame. [`use_safe_area`] and [`use_viewport`]
+    /// follow the new mode.
+    pub fn set_system_bars(&self, mode: SystemBars) {
+        if self.chrome.mode.peek() == mode {
+            return;
+        }
+        creamui_reactive::batch(|| {
+            self.chrome.mode.set(mode);
+            (self.on_chrome_changed)();
+        });
+    }
+
+    /// Color of the bands [`SystemBars::Inset`] leaves outside the layout,
+    /// and the color used to choose light or dark system-bar icons. `None`
+    /// keeps the window clear color until a color is set.
+    pub fn set_system_bar_color(&self, color: Color) {
+        if self.chrome.color.get() == Some(color) {
+            return;
+        }
+        self.chrome.color.set(Some(color));
+        self.chrome.applied_light_background.set(None);
+        (self.on_chrome_changed)();
+    }
+}
+
+/// One window's worth of setup, queued via [`AppBuilder::window`] and opened
+/// once [`AppBuilder::run`] starts the shared event loop.
+struct WindowSpec {
+    options: WindowOptions,
+    popup: Option<PopupOptions>,
+    on_window_ready: Box<dyn FnOnce(WindowHandle)>,
+    pipeline: Rc<Pipeline>,
+    _effect: Effect,
+    _runtime_subscription: Option<Rc<dyn Fn()>>,
+    close_requested: Rc<Cell<bool>>,
+    focus_lost_handler: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
+    close_handler: Rc<RefCell<Option<Rc<dyn Fn() -> bool>>>>,
+    keyboard_handler: KeyboardHandler,
+    pointer_presence_handler: PointerPresenceHandler,
+    pointer_move_handler: PointerMoveHandler,
+    pointer_button_handler: PointerButtonHandler,
+    file_drop_handler: FileDropHandler,
+    last_input_serial: Rc<Cell<Option<InputSerial>>>,
+    native_drag_active: Signal<bool>,
+}
+
+/// Builds and runs one or more CreamUI windows sharing a single process and
+/// event loop.
+///
+/// Each window keeps entirely separate reactive/paint state — a signal
+/// change in one window's UI only ever rebuilds and repaints that window.
+/// The main cost this amortizes across windows is the *fixed* per-process
+/// overhead a naive one-process-per-window design would otherwise multiply:
+/// the Rust runtime, the embedded font and its glyph atlas, and — for any
+/// window using [`RenderBackend::Gpu`] — a single shared `wgpu::Instance`
+/// (GPU driver init is normally the single biggest contributor to a
+/// CreamUI process's memory footprint; see [`RenderBackend::Cpu`] to avoid
+/// it altogether).
+///
+/// ```no_run
+/// # use creamui_render::{AppBuilder, WindowOptions};
+/// # use creamui_theme::Color;
+/// # use creamui_core::{BoxedWidget, Size};
+/// # fn build(_: Size) -> BoxedWidget { unimplemented!() }
+/// AppBuilder::new()
+///     .window(WindowOptions::default(), Color::rgb(0, 0, 0), |_handle| {}, build)
+///     .window(WindowOptions::default(), Color::rgb(0, 0, 0), |_handle| {}, build)
+///     .run();
+/// ```
+pub struct AppBuilder {
+    specs: Vec<PendingWindow>,
+    system_theme: Option<Theme>,
+    on_panic: Option<PanicHandler>,
+    on_started: Option<Box<dyn FnOnce(AppHandle)>>,
+    exit_when_last_window_closes: bool,
+    #[cfg(all(feature = "tray", target_os = "linux"))]
+    trays: Vec<TrayBuilder>,
+}
+
+/// Everything [`AppBuilder::window`] needs to defer construction to
+/// [`AppBuilder::run`], where all windows' backends are resolved together
+/// (so a single shared `wgpu::Instance` can be started once, up front, if
+/// any of them need it).
+struct PendingWindow {
+    follow_system_theme: bool,
+    options: WindowOptions,
+    popup: Option<PopupOptions>,
+    clear_color: Color,
+    on_window_ready: Box<dyn FnOnce(WindowHandle)>,
+    source: UiSource,
+}
+
+impl AppBuilder {
+    pub fn new() -> Self {
+        AppBuilder {
+            specs: Vec::new(),
+            system_theme: None,
+            on_panic: None,
+            on_started: None,
+            // Preserve the original AppBuilder/run behavior for regular
+            // applications. Background applications opt into persistence.
+            exit_when_last_window_closes: true,
+            #[cfg(all(feature = "tray", target_os = "linux"))]
+            trays: Vec::new(),
+        }
+    }
+
+    /// Keeps the event loop alive after every window has closed. Pair this
+    /// with [`AppHandle::exit`] (usually from a tray's Quit item) for a
+    /// background application.
+    pub fn keep_running(mut self) -> Self {
+        self.exit_when_last_window_closes = false;
+        self
+    }
+
+    /// Follow the host appearance at startup and while running. A desktop's
+    /// named variant is preserved when available; otherwise resolve light/dark.
+    /// Explicit loader/config selections retain priority over host preferences.
+    #[cfg(feature = "system-theme")]
+    pub fn system_theme(mut self) -> Result<Self, creamui_theme_loader::ThemeLoadError> {
+        let resolved = creamui_theme_loader::SystemThemeLoader::new().load()?;
+        if let Some(font_family) = &resolved.font_family {
+            creamui_fonts::use_system_font(font_family);
+        }
+        let theme = resolved.theme;
+        for spec in &mut self.specs {
+            spec.options.theme = theme;
+            spec.follow_system_theme = true;
+        }
+        self.system_theme = Some(theme);
+        Ok(self)
+    }
+
+    /// Runs `handler` once the native event loop is ready. It receives an
+    /// [`AppHandle`] and may append the first window, which makes a truly
+    /// windowless startup possible.
+    pub fn on_started(mut self, handler: impl FnOnce(AppHandle) + 'static) -> Self {
+        self.on_started = Some(Box::new(handler));
+        self
+    }
+
+    /// Registers a native system tray. This also makes sense with no queued
+    /// windows when combined with [`keep_running`](Self::keep_running).
+    #[cfg(all(feature = "tray", target_os = "linux"))]
+    pub fn tray(mut self, tray: TrayBuilder) -> Self {
+        self.trays.push(tray);
+        self
+    }
+
+    /// Registers a handler for panics raised inside `build_ui`. Without one,
+    /// a panic crashes the app as usual. With one, the panic is caught, the
+    /// handler runs instead of the default output, the frame is replaced
+    /// with a blank one, and the app keeps running.
+    pub fn on_panic(mut self, handler: impl Fn(&PanicDetails) + 'static) -> Self {
+        self.on_panic = Some(Rc::new(handler));
+        self
+    }
+
+    /// Queues a window to be opened when [`run`](AppBuilder::run) starts the
+    /// shared event loop. See [`crate::run`] for what each argument does.
+    pub fn window<V: WindowContent>(
+        mut self,
+        mut options: WindowOptions,
+        clear_color: Color,
+        on_window_ready: impl FnOnce(WindowHandle) + 'static,
+        build_ui: impl Fn(Size) -> V + 'static,
+    ) -> Self {
+        if let Some(theme) = self.system_theme {
+            options.theme = theme;
+        }
+        self.specs.push(PendingWindow {
+            follow_system_theme: self.system_theme.is_some(),
+            options,
+            popup: None,
+            clear_color,
+            on_window_ready: Box::new(on_window_ready),
+            source: UiSource::from_builder(build_ui),
+        });
+        self
+    }
+
+    /// Opens a window that paints and handles input through an already-mounted
+    /// persistent runtime. Mutations to `runtime` schedule redraws directly.
+    pub fn runtime_window(
+        mut self,
+        mut options: WindowOptions,
+        clear_color: Color,
+        on_window_ready: impl FnOnce(WindowHandle) + 'static,
+        runtime: SharedRuntime,
+    ) -> Self {
+        if let Some(theme) = self.system_theme {
+            options.theme = theme;
+        }
+        self.specs.push(PendingWindow {
+            follow_system_theme: self.system_theme.is_some(),
+            options,
+            popup: None,
+            clear_color,
+            on_window_ready: Box::new(on_window_ready),
+            source: UiSource::runtime(runtime),
+        });
+        self
+    }
+
+    /// Opens every queued window and runs one shared event loop. By default
+    /// it exits once the last window closes; [`keep_running`](Self::keep_running)
+    /// makes the application's lifetime explicit instead.
+    pub fn run(self) {
+        run_windows(
+            self.specs,
+            self.system_theme,
+            self.on_panic,
+            self.on_started,
+            self.exit_when_last_window_closes,
+            #[cfg(all(feature = "tray", target_os = "linux"))]
+            self.trays,
+            #[cfg(all(feature = "platform-android", target_os = "android"))]
+            None,
+        );
+    }
+
+    #[cfg(all(feature = "platform-android", target_os = "android"))]
+    pub fn run_android(self, app: AndroidApp) {
+        #[cfg(feature = "router")]
+        creamui_router::android::install(app.clone());
+        run_windows(
+            self.specs,
+            self.system_theme,
+            self.on_panic,
+            self.on_started,
+            self.exit_when_last_window_closes,
+            #[cfg(all(feature = "tray", target_os = "linux"))]
+            self.trays,
+            Some(app),
+        );
+    }
+}
+
+impl Default for AppBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Per-window state for a window whose platform window and presenter exist.
+/// Lives in [`AppHandler`], keyed by [`WindowId`], until the window closes.
+struct WindowState {
+    popup_parent: Option<WindowId>,
+    pipeline: Rc<Pipeline>,
+    close_requested: Rc<Cell<bool>>,
+    focus_lost_handler: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
+    close_handler: Rc<RefCell<Option<Rc<dyn Fn() -> bool>>>>,
+    keyboard_handler: KeyboardHandler,
+    pointer_presence_handler: PointerPresenceHandler,
+    pointer_move_handler: PointerMoveHandler,
+    pointer_button_handler: PointerButtonHandler,
+    file_drop_handler: FileDropHandler,
+    last_input_serial: Rc<Cell<Option<InputSerial>>>,
+    native_drag_active: Signal<bool>,
+    popup_done_during_drag: bool,
+    close_behavior: CloseBehavior,
+    frameless_resizable: bool,
+    resizable: bool,
+    presenter: Option<Presenter>,
+    backend: RenderBackend,
+    transparent: bool,
+    suspended: bool,
+    /// The platform reported a zero-sized surface (Windows: minimized). Its
+    /// pixels are discarded meanwhile, so the next real size repaints whole.
+    zero_sized: bool,
+    pointer_pos: Point,
+    modifiers: PlatformModifiers,
+    next_blink: Instant,
+    next_animation: Instant,
+    /// The last presented frame was handed to a presenter or platform that
+    /// holds the next one until the display refreshes, so an animation can
+    /// request it right away and stay in step with the display.
+    paced_present: bool,
+    frame_interval: Duration,
+    frame_interval_checked: Option<Instant>,
+    next_devtools_refresh: Instant,
+    pending_viewport: Option<Size>,
+    /// The system cursor icon last set on the window, so `CursorMoved`
+    /// only calls into the backend when it actually changes.
+    current_cursor: CursorIcon,
+    /// Callback for the widget currently under the pointer. Keeping the
+    /// callback rather than a scene index makes it safe across re-renders.
+    hovered: Option<(Rect, Rc<dyn Fn(bool)>)>,
+    /// Index into the current `Scene`'s draggables while the left mouse
+    /// button is held down over one.
+    dragging: Option<usize>,
+    drag_end: Option<Rc<dyn Fn()>>,
+    drag_click: Option<DragClick>,
+    /// Latest drag-handler call since the last frame; only the position
+    /// current at the next `RedrawRequested` is dispatched.
+    pending_drag: Option<(Point, Rect, Rc<dyn Fn(Point, Rect)>)>,
+    runtime_dragged: bool,
+    runtime_press_origin: Option<Point>,
+    touch: Option<TouchGesture>,
+    ime_allowed: bool,
+    #[cfg(any(target_os = "android", test))]
+    inset_poll: Option<(Instant, Instant)>,
+    _effect: Effect,
+    _runtime_subscription: Option<Rc<dyn Fn()>>,
+    t_run: Instant,
+    first_present_logged: bool,
+}
+
+struct DragClick {
+    origin: Point,
+    on_click: Option<Rc<dyn Fn()>>,
+    on_click_at: Option<Rc<dyn Fn(Point)>>,
+    moved: bool,
+}
+
+struct TouchGesture {
+    id: u64,
+    origin: Point,
+    last: Point,
+    scrollable: bool,
+    pressed: bool,
+    scrolling: bool,
+}
+
+impl Drop for WindowState {
+    fn drop(&mut self) {
+        if let UiSource::Runtime(source) = &self.pipeline.source {
+            source.dispose();
+        }
+    }
+}
+
+impl WindowState {
+    fn allow_close(&self) -> bool {
+        let handler = self.close_handler.borrow().clone();
+        if handler.is_some_and(|handler| !handler()) {
+            self.close_requested.set(false);
+            return false;
+        }
+        true
+    }
+
+    fn runtime(&self) -> Option<SharedRuntime> {
+        match &self.pipeline.source {
+            UiSource::Runtime(source) => Some(source.runtime.clone()),
+            UiSource::Legacy(_) => None,
+        }
+    }
+
+    fn runtime_pointer_moved(&mut self) {
+        let Some(runtime) = self.runtime() else {
+            return;
+        };
+        let point = self.pointer_pos;
+        let (changed, previous, next, cursor, drag) = runtime.with(|runtime| {
+            let next = runtime.hit_test(point);
+            let previous = runtime.pointer().hovered;
+            let changed = previous != next;
+            let previous = changed
+                .then(|| previous.and_then(|id| runtime.get(id)?.events.on_hover.clone()))
+                .flatten();
+            let next_hover = changed
+                .then(|| next.and_then(|id| runtime.get(id)?.events.on_hover.clone()))
+                .flatten();
+            let cursor = next
+                .and_then(|id| runtime.get(id)?.events.cursor)
+                .unwrap_or(CursorIcon::Default);
+            let drag = runtime.pointer().pressed.and_then(|id| {
+                let node = runtime.get(id)?;
+                let handler = node.events.on_drag.clone()?;
+                Some((id, node.layout.rect, handler))
+            });
+            (changed, previous, next_hover, cursor, drag)
+        });
+        if changed {
+            runtime.with_mut(|runtime| {
+                let next = runtime.hit_test(point);
+                runtime.set_hovered(next);
+            });
+        }
+        if let Some(handler) = previous {
+            handler(false);
+        }
+        if let Some(handler) = next {
+            handler(true);
+        }
+        let cursor = self.resize_direction().map(resize_cursor).unwrap_or(cursor);
+        if cursor != self.current_cursor {
+            self.current_cursor = cursor;
+            if let Some(window) = self.pipeline.window.borrow().as_ref() {
+                window.set_cursor(translate_cursor_icon(cursor));
+            }
+        }
+        if let Some((id, rect, handler)) = drag {
+            self.runtime_dragged |= self
+                .runtime_press_origin
+                .is_some_and(|origin| (point.x - origin.x).hypot(point.y - origin.y) >= 4.0);
+            runtime.with_mut(|runtime| runtime.capture_pointer(id));
+            handler(
+                Point {
+                    x: point.x - rect.x,
+                    y: point.y - rect.y,
+                },
+                rect,
+            );
+        }
+    }
+
+    fn runtime_pointer_pressed(&mut self) {
+        let Some(runtime) = self.runtime() else {
+            return;
+        };
+        let point = self.pointer_pos;
+        self.runtime_dragged = false;
+        self.runtime_press_origin = Some(point);
+        let (drag_start, text_input) = runtime.with_mut(|runtime| {
+            let target = runtime.hit_test(point);
+            runtime.set_pressed(target);
+            let focus =
+                target.filter(|&id| runtime.get(id).is_some_and(|node| node.events.focusable));
+            runtime.set_focused(focus);
+            let drag_start = target.and_then(|id| {
+                let node = runtime.get(id)?;
+                Some((node.layout.rect, node.events.on_drag_start.clone()))
+            });
+            let text_input =
+                focus.is_some_and(|id| runtime.get(id).is_some_and(|node| node.events.text_input));
+            (drag_start, text_input)
+        });
+        self.set_ime_allowed(text_input);
+        if let Some((rect, Some(handler))) = drag_start {
+            handler(
+                Point {
+                    x: point.x - rect.x,
+                    y: point.y - rect.y,
+                },
+                rect,
+            );
+        }
+    }
+
+    fn runtime_pointer_released(&mut self) {
+        let Some(runtime) = self.runtime() else {
+            return;
+        };
+        let point = self.pointer_pos;
+        let (click, click_at, drag_end) = runtime.with_mut(|runtime| {
+            let pressed = runtime.pointer().pressed;
+            let released_over = runtime.hit_test(point);
+            runtime.set_pressed(None);
+            runtime.release_pointer_capture();
+            let Some(node) = pressed.and_then(|id| runtime.get(id)) else {
+                return (None, None, None);
+            };
+            let drag_end = node.events.on_drag_end.clone();
+            let clicked = pressed == released_over && !self.runtime_dragged;
+            (
+                clicked.then(|| node.events.on_click.clone()).flatten(),
+                clicked.then(|| node.events.on_click_at.clone()).flatten(),
+                drag_end,
+            )
+        });
+        if let Some(handler) = drag_end {
+            handler();
+        }
+        if let Some(handler) = click_at {
+            handler(point);
+        } else if let Some(handler) = click {
+            handler();
+        }
+        self.runtime_dragged = false;
+        self.runtime_press_origin = None;
+    }
+
+    fn scene<R>(&self, f: impl FnOnce(&Scene) -> Option<R>) -> Option<R> {
+        self.pipeline.frame.borrow().scene.as_ref().and_then(f)
+    }
+
+    fn resize_direction(&self) -> Option<ResizeDirection> {
+        if !self.frameless_resizable {
+            return None;
+        }
+        let size = self.viewport_from_window();
+        let edge = 8.0;
+        let left = self.pointer_pos.x <= edge;
+        let right = self.pointer_pos.x >= size.width - edge;
+        let top = self.pointer_pos.y <= edge;
+        let bottom = self.pointer_pos.y >= size.height - edge;
+        match (left, right, top, bottom) {
+            (true, _, true, _) => Some(ResizeDirection::NorthWest),
+            (_, true, true, _) => Some(ResizeDirection::NorthEast),
+            (true, _, _, true) => Some(ResizeDirection::SouthWest),
+            (_, true, _, true) => Some(ResizeDirection::SouthEast),
+            (true, _, _, _) => Some(ResizeDirection::West),
+            (_, true, _, _) => Some(ResizeDirection::East),
+            (_, _, true, _) => Some(ResizeDirection::North),
+            (_, _, _, true) => Some(ResizeDirection::South),
+            _ => None,
+        }
+    }
+
+    fn dispatch_file_drop(&self, paths: Vec<std::path::PathBuf>, point: Point) {
+        let target = if let Some(runtime) = self.runtime() {
+            runtime.with(|runtime| {
+                let mut cursor = runtime.hit_test(point);
+                while let Some(id) = cursor {
+                    let node = runtime.get(id)?;
+                    if let Some(target) = &node.events.file_drop_target {
+                        return Some(target.clone());
+                    }
+                    cursor = node.parent;
+                }
+                None
+            })
+        } else {
+            self.scene(|scene| scene.file_drop_target_at(point).cloned())
+        };
+        if let Some(target) = target {
+            target.dispatch(paths);
+        } else if let Some(callback) = self.file_drop_handler.borrow().clone() {
+            callback(paths, point);
+        }
+    }
+
+    /// Recomputes `pending_drag` for the widget at `self.dragging` from the
+    /// current `pointer_pos`, requesting a redraw if it's still draggable.
+    fn refresh_pending_drag(&mut self) {
+        let Some(index) = self.dragging else { return };
+        let pointer = self.pointer_pos;
+        let pending = self.scene(|scene| {
+            scene.draggable_at(index).map(|(rect, handler)| {
+                let local = Point {
+                    x: pointer.x - rect.x,
+                    y: pointer.y - rect.y,
+                };
+                (local, rect, handler.clone())
+            })
+        });
+        if pending.is_some() {
+            self.pending_drag = pending;
+            self.pipeline.request_redraw();
+        }
+    }
+
+    fn viewport_from_window(&self) -> Size {
+        let Some(window) = self.pipeline.window.borrow().as_ref().cloned() else {
+            return self.pipeline.viewport.peek();
+        };
+        let physical = window.inner_size();
+        let scale = self.pipeline.scale_factor.peek();
+        Size {
+            width: (physical.width as f64 / scale) as f32,
+            height: (physical.height as f64 / scale) as f32,
+        }
+    }
+
+    fn queue_viewport(&mut self, surface: Size) {
+        if self
+            .pending_viewport
+            .unwrap_or_else(|| self.pipeline.surface.peek())
+            != surface
+        {
+            self.pending_viewport = Some(surface);
+            self.pipeline.invalidate_layout();
+        }
+    }
+
+    fn flush_pending_viewport(&mut self) {
+        if let Some(surface) = self.pending_viewport.take() {
+            if self.pipeline.surface.peek() != surface {
+                self.pipeline.surface.set(surface);
+                self.pipeline.sync_frame();
+            }
+        }
+    }
+
+    /// Samples system-UI bands before the frame is built. Android does not
+    /// deliver content-rect or inset changes as window events, so the sample
+    /// happens on the redraw that would show them.
+    fn refresh_safe_area(&self) {
+        let Some(window) = self.pipeline.window.borrow().as_ref().cloned() else {
+            return;
+        };
+        let occupied = window.safe_area();
+        if self.pipeline.chrome.occupied.peek() != occupied {
+            log::debug!(
+                "creamui-render: system insets {occupied:?}, mode {:?}",
+                self.pipeline.chrome.mode.peek()
+            );
+            self.pipeline.chrome.occupied.set(occupied);
+            self.pipeline.sync_frame();
+        } else {
+            self.pipeline.apply_system_bar_icons();
+        }
+    }
+
+    fn restart_caret(&mut self) {
+        self.pipeline.caret_visible.set(true);
+        self.next_blink = Instant::now() + CARET_BLINK_INTERVAL;
+    }
+
+    fn set_pointer(&mut self, pointer: Option<Point>) {
+        self.pipeline.frame.borrow_mut().recorder.pointer = pointer;
+    }
+
+    fn set_press_origin(&mut self, origin: Option<Point>) {
+        self.pipeline.frame.borrow_mut().recorder.press_origin = origin;
+    }
+
+    fn set_focus_visible(&mut self, visible: bool) {
+        let changed = {
+            let mut frame = self.pipeline.frame.borrow_mut();
+            let changed = frame.recorder.focus_visible != visible;
+            frame.recorder.focus_visible = visible;
+            changed
+        };
+        if changed {
+            self.pipeline.invalidate_paint();
+        }
+    }
+
+    fn set_ime_allowed(&mut self, allowed: bool) {
+        if self.ime_allowed == allowed {
+            return;
+        }
+        self.ime_allowed = allowed;
+        #[cfg(any(target_os = "android", test))]
+        {
+            let now = Instant::now();
+            self.inset_poll = Some((now, now + Duration::from_secs(2)));
+        }
+        if let Some(window) = self.pipeline.window.borrow().as_ref() {
+            window.set_ime_allowed(allowed);
+        }
+    }
+
+    fn refresh_ime_for_legacy_focus(&mut self) {
+        let allowed = self.pipeline.focused.get().is_some_and(|focus| {
+            self.scene(|scene| Some(scene.focus_accepts_text_input(focus)))
+                .unwrap_or(false)
+        });
+        self.set_ime_allowed(allowed);
+    }
+
+    /// Updates legacy-widget focus and publishes blur/focus transitions after
+    /// the scene borrow has ended, so callbacks may safely update reactive
+    /// application state.
+    fn set_legacy_focus(&mut self, next: Option<usize>) -> bool {
+        let previous = self.pipeline.focused.replace(next);
+        if previous == next {
+            return false;
+        }
+        let (blur, focus) = self
+            .scene(|scene| {
+                Some((
+                    previous.and_then(|index| scene.on_focus_change_at(index)),
+                    next.and_then(|index| scene.on_focus_change_at(index)),
+                ))
+            })
+            .unwrap_or((None, None));
+        if let Some(callback) = blur {
+            callback(false);
+        }
+        if let Some(callback) = focus {
+            callback(true);
+        }
+        true
+    }
+
+    fn cancel_pointer_interaction(&mut self) {
+        if let Some(runtime) = self.runtime() {
+            let drag_end = runtime.with_mut(|runtime| {
+                let drag_end = runtime
+                    .pointer()
+                    .pressed
+                    .and_then(|id| runtime.get(id)?.events.on_drag_end.clone());
+                runtime.set_pressed(None);
+                runtime.release_pointer_capture();
+                drag_end
+            });
+            if let Some(handler) = drag_end {
+                handler();
+            }
+            self.runtime_dragged = false;
+            self.runtime_press_origin = None;
+        } else {
+            self.dragging = None;
+            self.pending_drag = None;
+            self.drag_click = None;
+            self.set_press_origin(None);
+            if let Some(handler) = self.drag_end.take() {
+                handler();
+            }
+        }
+        self.pipeline.invalidate_paint();
+    }
+
+    fn scroll_at(&mut self, pointer: Point, delta_y: f32) {
+        if let Some(runtime) = self.runtime() {
+            let handler = runtime.with(|runtime| {
+                let target = runtime.scroll_target(pointer)?;
+                runtime.get(target)?.events.on_scroll.clone()
+            });
+            if let Some(handler) = handler {
+                handler(delta_y);
+            }
+            return;
+        }
+        let handler = self.scene(|scene| {
+            let index = scene.scroll_hit_test(pointer)?;
+            Some((
+                scene.on_scroll_at(index)?.clone(),
+                scene.scroll_is_local_at(index),
+                scene.scroll_requires_layout_at(index),
+            ))
+        });
+        if let Some((handler, local, layout)) = handler {
+            handler(delta_y);
+            if layout {
+                self.pipeline.invalidate_layout();
+            } else if local {
+                self.pipeline.invalidate_paint();
+            }
+        }
+    }
+
+    fn touch_scrollable_at(&self, point: Point) -> bool {
+        if let Some(runtime) = self.runtime() {
+            return runtime.with(|runtime| runtime.scroll_target(point).is_some());
+        }
+        self.scene(|scene| Some(scene.scroll_hit_test(point).is_some()))
+            .unwrap_or(false)
+    }
+
+    fn touch_starts_text_input(&self, point: Point) -> bool {
+        if let Some(runtime) = self.runtime() {
+            return runtime.with(|runtime| {
+                runtime
+                    .hit_test(point)
+                    .is_some_and(|id| runtime.get(id).is_some_and(|node| node.events.text_input))
+            });
+        }
+        self.scene(|scene| {
+            Some(
+                scene
+                    .focus_hit_test(point)
+                    .is_some_and(|focus| scene.focus_accepts_text_input(focus)),
+            )
+        })
+        .unwrap_or(false)
+    }
+
+    fn touch_point(&self, position: creamui_platform::PhysicalPosition) -> Point {
+        let scale = self.pipeline.scale_factor.peek();
+        Point {
+            x: (position.x / scale) as f32,
+            y: (position.y / scale) as f32,
+        }
+    }
+
+    fn handle_touch(
+        &mut self,
+        id: u64,
+        phase: creamui_platform::TouchPhase,
+        position: creamui_platform::PhysicalPosition,
+    ) {
+        let point = self.touch_point(position);
+        match phase {
+            creamui_platform::TouchPhase::Started => {
+                if self.touch.is_some() {
+                    return;
+                }
+                let scrollable =
+                    !self.touch_starts_text_input(point) && self.touch_scrollable_at(point);
+                self.touch = Some(TouchGesture {
+                    id,
+                    origin: point,
+                    last: point,
+                    scrollable,
+                    pressed: !scrollable,
+                    scrolling: false,
+                });
+                self.handle_window_event(WindowEvent::CursorMoved { position });
+                if !scrollable {
+                    self.handle_window_event(WindowEvent::MouseInput {
+                        pressed: true,
+                        button: MouseButton::Left,
+                        serial: None,
+                    });
+                }
+            }
+            creamui_platform::TouchPhase::Moved => {
+                let Some(mut touch) = self.touch.take() else {
+                    return;
+                };
+                if touch.id != id {
+                    self.touch = Some(touch);
+                    return;
+                }
+                let delta_y = touch.last.y - point.y;
+                let should_scroll = touch.scrollable
+                    && !touch.scrolling
+                    && (point.x - touch.origin.x).hypot(point.y - touch.origin.y)
+                        >= TOUCH_SCROLL_SLOP;
+                touch.last = point;
+                if should_scroll {
+                    touch.scrolling = true;
+                    if touch.pressed {
+                        self.cancel_pointer_interaction();
+                    }
+                }
+                if touch.scrolling {
+                    self.pointer_pos = point;
+                    self.set_pointer(Some(point));
+                    self.scroll_at(touch.origin, delta_y);
+                } else {
+                    self.handle_window_event(WindowEvent::CursorMoved { position });
+                }
+                self.touch = Some(touch);
+            }
+            creamui_platform::TouchPhase::Ended => {
+                let Some(touch) = self.touch.take() else {
+                    return;
+                };
+                if touch.id != id {
+                    self.touch = Some(touch);
+                    return;
+                }
+                if touch.scrolling {
+                    self.pointer_pos = point;
+                    self.set_pointer(Some(point));
+                } else {
+                    self.handle_window_event(WindowEvent::CursorMoved { position });
+                    if !touch.pressed {
+                        self.handle_window_event(WindowEvent::MouseInput {
+                            pressed: true,
+                            button: MouseButton::Left,
+                            serial: None,
+                        });
+                    }
+                    self.handle_window_event(WindowEvent::MouseInput {
+                        pressed: false,
+                        button: MouseButton::Left,
+                        serial: None,
+                    });
+                }
+            }
+            creamui_platform::TouchPhase::Cancelled => {
+                if self.touch.as_ref().is_some_and(|touch| touch.id == id) {
+                    self.touch = None;
+                    self.cancel_pointer_interaction();
+                }
+            }
+        }
+    }
+
+    fn handle_key_input(&mut self, key: KeyInput) {
+        self.set_focus_visible(true);
+        match key.key {
+            // Page keys scroll the container beneath the pointer even when
+            // it has no focused child. This keeps long views usable from a
+            // keyboard-only desktop setup, while retaining the usual nested
+            // scroll-view behaviour (the innermost container is selected).
+            Key::PageUp if self.scroll_page_at_pointer(-1.0) => return,
+            Key::PageDown if self.scroll_page_at_pointer(1.0) => return,
+            _ => {}
+        }
+        if let Some(runtime) = self.runtime() {
+            if key.key == Key::Tab {
+                let text_input = runtime.with_mut(|runtime| {
+                    let next = runtime.next_focus(runtime.pointer().focused, key.modifiers.shift);
+                    runtime.set_focused(next);
+                    next.is_some_and(|id| {
+                        runtime.get(id).is_some_and(|node| node.events.text_input)
+                    })
+                });
+                self.set_ime_allowed(text_input);
+                self.restart_caret();
+                return;
+            }
+            let handler = runtime.with(|runtime| {
+                let focused = runtime.pointer().focused?;
+                runtime.get(focused)?.events.on_key.clone()
+            });
+            if let Some(handler) = handler {
+                self.restart_caret();
+                handler(key);
+            }
+            return;
+        }
+        if key.key == Key::Tab {
+            let current = self.pipeline.focused.get();
+            let next = self.scene(|scene| scene.next_focus(current, key.modifiers.shift));
+            self.set_legacy_focus(next);
+            self.refresh_ime_for_legacy_focus();
+            self.restart_caret();
+            self.pipeline.invalidate_paint();
+            return;
+        }
+        let Some(index) = self.pipeline.focused.get() else {
+            return;
+        };
+        let handler = self.scene(|scene| scene.on_key_at(index).cloned());
+        if let Some(handler) = handler {
+            self.restart_caret();
+            handler(key);
+            self.pipeline.invalidate_layout();
+        }
+    }
+
+    /// Moves the innermost scroll view under the pointer by almost its
+    /// viewport height. Returning whether a target existed lets Page Up/Down
+    /// fall through to a focused widget when there is nothing to scroll.
+    fn scroll_page_at_pointer(&mut self, direction: f32) -> bool {
+        if let Some(runtime) = self.runtime() {
+            let handler = runtime.with(|runtime| {
+                let target = runtime.scroll_target(self.pointer_pos)?;
+                let node = runtime.get(target)?;
+                Some((node.layout.rect.height, node.events.on_scroll.clone()?))
+            });
+            if let Some((height, handler)) = handler {
+                handler(direction * height * 0.9);
+                return true;
+            }
+            return false;
+        }
+
+        let target = self.scene(|scene| {
+            let index = scene.scroll_hit_test(self.pointer_pos)?;
+            Some((
+                scene.scroll_rect_at(index)?.height,
+                scene.on_scroll_at(index)?.clone(),
+                scene.scroll_is_local_at(index),
+                scene.scroll_requires_layout_at(index),
+            ))
+        });
+        let Some((height, handler, local, layout)) = target else {
+            return false;
+        };
+        handler(direction * height * 0.9);
+        if layout {
+            self.pipeline.invalidate_layout();
+        } else if local {
+            self.pipeline.invalidate_paint();
+        }
+        true
+    }
+
+    fn handle_window_event(&mut self, event: WindowEvent) {
+        if let WindowEvent::MouseInput {
+            pressed: true,
+            serial,
+            ..
+        } = event
+        {
+            self.last_input_serial.set(serial);
+        }
+        if let WindowEvent::MouseInput {
+            pressed, button, ..
+        } = event
+        {
+            let handler = self.pointer_button_handler.borrow().clone();
+            if handler.is_some_and(|handler| handler(button, pressed, self.pointer_pos)) {
+                self.pipeline.invalidate_paint();
+                return;
+            }
+        }
+        if matches!(
+            event,
+            WindowEvent::MouseInput {
+                pressed: true,
+                button: MouseButton::Right,
+                ..
+            }
+        ) {
+            let pointer = self.pointer_pos;
+            let handler = if let Some(runtime) = self.runtime() {
+                runtime.with(|runtime| {
+                    let mut target = runtime.hit_test(pointer);
+                    let mut handler = None;
+                    while let Some(id) = target {
+                        let Some(node) = runtime.get(id) else {
+                            break;
+                        };
+                        if node.events.on_context_menu.is_some() {
+                            handler = node.events.on_context_menu.clone();
+                            break;
+                        }
+                        target = node.parent;
+                    }
+                    handler
+                })
+            } else {
+                self.scene(|scene| scene.context_menu_at(pointer).cloned())
+            };
+            if let Some(handler) = handler {
+                handler(pointer);
+                self.pipeline.invalidate_paint();
+                return;
+            }
+        }
+        match event {
+            WindowEvent::DecorationsChanged(decorations) => {
+                log::debug!("creamui-render: negotiated decorations: {:?}", decorations);
+                self.sync_decorations(decorations);
+            }
+            WindowEvent::Resized(new_size) => {
+                self.poll_decorations();
+                if new_size.width == 0 || new_size.height == 0 {
+                    self.zero_sized = true;
+                    return;
+                }
+                if std::mem::take(&mut self.zero_sized) {
+                    self.pipeline.invalidate_surface();
+                }
+                let scale = self.pipeline.scale_factor.peek();
+                self.queue_viewport(Size {
+                    width: (new_size.width as f64 / scale) as f32,
+                    height: (new_size.height as f64 / scale) as f32,
+                });
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                log::debug!("creamui-render: scale factor changed to {scale_factor}");
+                set_if_changed(&self.pipeline.scale_factor, scale_factor);
+                let viewport = self.viewport_from_window();
+                self.queue_viewport(viewport);
+                self.pipeline.invalidate_layout();
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let callback = self.pointer_presence_handler.borrow().clone();
+                if let Some(callback) = callback {
+                    callback(true);
+                }
+                let scale = self.pipeline.scale_factor.peek();
+                self.pointer_pos = Point {
+                    x: (position.x / scale) as f32,
+                    y: (position.y / scale) as f32,
+                };
+                let move_callback = self.pointer_move_handler.borrow().clone();
+                if let Some(move_callback) = move_callback {
+                    move_callback(self.pointer_pos);
+                }
+                self.set_pointer(Some(self.pointer_pos));
+                if self.runtime().is_some() {
+                    self.runtime_pointer_moved();
+                    return;
+                }
+                if let Some(drag_click) = self.drag_click.as_mut() {
+                    let dx = self.pointer_pos.x - drag_click.origin.x;
+                    let dy = self.pointer_pos.y - drag_click.origin.y;
+                    drag_click.moved |= dx.hypot(dy) >= 4.0;
+                }
+                let pointer = self.pointer_pos;
+                let hovered_cursor = self
+                    .resize_direction()
+                    .map(resize_cursor)
+                    .or_else(|| self.scene(|scene| scene.cursor_hit_test(pointer)))
+                    .unwrap_or(CursorIcon::Default);
+                if hovered_cursor != self.current_cursor {
+                    self.current_cursor = hovered_cursor;
+                    if let Some(window) = self.pipeline.window.borrow().as_ref() {
+                        window.set_cursor(translate_cursor_icon(hovered_cursor));
+                    }
+                }
+
+                // Widgets are rebuilt on every reactive frame, so callback
+                // `Rc`s are not stable identities; the hovered rect is.
+                let next_hover = self.scene(|scene| scene.hover_hit_test(pointer));
+                let unchanged = matches!(
+                    (&self.hovered, &next_hover),
+                    (Some((current, _)), Some((next, _))) if current == next
+                );
+                if !unchanged {
+                    if let Some((_, previous)) = self.hovered.take() {
+                        previous(false);
+                    }
+                    if let Some((rect, next)) = next_hover {
+                        next(true);
+                        self.hovered = Some((rect, next));
+                    }
+                }
+
+                if self.dragging.is_some() {
+                    self.refresh_pending_drag();
+                } else if !unchanged {
+                    self.pipeline.invalidate_paint();
+                }
+            }
+            // A real Wayland drag-and-drop suppresses normal pointer motion
+            // for the duration of the grab; these drive the same callbacks.
+            WindowEvent::DragEntered { position } | WindowEvent::DragMoved { position } => {
+                if let Some(callback) = self.pointer_presence_handler.borrow().clone() {
+                    callback(true);
+                }
+                let scale = self.pipeline.scale_factor.peek();
+                self.pointer_pos = Point {
+                    x: (position.x / scale) as f32,
+                    y: (position.y / scale) as f32,
+                };
+                if let Some(callback) = self.pointer_move_handler.borrow().clone() {
+                    callback(self.pointer_pos);
+                }
+                self.set_pointer(Some(self.pointer_pos));
+                if self.dragging.is_some() {
+                    self.refresh_pending_drag();
+                }
+                self.pipeline.invalidate_paint();
+            }
+            WindowEvent::DragSourceFinished => {
+                self.native_drag_active.set(false);
+                if self.popup_done_during_drag {
+                    self.close_requested.set(true);
+                }
+                self.dragging = None;
+                self.pending_drag = None;
+                self.drag_click = None;
+                if let Some(handler) = self.drag_end.take() {
+                    handler();
+                }
+                self.pipeline.invalidate_paint();
+            }
+            WindowEvent::FilesDroppedAt { paths, position } => {
+                let scale = self.pipeline.scale_factor.peek();
+                let point = Point {
+                    x: (position.x / scale) as f32,
+                    y: (position.y / scale) as f32,
+                };
+                self.dispatch_file_drop(paths, point);
+                self.pipeline.invalidate_paint();
+            }
+            WindowEvent::FilesDropped { paths } => {
+                self.dispatch_file_drop(paths, self.pointer_pos);
+                self.pipeline.invalidate_paint();
+            }
+            WindowEvent::DragLeft | WindowEvent::DragDropped => {
+                if matches!(event, WindowEvent::DragLeft) {
+                    if let Some(callback) = self.pointer_presence_handler.borrow().clone() {
+                        callback(false);
+                    }
+                    self.set_pointer(None);
+                }
+                self.dragging = None;
+                self.pending_drag = None;
+                if let Some(handler) = self.drag_end.take() {
+                    handler();
+                }
+                self.pipeline.invalidate_paint();
+            }
+            WindowEvent::MouseInput {
+                pressed: true,
+                button: MouseButton::Left,
+                serial,
+            } => {
+                self.last_input_serial.set(serial);
+                self.set_focus_visible(false);
+                self.set_press_origin(Some(self.pointer_pos));
+                self.pipeline.invalidate_paint();
+                if let Some(direction) = self.resize_direction() {
+                    if let Some(window) = self.pipeline.window.borrow().as_ref() {
+                        let result = match serial {
+                            Some(serial) => {
+                                window.drag_resize_window_with_serial(direction, serial)
+                            }
+                            None => window.drag_resize_window(direction),
+                        };
+                        if let Err(error) = result {
+                            log::debug!("creamui-render: interactive resize failed: {error}");
+                        }
+                    }
+                    return;
+                }
+                if let Some(handler) = self.scene(|scene| scene.window_drag_at(self.pointer_pos)) {
+                    handler();
+                    return;
+                }
+                if self.runtime().is_some() {
+                    self.runtime_pointer_pressed();
+                    return;
+                }
+                let pointer = self.pointer_pos;
+                let Some((click, click_at, new_focus, drag_start, drag_anchor)) =
+                    self.scene(|scene| {
+                        let drag_start = scene.drag_hit_test(pointer).and_then(|index| {
+                            scene.draggable_at(index).map(|(rect, handler)| {
+                                (index, rect, handler.clone(), scene.drag_end_at(index))
+                            })
+                        });
+                        Some((
+                            scene.hit_test(pointer).cloned(),
+                            scene.hit_test_at(pointer).cloned(),
+                            scene.focus_hit_test(pointer),
+                            drag_start,
+                            scene.drag_start_at(pointer),
+                        ))
+                    })
+                else {
+                    return;
+                };
+
+                let has_drag = drag_start.is_some();
+                if has_drag && (click.is_some() || click_at.is_some()) {
+                    self.drag_click = Some(DragClick {
+                        origin: pointer,
+                        on_click: click.clone(),
+                        on_click_at: click_at.clone(),
+                        moved: false,
+                    });
+                }
+                if self.set_legacy_focus(new_focus) {
+                    self.restart_caret();
+                }
+                self.refresh_ime_for_legacy_focus();
+                if let Some((rect, handler)) = drag_anchor {
+                    handler(
+                        Point {
+                            x: pointer.x - rect.x,
+                            y: pointer.y - rect.y,
+                        },
+                        rect,
+                    );
+                }
+                if let Some((index, rect, handler, drag_end)) = drag_start {
+                    self.dragging = Some(index);
+                    self.drag_end = drag_end;
+                    handler(
+                        Point {
+                            x: pointer.x - rect.x,
+                            y: pointer.y - rect.y,
+                        },
+                        rect,
+                    );
+                    self.pipeline.invalidate_layout();
+                    return;
+                }
+                if let Some(handler) = click_at {
+                    log::debug!("creamui-render: click at {pointer:?}");
+                    handler(pointer);
+                    self.pipeline.invalidate_layout();
+                } else if let Some(handler) = click {
+                    log::debug!("creamui-render: click at {pointer:?}");
+                    handler();
+                    self.pipeline.invalidate_layout();
+                }
+            }
+            WindowEvent::MouseInput {
+                pressed: false,
+                button: MouseButton::Left,
+                ..
+            } => {
+                if self.runtime().is_some() {
+                    self.set_press_origin(None);
+                    self.runtime_pointer_released();
+                    return;
+                }
+                self.dragging = None;
+                self.pending_drag = None;
+                self.set_press_origin(None);
+                if let Some(handler) = self.drag_end.take() {
+                    handler();
+                }
+                if let Some(drag_click) = self.drag_click.take() {
+                    if !drag_click.moved {
+                        if let Some(handler) = drag_click.on_click_at {
+                            handler(self.pointer_pos);
+                        } else if let Some(handler) = drag_click.on_click {
+                            handler();
+                        }
+                        self.pipeline.invalidate_layout();
+                    }
+                }
+                self.pipeline.invalidate_paint();
+            }
+            WindowEvent::CursorLeft => {
+                let callback = self.pointer_presence_handler.borrow().clone();
+                if let Some(callback) = callback {
+                    callback(false);
+                }
+                self.set_pointer(None);
+                if let Some(runtime) = self.runtime() {
+                    let previous = runtime.with_mut(|runtime| {
+                        let previous = runtime.pointer().hovered;
+                        runtime.set_hovered(None);
+                        previous.and_then(|id| runtime.get(id)?.events.on_hover.clone())
+                    });
+                    if let Some(handler) = previous {
+                        handler(false);
+                    }
+                    return;
+                }
+                if let Some((_, callback)) = self.hovered.take() {
+                    callback(false);
+                }
+                self.pipeline.invalidate_paint();
+            }
+            WindowEvent::Focused(false) => {
+                log::trace!(
+                    "creamui-render: focus lost for {:?}",
+                    self.pipeline
+                        .window
+                        .borrow()
+                        .as_ref()
+                        .map(|window| window.id())
+                );
+                if let Some(runtime) = self.runtime() {
+                    runtime.with_mut(|runtime| {
+                        runtime.set_pressed(None);
+                        runtime.release_pointer_capture();
+                    });
+                }
+                self.set_press_origin(None);
+                self.set_ime_allowed(false);
+                if self.runtime().is_none() {
+                    self.set_legacy_focus(None);
+                }
+                self.dragging = None;
+                self.pending_drag = None;
+                self.pipeline.invalidate_paint();
+                if let Some(handler) = self.focus_lost_handler.borrow().as_ref().cloned() {
+                    handler();
+                }
+            }
+            WindowEvent::PopupDone => {
+                log::trace!(
+                    "creamui-render: compositor dismissed popup {:?}",
+                    self.pipeline
+                        .window
+                        .borrow()
+                        .as_ref()
+                        .map(|window| window.id())
+                );
+                if self.native_drag_active.peek() {
+                    self.popup_done_during_drag = true;
+                } else {
+                    self.close_requested.set(true);
+                }
+                if let Some(handler) = self.focus_lost_handler.borrow().as_ref().cloned() {
+                    handler();
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let scale = self.pipeline.scale_factor.peek();
+                // Positive `delta_y` reveals content further down.
+                let delta_y: f32 = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => -y * 40.0,
+                    MouseScrollDelta::PixelDelta(pos) => -(pos.y / scale) as f32,
+                };
+                self.scroll_at(self.pointer_pos, delta_y);
+            }
+            WindowEvent::Touch {
+                id,
+                phase,
+                position,
+            } => self.handle_touch(id, phase, position),
+            WindowEvent::KeyboardInput(event) if !event.synthetic => {
+                let handler = self.keyboard_handler.borrow().clone();
+                if handler.is_some_and(|handler| handler(event.clone(), self.modifiers)) {
+                    self.pipeline.invalidate_paint();
+                    return;
+                }
+                if !event.pressed {
+                    return;
+                }
+                if event.key == PlatformKey::Back && self.ime_allowed {
+                    if let Some(runtime) = self.runtime() {
+                        runtime.with_mut(|runtime| runtime.set_focused(None));
+                    } else {
+                        self.set_legacy_focus(None);
+                    }
+                    self.set_ime_allowed(false);
+                    self.pipeline.invalidate_paint();
+                    return;
+                }
+                #[cfg(feature = "router")]
+                if event.key == PlatformKey::Back && self.pipeline.router_host.router().is_some() {
+                    match self.pipeline.router_host.back() {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            #[cfg(target_os = "android")]
+                            if let Some(router) = self.pipeline.router_host.router() {
+                                if let Err(error) =
+                                    creamui_router::android::background_task(&router)
+                                {
+                                    log::warn!("router root Back failed: {error}");
+                                }
+                            }
+                            #[cfg(not(target_os = "android"))]
+                            self.close_requested.set(true);
+                        }
+                        Err(error) => log::warn!("router back failed: {error}"),
+                    }
+                    return;
+                }
+                if event.key == PlatformKey::F3 {
+                    let toggled = self
+                        .pipeline
+                        .frame
+                        .borrow_mut()
+                        .devtools
+                        .as_mut()
+                        .is_some_and(|devtools| devtools.toggle());
+                    if toggled {
+                        self.next_devtools_refresh = Instant::now();
+                        self.pipeline.invalidate_paint();
+                    }
+                    return;
+                }
+                let command = match event.key {
+                    PlatformKey::F4 => Some(DevtoolsCommand::ToggleTree),
+                    PlatformKey::F5 => Some(DevtoolsCommand::ToggleDamage),
+                    PlatformKey::F6 => Some(DevtoolsCommand::ToggleLayout),
+                    PlatformKey::F7 => Some(DevtoolsCommand::ToggleHitRegions),
+                    PlatformKey::F8 if self.modifiers.shift => Some(DevtoolsCommand::PreviousNode),
+                    PlatformKey::F8 => Some(DevtoolsCommand::NextNode),
+                    _ => None,
+                };
+                if let Some(command) = command {
+                    let changed = self
+                        .pipeline
+                        .frame
+                        .borrow_mut()
+                        .devtools
+                        .as_mut()
+                        .is_some_and(|tools| tools.command(command));
+                    if changed {
+                        self.next_devtools_refresh = Instant::now();
+                        self.pipeline.invalidate_paint();
+                    }
+                    return;
+                }
+                let Some(key) = translate_key(&event.key) else {
+                    return;
+                };
+                self.handle_key_input(KeyInput {
+                    key,
+                    modifiers: Modifiers {
+                        ctrl: self.modifiers.ctrl,
+                        shift: self.modifiers.shift,
+                        alt: self.modifiers.alt,
+                        logo: self.modifiers.logo,
+                    },
+                });
+            }
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers,
+            WindowEvent::RedrawRequested => {
+                self.poll_decorations();
+                self.redraw();
+            }
+            _ => {}
+        }
+    }
+
+    fn sync_decorations(&mut self, decorations: WindowDecorations) {
+        self.frameless_resizable = self.resizable
+            && matches!(
+                decorations.mode,
+                WindowDecorationMode::Client
+                    | WindowDecorationMode::None
+                    | WindowDecorationMode::Hybrid
+            );
+        if self.pipeline.decorations.peek() != decorations {
+            self.pipeline.decorations.set(decorations);
+            self.pipeline.invalidate_layout();
+        }
+    }
+
+    /// Backends without decoration events (winit) change maximized state,
+    /// frame ownership and platform hover synchronously; pick those up here.
+    fn poll_decorations(&mut self) {
+        let polled = self
+            .pipeline
+            .window
+            .borrow()
+            .as_ref()
+            .map(|window| window.window_decorations());
+        if let Some(decorations) = polled {
+            self.sync_decorations(decorations);
+        }
+    }
+
+    fn suspend(&mut self) {
+        if self.suspended {
+            return;
+        }
+        self.suspended = true;
+        self.presenter = None;
+        self.paced_present = false;
+        self.touch = None;
+        self.modifiers = PlatformModifiers::default();
+        self.cancel_pointer_interaction();
+        self.set_ime_allowed(false);
+        let mut frame = self.pipeline.frame.borrow_mut();
+        if let Some(list) = frame.presented.take() {
+            frame.recorder.recycle(list);
+        }
+        frame.adapter = None;
+        log::debug!("creamui-render: window presenter suspended");
+    }
+
+    fn resume(&mut self, presenter: Presenter) {
+        if !self.suspended {
+            return;
+        }
+        self.pipeline.frame.borrow_mut().adapter = presenter.adapter();
+        log::debug!("creamui-render: {} presenter resumed", presenter.name());
+        self.presenter = Some(presenter);
+        self.suspended = false;
+        self.frame_interval_checked = None;
+        let now = Instant::now();
+        self.next_blink = now + CARET_BLINK_INTERVAL;
+        self.next_animation = now;
+        self.next_devtools_refresh = now;
+        if let Some(window) = self.pipeline.window.borrow().as_ref() {
+            set_if_changed(&self.pipeline.scale_factor, window.scale_factor());
+        }
+        self.queue_viewport(self.viewport_from_window());
+        self.pipeline.invalidate_layout();
+    }
+
+    fn redraw(&mut self) {
+        if self.suspended {
+            return;
+        }
+        if let Some((local, rect, handler)) = self.pending_drag.take() {
+            handler(local, rect);
+            // Drag handlers may write plain `Cell`s rather than signals.
+            self.pipeline.invalidate_layout();
+        }
+        self.refresh_safe_area();
+        self.flush_pending_viewport();
+        self.pipeline.update();
+        let ready = self
+            .pipeline
+            .window
+            .borrow()
+            .as_ref()
+            .is_none_or(|window| window.is_ready());
+        if !ready {
+            return;
+        }
+        let presented = self.pipeline.present(self.presenter.as_mut());
+        if matches!(self.pipeline.source, UiSource::Legacy(_)) {
+            self.refresh_ime_for_legacy_focus();
+        }
+        self.paced_present = presented
+            && (self
+                .presenter
+                .as_ref()
+                .is_some_and(Presenter::paces_presents)
+                || self
+                    .pipeline
+                    .window
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|window| window.paces_redraws()));
+        if !self.first_present_logged {
+            self.first_present_logged = true;
+            log::debug!(
+                "creamui-render: first present done: {:?}",
+                self.t_run.elapsed()
+            );
+        }
+    }
+
+    fn frame_interval(&mut self, now: Instant) -> Duration {
+        if self
+            .frame_interval_checked
+            .is_none_or(|checked| now - checked >= REFRESH_QUERY_INTERVAL)
+        {
+            self.frame_interval_checked = Some(now);
+            self.frame_interval = self
+                .pipeline
+                .window
+                .borrow()
+                .as_ref()
+                .and_then(|window| window.refresh_interval())
+                .unwrap_or(DEFAULT_FRAME_INTERVAL);
+        }
+        self.frame_interval
+    }
+
+    /// Fires time-driven repaints that are due and returns when the next one
+    /// is.
+    fn tick(&mut self, now: Instant) -> Option<Instant> {
+        if self.suspended {
+            return None;
+        }
+        let mut next_wake: Option<Instant> = None;
+        let mut wake_at = |at: Instant| {
+            next_wake = Some(next_wake.map_or(at, |t: Instant| t.min(at)));
+        };
+        #[cfg(any(target_os = "android", test))]
+        if let Some((next, until)) = self.inset_poll {
+            if now >= next {
+                self.refresh_safe_area();
+                self.inset_poll =
+                    (now < until).then_some(((now + Duration::from_millis(50)).min(until), until));
+            }
+            if let Some((next, _)) = self.inset_poll {
+                wake_at(next);
+            }
+        }
+        if self.pipeline.animated() {
+            if std::mem::take(&mut self.paced_present) {
+                self.pipeline.invalidate_paint();
+            } else {
+                if now >= self.next_animation {
+                    let interval = self.frame_interval(now);
+                    self.next_animation = (self.next_animation + interval).max(now);
+                    self.pipeline.invalidate_paint();
+                }
+                wake_at(self.next_animation);
+            }
+        }
+        if let Some(interval) = self.pipeline.devtools_refresh() {
+            if now >= self.next_devtools_refresh {
+                self.next_devtools_refresh = now + interval;
+                self.pipeline.invalidate_paint();
+            }
+            wake_at(self.next_devtools_refresh);
+        }
+        if self.pipeline.focused.get().is_some() {
+            if now >= self.next_blink {
+                let caret = &self.pipeline.caret_visible;
+                caret.set(!caret.get());
+                self.next_blink = now + CARET_BLINK_INTERVAL;
+                self.pipeline.invalidate_paint();
+            }
+            wake_at(self.next_blink);
+        }
+        next_wake
+    }
+}
+
+/// The shared [`ApplicationHandler`] driving every window opened by
+/// [`AppBuilder`] (and, for a single window, [`run`]) from one event loop.
+struct AppHandler {
+    #[cfg(feature = "system-theme")]
+    _appearance_monitor: system_appearance::Monitor,
+    /// Drained the first time `resumed` runs.
+    pending: Vec<WindowSpec>,
+    commands: Rc<RefCell<AppCommands>>,
+    app: AppHandle,
+    on_started: Option<Box<dyn FnOnce(AppHandle)>>,
+    started: bool,
+    suspended: bool,
+    exit_when_last_window_closes: bool,
+    dump_frame_path: Option<String>,
+    next_window_index: usize,
+    windows: HashMap<WindowId, WindowState>,
+    #[cfg(all(feature = "tray", target_os = "linux"))]
+    pending_trays: Vec<TrayBuilder>,
+    #[cfg(all(feature = "tray", target_os = "linux"))]
+    trays: Vec<InstalledTray>,
+    #[cfg(all(feature = "tray", target_os = "linux"))]
+    proxy: EventLoopProxy<AppEvent>,
+    /// Instance, adapter and device being prepared off the UI thread,
+    /// taken by the first GPU window.
+    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+    gpu_prepare: Option<std::thread::JoinHandle<crate::gpu::PreparedGpu>>,
+    /// One `wgpu::Instance` shared by every GPU window; `None` until the
+    /// first one is created.
+    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+    gpu_instance: Option<Rc<wgpu::Instance>>,
+    /// Adapter/device/queue negotiated by the first GPU window and reused
+    /// by every later one; `None` until that first window is created.
+    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+    gpu_context: Option<crate::gpu::GpuContext>,
+}
+
+impl AppHandler {
+    fn create_presenter(
+        &mut self,
+        window: &Arc<dyn PlatformWindow>,
+        backend: RenderBackend,
+        transparent: bool,
+    ) -> Presenter {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            #[cfg(feature = "gpu")]
+            if backend == RenderBackend::Gpu && self.gpu_instance.is_none() {
+                let prepared = match self.gpu_prepare.take() {
+                    Some(handle) => handle.join().expect("GPU preparation thread panicked"),
+                    None => crate::gpu::PreparedGpu::instance_only(),
+                };
+                let (instance, context) = prepared.into_parts();
+                self.gpu_instance = Some(Rc::new(instance));
+                if self.gpu_context.is_none() {
+                    self.gpu_context = context;
+                }
+            }
+            Presenter::new(
+                window,
+                backend,
+                transparent,
+                #[cfg(feature = "gpu")]
+                self.gpu_instance.as_deref(),
+                #[cfg(feature = "gpu")]
+                &mut self.gpu_context,
+            )
+            .unwrap_or_else(|err| {
+                panic!("creamui-render: no usable presenter for the window: {err}")
+            })
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (backend, transparent);
+            Presenter::new(window)
+        }
+    }
+
+    fn create_window(&mut self, event_loop: &ActiveEventLoop<'_>, spec: WindowSpec) {
+        if self.suspended {
+            self.pending.push(spec);
+            return;
+        }
+        #[cfg(target_os = "android")]
+        if !self.windows.is_empty() || spec.popup.is_some() {
+            log::warn!("creamui-render: Android window request rejected; one activity window is supported, use hosted overlays for dialogs and popups");
+            return;
+        }
+        if spec
+            .popup
+            .as_ref()
+            .and_then(|popup| popup.is_current.as_ref())
+            .is_some_and(|current| !current())
+        {
+            return;
+        }
+        let t0 = Instant::now();
+        let attrs = PlatformWindowAttributes {
+            title: spec.options.title.clone(),
+            size: LogicalSize::new(spec.options.width as f64, spec.options.height as f64),
+            position: spec
+                .options
+                .position
+                .map(|(x, y)| LogicalPosition::new(x as f64, y as f64)),
+            resizable: spec.options.resizable,
+            decorations: spec.options.decorations,
+            transparent: spec.options.transparent,
+            role: spec.options.role,
+        };
+
+        let popup_parent = spec.popup.as_ref().and_then(|popup| {
+            popup
+                .parent
+                .window
+                .borrow()
+                .as_ref()
+                .map(|window| window.id())
+        });
+        let result = match spec.popup.as_ref() {
+            Some(popup) => popup_parent
+                .ok_or_else(|| "popup parent no longer exists".to_owned())
+                .and_then(|parent| {
+                    event_loop.create_popup(
+                        attrs,
+                        PlatformPopupOptions {
+                            parent,
+                            anchor_x: popup.anchor.x,
+                            anchor_y: popup.anchor.y,
+                            anchor_width: popup.anchor.width,
+                            anchor_height: popup.anchor.height,
+                            input_serial: popup.input_serial,
+                            placement: popup.placement,
+                            resize_to_fit: popup.resize_to_fit,
+                        },
+                    )
+                }),
+            None => event_loop.create_window(attrs),
+        };
+        let window = match result {
+            Ok(window) => window,
+            Err(error) if spec.popup.is_some() => {
+                log::warn!("creamui-render: could not create popup: {error}");
+                if let Some(handler) = spec
+                    .popup
+                    .as_ref()
+                    .and_then(|popup| popup.on_error.as_ref())
+                {
+                    handler(error);
+                }
+                return;
+            }
+            Err(error) => panic!("failed to create window: {error}"),
+        };
+        if let Some(region) = spec.options.blur.clone() {
+            window.set_blur_region(Some(region));
+        }
+        // Show the window immediately; the presenter's first frame replaces
+        // the platform's placeholder surface moments later.
+        window.set_visible(true);
+        log::debug!(
+            "creamui-render: window created ({}x{} logical, scale factor {}) in {:?}",
+            spec.options.width,
+            spec.options.height,
+            window.scale_factor(),
+            t0.elapsed()
+        );
+
+        let pipeline = spec.pipeline;
+        set_if_changed(&pipeline.decorations, window.window_decorations());
+        pipeline.scale_factor.set(window.scale_factor());
+        *pipeline.window.borrow_mut() = Some(window.clone());
+        pipeline.titlebar.apply();
+        {
+            let physical = window.inner_size();
+            let scale = window.scale_factor();
+            let surface = Size {
+                width: (physical.width as f64 / scale) as f32,
+                height: (physical.height as f64 / scale) as f32,
+            };
+            if pipeline.surface.peek() != surface {
+                pipeline.surface.set(surface);
+            }
+            pipeline.sync_frame();
+        }
+
+        let presenter =
+            self.create_presenter(&window, spec.options.backend, spec.options.transparent);
+        pipeline.frame.borrow_mut().adapter = presenter.adapter();
+        log::debug!(
+            "creamui-render: {} presenter ready: {:?}",
+            presenter.name(),
+            t0.elapsed()
+        );
+
+        let runtime = match &pipeline.source {
+            UiSource::Runtime(source) => Some(source.runtime.clone()),
+            UiSource::Legacy(_) => None,
+        };
+
+        let on_chrome_changed: Rc<dyn Fn()> = {
+            let pipeline = pipeline.clone();
+            Rc::new(move || {
+                pipeline.sync_frame();
+                pipeline.invalidate_paint();
+            })
+        };
+        (spec.on_window_ready)(WindowHandle {
+            window: pipeline.window.clone(),
+            theme: pipeline.theme.clone(),
+            chrome: pipeline.chrome.clone(),
+            decorations: pipeline.decorations.clone(),
+            on_chrome_changed,
+            close_requested: spec.close_requested.clone(),
+            focus_lost_handler: spec.focus_lost_handler.clone(),
+            close_handler: spec.close_handler.clone(),
+            keyboard_handler: spec.keyboard_handler.clone(),
+            pointer_presence_handler: spec.pointer_presence_handler.clone(),
+            pointer_move_handler: spec.pointer_move_handler.clone(),
+            pointer_button_handler: spec.pointer_button_handler.clone(),
+            file_drop_handler: spec.file_drop_handler.clone(),
+            last_input_serial: spec.last_input_serial.clone(),
+            native_drag_active: spec.native_drag_active.clone(),
+            app: self.app.clone(),
+            runtime,
+            pipeline: Rc::downgrade(&pipeline),
+        });
+
+        let now = Instant::now();
+        let frameless_resizable = spec.options.resizable
+            && matches!(
+                pipeline.decorations.peek().mode,
+                WindowDecorationMode::Client
+                    | WindowDecorationMode::None
+                    | WindowDecorationMode::Hybrid
+            );
+        let mut state = WindowState {
+            popup_parent,
+            pipeline,
+            close_requested: spec.close_requested,
+            focus_lost_handler: spec.focus_lost_handler,
+            close_handler: spec.close_handler,
+            keyboard_handler: spec.keyboard_handler,
+            pointer_presence_handler: spec.pointer_presence_handler,
+            pointer_move_handler: spec.pointer_move_handler,
+            pointer_button_handler: spec.pointer_button_handler,
+            file_drop_handler: spec.file_drop_handler,
+            last_input_serial: spec.last_input_serial,
+            native_drag_active: spec.native_drag_active,
+            popup_done_during_drag: false,
+            close_behavior: spec.options.close_behavior,
+            frameless_resizable,
+            resizable: spec.options.resizable,
+            presenter: Some(presenter),
+            backend: spec.options.backend,
+            transparent: spec.options.transparent,
+            suspended: false,
+            zero_sized: false,
+            pointer_pos: Point::default(),
+            modifiers: PlatformModifiers::default(),
+            next_blink: now + CARET_BLINK_INTERVAL,
+            next_animation: now,
+            paced_present: false,
+            frame_interval: DEFAULT_FRAME_INTERVAL,
+            frame_interval_checked: None,
+            next_devtools_refresh: now,
+            pending_viewport: None,
+            current_cursor: CursorIcon::Default,
+            hovered: None,
+            dragging: None,
+            drag_end: None,
+            drag_click: None,
+            pending_drag: None,
+            runtime_dragged: false,
+            runtime_press_origin: None,
+            touch: None,
+            ime_allowed: false,
+            #[cfg(any(target_os = "android", test))]
+            inset_poll: None,
+            _effect: spec._effect,
+            _runtime_subscription: spec._runtime_subscription,
+            t_run: t0,
+            first_present_logged: false,
+        };
+        if window.is_ready() {
+            state.redraw();
+        }
+        self.windows.insert(window.id(), state);
+    }
+}
+
+enum AppEvent {
+    #[cfg(all(
+        feature = "system-theme",
+        any(target_os = "linux", target_os = "windows")
+    ))]
+    SystemAppearance(
+        creamui_theme::SystemAppearance,
+        Option<Box<creamui_theme::ResolvedAppearance>>,
+    ),
+    #[cfg(all(feature = "tray", target_os = "linux"))]
+    TrayMenu(String),
+    BackgroundJob(u64, Box<dyn Any + Send>),
+}
+
+impl ApplicationHandler<AppEvent> for AppHandler {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop<'_>) {
+        self.suspended = false;
+        self.close_requested_windows(event_loop);
+        let suspended: Vec<WindowId> = self
+            .windows
+            .iter()
+            .filter_map(|(id, state)| state.suspended.then_some(*id))
+            .collect();
+        for id in suspended {
+            let state = &self.windows[&id];
+            let Some(window) = state.pipeline.window.borrow().as_ref().cloned() else {
+                continue;
+            };
+            let presenter = self.create_presenter(&window, state.backend, state.transparent);
+            self.windows
+                .get_mut(&id)
+                .expect("window exists during resume")
+                .resume(presenter);
+        }
+        #[cfg(all(feature = "tray", target_os = "linux"))]
+        if self.trays.is_empty() {
+            self.trays = std::mem::take(&mut self.pending_trays)
+                .into_iter()
+                .enumerate()
+                .map(|(index, tray)| {
+                    tray.install(index, self.proxy.clone())
+                        .expect("creamui-render: failed to create system tray icon")
+                })
+                .collect();
+        }
+        if !self.started {
+            self.started = true;
+            if let Some(on_started) = self.on_started.take() {
+                on_started(self.app.clone());
+            }
+        }
+        let pending = std::mem::take(&mut self.pending);
+        for spec in pending {
+            self.create_window(event_loop, spec);
+        }
+        self.drain_app_commands(event_loop);
+    }
+
+    fn suspended(&mut self, _event_loop: &ActiveEventLoop<'_>) {
+        self.suspended = true;
+        for state in self.windows.values_mut() {
+            state.suspend();
+        }
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop<'_>,
+        window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        if matches!(event, WindowEvent::CloseRequested) {
+            let hide = self
+                .windows
+                .get(&window_id)
+                .filter(|state| state.close_behavior == CloseBehavior::Hide);
+            if let Some(state) = hide {
+                if let Some(window) = state.pipeline.window.borrow().as_ref() {
+                    window.set_visible(false);
+                }
+                return;
+            }
+            self.close_window(event_loop, window_id);
+            return;
+        }
+
+        if let Some(state) = self.windows.get_mut(&window_id) {
+            state.handle_window_event(event);
+        }
+        if self
+            .windows
+            .get(&window_id)
+            .is_some_and(|state| state.close_requested.get())
+        {
+            self.close_window(event_loop, window_id);
+        }
+    }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop<'_>, event: AppEvent) {
+        match event {
+            #[cfg(all(
+                feature = "system-theme",
+                any(target_os = "linux", target_os = "windows")
+            ))]
+            AppEvent::SystemAppearance(appearance, resolved) => {
+                // Release command borrows before signals trigger application effects.
+                let following = self.commands.borrow().system_theme.is_some();
+                if let Some(resolved) = resolved.as_ref().filter(|_| following) {
+                    if let Some(family) = &resolved.font_family {
+                        creamui_fonts::use_system_font(family);
+                    }
+                    let mut commands = self.commands.borrow_mut();
+                    commands.system_theme = Some(resolved.theme);
+                    for pending in &mut commands.windows {
+                        if pending.follow_system_theme {
+                            pending.options.theme = resolved.theme;
+                        }
+                    }
+                }
+                creamui_reactive::batch(|| {
+                    SYSTEM_APPEARANCE.with(|provider| provider.set(appearance));
+                    if let Some(resolved) = resolved {
+                        for spec in &self.pending {
+                            if spec.pipeline.follow_system_theme.get() {
+                                spec.pipeline.theme.set(resolved.theme);
+                            }
+                        }
+                        for state in self.windows.values() {
+                            if state.pipeline.follow_system_theme.get() {
+                                state.pipeline.theme.set(resolved.theme);
+                            }
+                        }
+                    }
+                });
+            }
+            #[cfg(all(feature = "tray", target_os = "linux"))]
+            AppEvent::TrayMenu(id) => {
+                for tray in &self.trays {
+                    if let Some(action) = tray.actions.get(&id) {
+                        action(&self.app);
+                        break;
+                    }
+                }
+            }
+            AppEvent::BackgroundJob(job_id, value) => {
+                resolve_background_job(&self.commands, job_id, value);
+            }
+        }
+        self.drain_app_commands(event_loop);
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop<'_>) {
+        #[cfg(feature = "router")]
+        for state in self.windows.values() {
+            state.pipeline.router_host.poll();
+        }
+        // Closes before creates: a replacement popup must not be requested
+        // while the one it's replacing is still alive server-side.
+        self.close_requested_windows(event_loop);
+
+        self.drain_app_commands(event_loop);
+        if self.commands.borrow().exit_requested {
+            event_loop.exit();
+            return;
+        }
+
+        let now = Instant::now();
+        let next_wake = self
+            .windows
+            .values_mut()
+            .filter_map(|state| state.tick(now))
+            .min();
+        // A reused NativeActivity exposes new Intent data through setIntent,
+        // but winit has no onNewIntent event. Poll only while the app is active.
+        #[cfg(all(feature = "router", target_os = "android"))]
+        let next_wake = if !self.suspended
+            && self
+                .windows
+                .values()
+                .any(|state| state.pipeline.router_host.router().is_some())
+        {
+            Some(
+                next_wake
+                    .unwrap_or(now + Duration::from_millis(250))
+                    .min(now + Duration::from_millis(250)),
+            )
+        } else {
+            next_wake
+        };
+        event_loop.set_control_flow(match next_wake {
+            Some(t) => ControlFlow::WaitUntil(t),
+            None => ControlFlow::Wait,
+        });
+    }
+}
+
+impl AppHandler {
+    fn close_requested_windows(&mut self, event_loop: &ActiveEventLoop<'_>) {
+        let close_requests: Vec<WindowId> = self
+            .windows
+            .iter()
+            .filter_map(|(id, state)| state.close_requested.get().then_some(*id))
+            .collect();
+        for window_id in close_requests {
+            self.close_window(event_loop, window_id);
+        }
+    }
+
+    fn drain_app_commands(&mut self, event_loop: &ActiveEventLoop<'_>) {
+        self.close_requested_windows(event_loop);
+        let (windows, exit_requested) = {
+            let mut commands = self.commands.borrow_mut();
+            (
+                std::mem::take(&mut commands.windows),
+                commands.exit_requested,
+            )
+        };
+        if exit_requested {
+            event_loop.exit();
+            return;
+        }
+
+        for mut pending in windows {
+            if pending
+                .popup
+                .as_ref()
+                .and_then(|popup| popup.is_current.as_ref())
+                .is_some_and(|current| !current())
+            {
+                continue;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                pending.options.backend = RenderBackend::resolve(pending.options.backend);
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                pending.options.backend = RenderBackend::Gpu;
+            }
+            let spec = build_window_spec(
+                self.next_window_index,
+                pending,
+                self.dump_frame_path.as_deref(),
+                true,
+            );
+            self.next_window_index += 1;
+            self.create_window(event_loop, spec);
+        }
+    }
+
+    fn close_window(&mut self, event_loop: &ActiveEventLoop<'_>, window_id: WindowId) {
+        if self
+            .windows
+            .get(&window_id)
+            .is_some_and(|state| !state.allow_close())
+        {
+            return;
+        }
+        self.close_window_tree(window_id);
+        if self.windows.is_empty() && self.exit_when_last_window_closes {
+            event_loop.exit();
+        }
+    }
+
+    fn close_window_tree(&mut self, window_id: WindowId) {
+        let children: Vec<_> = self
+            .windows
+            .iter()
+            .filter_map(|(id, state)| (state.popup_parent == Some(window_id)).then_some(*id))
+            .collect();
+        for child in children {
+            let handler = self
+                .windows
+                .get(&child)
+                .and_then(|state| state.close_handler.borrow().clone());
+            if let Some(handler) = handler {
+                handler();
+            }
+            self.close_window_tree(child);
+        }
+        log::debug!("creamui-render: close requested for window {window_id:?}");
+        if let Some(mut state) = self.windows.remove(&window_id) {
+            state.presenter = None;
+            if let Some(window) = state.pipeline.window.borrow_mut().take() {
+                window.close();
+            }
+        }
+    }
+}
+
+/// Opens a window and runs the reactive render loop until it is closed.
+///
+/// Builders returning [`View`] mount once inside the window's hook context;
+/// the window disposes the view on close. Builders returning widgets rerun
+/// whenever a signal they read changes. `clear_color` is the color the window is wiped
+/// to before `build_ui`'s tree is painted. `on_window_ready` is called once,
+/// as soon as the window exists, with a [`WindowHandle`] for issuing
+/// window-level operations (resize, move, always-on-top) later — e.g. from
+/// a click handler.
+///
+/// To open several windows sharing one process and event loop (e.g. a
+/// desktop-shell dock), use [`AppBuilder`] instead.
+pub fn run<V: WindowContent>(
+    options: WindowOptions,
+    clear_color: Color,
+    on_window_ready: impl FnOnce(WindowHandle) + 'static,
+    build_ui: impl Fn(Size) -> V + 'static,
+) {
+    AppBuilder::new()
+        .window(options, clear_color, on_window_ready, build_ui)
+        .run();
+}
+
+#[cfg(all(feature = "platform-android", target_os = "android"))]
+pub fn run_android<V: WindowContent>(
+    app: AndroidApp,
+    options: WindowOptions,
+    clear_color: Color,
+    on_window_ready: impl FnOnce(WindowHandle) + 'static,
+    build_ui: impl Fn(Size) -> V + 'static,
+) {
+    AppBuilder::new()
+        .window(options, clear_color, on_window_ready, build_ui)
+        .run_android(app);
+}
+
+fn run_windows(
+    specs: Vec<PendingWindow>,
+    system_theme: Option<Theme>,
+    on_panic: Option<PanicHandler>,
+    on_started: Option<Box<dyn FnOnce(AppHandle)>>,
+    exit_when_last_window_closes: bool,
+    #[cfg(all(feature = "tray", target_os = "linux"))] trays: Vec<TrayBuilder>,
+    #[cfg(all(feature = "platform-android", target_os = "android"))] android_app: Option<
+        AndroidApp,
+    >,
+) {
+    #[cfg(all(feature = "tray", target_os = "linux"))]
+    let has_tray = !trays.is_empty();
+    #[cfg(not(all(feature = "tray", target_os = "linux")))]
+    let has_tray = false;
+    assert!(
+        !specs.is_empty() || on_started.is_some() || !exit_when_last_window_closes || has_tray,
+        "creamui-render: AppBuilder::run() needs a window, on_started handler, tray, or keep_running()"
+    );
+
+    if let Some(handler) = on_panic {
+        install_panic_dispatch();
+        PANIC_HANDLER.with(|cell| *cell.borrow_mut() = Some(handler));
+    }
+
+    #[cfg(feature = "logger")]
+    init_logging();
+    let t_run = Instant::now();
+    log::debug!("creamui-render: run() start with {} window(s)", specs.len());
+
+    // Each window's requested backend can be force-overridden at launch via
+    // `CUI_OVERRIDE_RENDER_BACKEND` — resolve up front, once per window, so
+    // every later decision (whether to pay GPU init cost at all, which
+    // presenter `resumed` builds for that window) uses the same value.
+    let mut specs = specs;
+    #[cfg(not(target_arch = "wasm32"))]
+    for spec in &mut specs {
+        spec.options.backend = RenderBackend::resolve(spec.options.backend);
+    }
+    #[cfg(target_arch = "wasm32")]
+    for spec in &mut specs {
+        // The web demo always rasterizes into its canvas; there is no
+        // backend choice to make.
+        spec.options.backend = RenderBackend::Gpu;
+    }
+    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+    let any_gpu = specs
+        .iter()
+        .any(|s| matches!(s.options.backend, RenderBackend::Gpu));
+
+    // Creating the instance and requesting an adapter and device don't need
+    // a window and cost tens of milliseconds (loader, ICD enumeration,
+    // driver setup) — start them now so they overlap with the event loop
+    // and the first window's creation instead of sitting on the first
+    // frame's critical path. Skipped entirely if no window needs the GPU.
+    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+    let gpu_prepare = any_gpu.then(|| std::thread::spawn(crate::gpu::prepare));
+
+    let dump_frame_path = std::env::var("CUI_DUMP_FRAME").ok();
+    let multiple_windows = specs.len() > 1;
+    let initial_window_count = specs.len();
+
+    #[cfg(feature = "system-theme")]
+    SYSTEM_APPEARANCE.with(|provider| provider.set(creamui_appearance::query()));
+    let pending: Vec<WindowSpec> = specs
+        .into_iter()
+        .enumerate()
+        .map(|(index, spec)| {
+            build_window_spec(index, spec, dump_frame_path.as_deref(), multiple_windows)
+        })
+        .collect();
+
+    log::debug!(
+        "creamui-render: before EventLoop::new: {:?}",
+        t_run.elapsed()
+    );
+    let event_loop_builder = EventLoop::<AppEvent>::with_user_event();
+    #[cfg(all(feature = "platform-android", target_os = "android"))]
+    let event_loop_builder = {
+        let mut event_loop_builder = event_loop_builder;
+        event_loop_builder.with_android_app(
+            android_app.expect("creamui-render: Android startup requires AndroidApp"),
+        );
+        event_loop_builder
+    };
+    let event_loop = event_loop_builder
+        .build()
+        .expect("failed to create event loop");
+    log::debug!("creamui-render: event loop created: {:?}", t_run.elapsed());
+    event_loop.set_control_flow(ControlFlow::Wait);
+
+    let commands = Rc::new(RefCell::new(AppCommands {
+        system_theme,
+        windows: Vec::new(),
+        exit_requested: false,
+        proxy: event_loop.create_proxy(),
+        next_job_id: 0,
+        background_jobs: HashMap::new(),
+    }));
+    let app = AppHandle {
+        commands: commands.clone(),
+    };
+    let handler = AppHandler {
+        #[cfg(feature = "system-theme")]
+        _appearance_monitor: system_appearance::Monitor::start(
+            event_loop.create_proxy(),
+            system_theme.is_some(),
+        ),
+        pending,
+        commands,
+        app,
+        on_started,
+        started: false,
+        suspended: true,
+        exit_when_last_window_closes,
+        dump_frame_path,
+        // Dynamic windows continue after the initially queued specs.
+        next_window_index: initial_window_count,
+        windows: HashMap::new(),
+        #[cfg(all(feature = "tray", target_os = "linux"))]
+        pending_trays: trays,
+        #[cfg(all(feature = "tray", target_os = "linux"))]
+        trays: Vec::new(),
+        #[cfg(all(feature = "tray", target_os = "linux"))]
+        proxy: event_loop.create_proxy(),
+        #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+        gpu_prepare,
+        #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+        gpu_instance: None,
+        #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+        gpu_context: None,
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut handler = handler;
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Err(error) = event_loop.run_app(&mut handler) {
+        // Losing the Wayland connection is the normal consequence of its
+        // compositor shutting down.  `run_app` cannot distinguish that from
+        // an application-requested exit at this layer, but it must not turn a
+        // compositor shutdown into an application panic.
+        if event_loop_connection_closed(&error) {
+            log::debug!("creamui-render: event loop stopped after compositor disconnect: {error}");
+        } else {
+            panic!("event loop exited with an error: {error}");
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        event_loop.spawn_app(handler);
+    }
+}
+
+/// Whether the platform event loop ended because its display server closed
+/// the connection beneath it.
+fn event_loop_connection_closed(error: &str) -> bool {
+    matches!(
+        error,
+        error if error.contains("Broken pipe")
+            || error.contains("Connection reset")
+            || error.contains("Connection refused")
+    )
+}
+
+fn start_window_move(window: &dyn PlatformWindow, serial: Option<InputSerial>) {
+    let result = match serial {
+        Some(serial) => window.drag_window_with_serial(serial),
+        None => window.drag_window(),
+    };
+    if let Err(error) = result {
+        log::debug!("creamui-render: interactive move failed: {error}");
+    }
+}
+
+/// Builds one window's pre-creation state (signals, pipeline, reactive
+/// effect) — everything that doesn't need the platform window yet.
+fn build_window_spec(
+    index: usize,
+    spec: PendingWindow,
+    dump_frame_path: Option<&str>,
+    multiple_windows: bool,
+) -> WindowSpec {
+    let PendingWindow {
+        follow_system_theme,
+        options,
+        popup,
+        clear_color,
+        on_window_ready,
+        source,
+    } = spec;
+
+    let window: SharedWindow = Rc::new(RefCell::new(None));
+    let last_input_serial = Rc::new(Cell::new(None));
+    let close_requested = Rc::new(Cell::new(false));
+    let decorations = Signal::new(WindowDecorations {
+        mode: if options.decorations && popup.is_none() {
+            WindowDecorationMode::Pending
+        } else {
+            WindowDecorationMode::None
+        },
+        ..Default::default()
+    });
+    let titlebar = Rc::new(TitlebarBridge {
+        window: window.clone(),
+        decorations: decorations.clone(),
+        close_requested: close_requested.clone(),
+        requested: Cell::new(false),
+        applied: Cell::new(false),
+    });
+    let window_controls = WindowControls::new(SharedTitlebar(titlebar.clone()));
+    let window_drag = WindowDragHandle::new({
+        let window = window.clone();
+        let last_input_serial = last_input_serial.clone();
+        move || {
+            if let Some(window) = window.borrow().as_ref() {
+                start_window_move(window.as_ref(), last_input_serial.get());
+            }
+        }
+    });
+    // Several windows sharing one `CUI_DUMP_FRAME` path each get a suffix.
+    let dump_frame_path = dump_frame_path.map(|path| {
+        if multiple_windows {
+            format!("{path}.{index}")
+        } else {
+            path.to_string()
+        }
+    });
+    let pipeline = Rc::new(Pipeline {
+        #[cfg(feature = "router")]
+        router_host: creamui_router::RouterHost::default(),
+        content_blur: options.blur == Some(BlurRegion::Content),
+        applied_blur: RefCell::new(Vec::new()),
+        frame: RefCell::new(FrameState {
+            recorder: SceneRecorder::new(),
+            renderer: match &source {
+                UiSource::Legacy(_) => Renderer::new(),
+                UiSource::Runtime(source) => Renderer::with_runtime(source.runtime.clone()),
+            },
+            scene: None,
+            pending: None,
+            presented: None,
+            raster: None,
+            devtools: devtools_for_new_window(),
+            report: FrameReport::default(),
+            last_report: FrameReport::default(),
+            inspected_content: None,
+            adapter: None,
+        }),
+        surface: Signal::new(Size {
+            width: options.width as f32,
+            height: options.height as f32,
+        }),
+        viewport: Signal::new(Size {
+            width: options.width as f32,
+            height: options.height as f32,
+        }),
+        safe_area: Signal::new(SafeArea::ZERO),
+        decorations,
+        chrome: SystemChrome {
+            mode: Signal::new(options.system_bars),
+            occupied: Signal::new(SafeArea::ZERO),
+            color: Rc::new(Cell::new(None)),
+            applied_light_background: Rc::new(Cell::new(None)),
+        },
+        scale_factor: Signal::new(1.0),
+        window,
+        source: source.clone(),
+        theme: ThemeProvider::new(options.theme),
+        follow_system_theme: Cell::new(follow_system_theme),
+        #[cfg(feature = "system-theme")]
+        system_appearance: SYSTEM_APPEARANCE.with(Clone::clone),
+        window_drag,
+        titlebar,
+        window_controls,
+        clear_color,
+        focused: Cell::new(options.focus_first.then_some(0)),
+        pending_text_input_focus: Cell::new(false),
+        caret_visible: Cell::new(true),
+        pending_root: RefCell::new(None),
+        needs_layout: Cell::new(true),
+        needs_paint: Cell::new(true),
+        dump_frame_path,
+    });
+    let effect = create_effect({
+        let pipeline = pipeline.clone();
+        move || match &pipeline.source {
+            UiSource::Legacy(_) => pipeline.build(),
+            UiSource::Runtime(source) => {
+                creamui_reactive::untrack(|| {
+                    pipeline.with_scope(|| source.mount(pipeline.viewport.peek()))
+                });
+                pipeline.theme.get();
+                pipeline.chrome.mode.get();
+                pipeline.viewport.get();
+                pipeline.safe_area.get();
+                pipeline.invalidate_paint();
+            }
+        }
+    });
+    let runtime_subscription = if let UiSource::Runtime(runtime) = &source {
+        let weak = Rc::downgrade(&pipeline);
+        let listener: Rc<dyn Fn()> = Rc::new(move || {
+            if let Some(pipeline) = weak.upgrade() {
+                pipeline.invalidate_layout();
+            }
+        });
+        runtime.runtime.subscribe(&listener);
+        Some(listener)
+    } else {
+        None
+    };
+
+    WindowSpec {
+        options,
+        popup,
+        on_window_ready,
+        pipeline,
+        _effect: effect,
+        _runtime_subscription: runtime_subscription,
+        close_requested,
+        focus_lost_handler: Rc::new(RefCell::new(None)),
+        close_handler: Rc::new(RefCell::new(None)),
+        keyboard_handler: Rc::new(RefCell::new(None)),
+        pointer_presence_handler: Rc::new(RefCell::new(None)),
+        pointer_move_handler: Rc::new(RefCell::new(None)),
+        pointer_button_handler: Rc::new(RefCell::new(None)),
+        file_drop_handler: Rc::new(RefCell::new(None)),
+        last_input_serial,
+        native_drag_active: Signal::new(false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use creamui_core::runtime::{
+        EventState, ImageContent, ImageFit, ImageNode, Mutation, NodeKind, Runtime,
+    };
+    use std::cell::Cell;
+
+    #[derive(Default)]
+    struct InteractiveTestWindow {
+        latest_input_serial: std::sync::atomic::AtomicU32,
+        native_popups: std::sync::atomic::AtomicBool,
+        minimum: std::sync::Mutex<Vec<Option<LogicalSize>>>,
+        requests: std::sync::Mutex<Vec<(InputSerial, Option<ResizeDirection>)>>,
+        decorations: std::sync::Mutex<WindowDecorations>,
+        minimized: std::sync::Mutex<Vec<bool>>,
+        maximized: std::sync::Mutex<Vec<bool>>,
+        size: std::sync::Mutex<Option<creamui_platform::PhysicalSize>>,
+    }
+
+    impl raw_window_handle::HasDisplayHandle for InteractiveTestWindow {
+        fn display_handle(
+            &self,
+        ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+            Err(raw_window_handle::HandleError::Unavailable)
+        }
+    }
+    impl raw_window_handle::HasWindowHandle for InteractiveTestWindow {
+        fn window_handle(
+            &self,
+        ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+            Err(raw_window_handle::HandleError::Unavailable)
+        }
+    }
+    impl PlatformWindow for InteractiveTestWindow {
+        fn input_serial(&self) -> Option<InputSerial> {
+            let serial = self
+                .latest_input_serial
+                .load(std::sync::atomic::Ordering::Relaxed);
+            (serial != 0).then_some(InputSerial(serial))
+        }
+        fn supports_native_popups(&self) -> bool {
+            self.native_popups
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }
+        fn id(&self) -> WindowId {
+            unreachable!("headless test window has no platform ID")
+        }
+        fn request_redraw(&self) {}
+        fn close(&self) {}
+        fn request_inner_size(&self, _: LogicalSize) {}
+        fn set_min_inner_size(&self, size: Option<LogicalSize>) {
+            self.minimum.lock().unwrap().push(size);
+        }
+        fn set_outer_position(&self, _: LogicalPosition) {}
+        fn outer_position(&self) -> Option<creamui_platform::PhysicalPosition> {
+            None
+        }
+        fn monitor_size(&self) -> Option<creamui_platform::PhysicalSize> {
+            None
+        }
+        fn scale_factor(&self) -> f64 {
+            1.0
+        }
+        fn inner_size(&self) -> creamui_platform::PhysicalSize {
+            self.size
+                .lock()
+                .unwrap()
+                .unwrap_or(creamui_platform::PhysicalSize {
+                    width: 100,
+                    height: 100,
+                })
+        }
+        fn is_ready(&self) -> bool {
+            true
+        }
+        fn set_visible(&self, _: bool) {}
+        fn window_decorations(&self) -> WindowDecorations {
+            *self.decorations.lock().unwrap()
+        }
+        fn set_minimized(&self, minimized: bool) {
+            self.minimized.lock().unwrap().push(minimized);
+        }
+        fn set_maximized(&self, maximized: bool) {
+            self.maximized.lock().unwrap().push(maximized);
+        }
+        fn set_window_level(&self, _: WindowLevel) {}
+        fn drag_window(&self) -> Result<(), String> {
+            panic!("must pass the pointer serial to move")
+        }
+        fn drag_resize_window(&self, _: ResizeDirection) -> Result<(), String> {
+            panic!("must pass the pointer serial to resize")
+        }
+        fn drag_window_with_serial(&self, serial: InputSerial) -> Result<(), String> {
+            self.requests.lock().unwrap().push((serial, None));
+            Ok(())
+        }
+        fn drag_resize_window_with_serial(
+            &self,
+            direction: ResizeDirection,
+            serial: InputSerial,
+        ) -> Result<(), String> {
+            self.requests
+                .lock()
+                .unwrap()
+                .push((serial, Some(direction)));
+            Ok(())
+        }
+        fn set_cursor(&self, _: PlatformCursorIcon) {}
+        fn focus(&self) {}
+    }
+
+    struct WindowEventHarness {
+        state: WindowState,
+    }
+
+    impl WindowEventHarness {
+        fn new(build_ui: impl Fn(Size) -> BoxedWidget + 'static) -> Self {
+            Self::from_source(UiSource::Legacy(Rc::new(build_ui)))
+        }
+
+        fn view(build: impl Fn(Size) -> View + 'static) -> Self {
+            Self::from_source(UiSource::from_builder(build))
+        }
+
+        fn retained(runtime: SharedRuntime) -> Self {
+            Self::from_source(UiSource::runtime(runtime))
+        }
+
+        fn from_source(source: UiSource) -> Self {
+            let spec = build_window_spec(
+                0,
+                PendingWindow {
+                    follow_system_theme: false,
+                    options: WindowOptions {
+                        width: 100,
+                        height: 100,
+                        ..WindowOptions::default()
+                    },
+                    popup: None,
+                    clear_color: Color::rgba(0, 0, 0, 255),
+                    on_window_ready: Box::new(|_| {}),
+                    source,
+                },
+                None,
+                false,
+            );
+            let now = Instant::now();
+            let mut state = WindowState {
+                popup_parent: None,
+                pipeline: spec.pipeline,
+                close_requested: spec.close_requested,
+                focus_lost_handler: spec.focus_lost_handler,
+                close_handler: spec.close_handler,
+                keyboard_handler: spec.keyboard_handler,
+                pointer_presence_handler: spec.pointer_presence_handler,
+                pointer_move_handler: spec.pointer_move_handler,
+                pointer_button_handler: spec.pointer_button_handler,
+                file_drop_handler: spec.file_drop_handler,
+                last_input_serial: spec.last_input_serial,
+                native_drag_active: spec.native_drag_active,
+                popup_done_during_drag: false,
+                close_behavior: CloseBehavior::Close,
+                frameless_resizable: false,
+                resizable: true,
+                presenter: None,
+                backend: RenderBackend::Cpu,
+                transparent: false,
+                suspended: false,
+                zero_sized: false,
+                pointer_pos: Point::default(),
+                modifiers: PlatformModifiers::default(),
+                next_blink: now + CARET_BLINK_INTERVAL,
+                next_animation: now,
+                paced_present: false,
+                frame_interval: DEFAULT_FRAME_INTERVAL,
+                frame_interval_checked: None,
+                next_devtools_refresh: now,
+                pending_viewport: None,
+                current_cursor: CursorIcon::Default,
+                hovered: None,
+                dragging: None,
+                drag_end: None,
+                drag_click: None,
+                pending_drag: None,
+                runtime_dragged: false,
+                runtime_press_origin: None,
+                touch: None,
+                ime_allowed: false,
+                inset_poll: None,
+                _effect: spec._effect,
+                _runtime_subscription: spec._runtime_subscription,
+                t_run: now,
+                first_present_logged: false,
+            };
+            state.redraw();
+            WindowEventHarness { state }
+        }
+
+        #[cfg(all(feature = "context-menu", target_os = "linux"))]
+        fn menu_handle(&self, app: AppHandle, native: bool) -> WindowHandle {
+            let platform = InteractiveTestWindow::default();
+            platform
+                .native_popups
+                .store(native, std::sync::atomic::Ordering::Relaxed);
+            *self.state.pipeline.window.borrow_mut() = Some(Arc::new(platform));
+            let pipeline = &self.state.pipeline;
+            WindowHandle {
+                window: pipeline.window.clone(),
+                theme: pipeline.theme.clone(),
+                chrome: pipeline.chrome.clone(),
+                decorations: pipeline.decorations.clone(),
+                on_chrome_changed: Rc::new(|| {}),
+                close_requested: self.state.close_requested.clone(),
+                focus_lost_handler: self.state.focus_lost_handler.clone(),
+                close_handler: self.state.close_handler.clone(),
+                keyboard_handler: self.state.keyboard_handler.clone(),
+                pointer_presence_handler: self.state.pointer_presence_handler.clone(),
+                pointer_move_handler: self.state.pointer_move_handler.clone(),
+                pointer_button_handler: self.state.pointer_button_handler.clone(),
+                file_drop_handler: self.state.file_drop_handler.clone(),
+                last_input_serial: self.state.last_input_serial.clone(),
+                native_drag_active: self.state.native_drag_active.clone(),
+                app,
+                runtime: None,
+                pipeline: Rc::downgrade(pipeline),
+            }
+        }
+
+        fn send(&mut self, event: WindowEvent) {
+            self.state.handle_window_event(event);
+        }
+
+        fn key(&mut self, input: KeyInput) {
+            self.state.handle_key_input(input);
+        }
+    }
+
+    #[test]
+    fn secondary_click_dispatches_context_without_primary_activation() {
+        let primary = Rc::new(Cell::new(0));
+        let secondary = Rc::new(Cell::new(0));
+        let click = primary.clone();
+        let context = secondary.clone();
+        let mut harness = WindowEventHarness::new(move |_| {
+            Box::new(
+                creamui_widgets::RawButton::new(
+                    creamui_core::layout::Style {
+                        size: creamui_widgets::layout::fixed(200.0, 100.0),
+                        ..Default::default()
+                    },
+                    {
+                        let click = click.clone();
+                        move || click.set(click.get() + 1)
+                    },
+                )
+                .with_context_menu({
+                    let context = context.clone();
+                    move |point| {
+                        assert_eq!(point, Point { x: 10.0, y: 15.0 });
+                        context.set(context.get() + 1);
+                    }
+                }),
+            )
+        });
+        harness.state.pointer_pos = Point { x: 10.0, y: 15.0 };
+        for pressed in [true, false] {
+            harness.send(WindowEvent::MouseInput {
+                pressed,
+                button: MouseButton::Right,
+                serial: None,
+            });
+        }
+        assert_eq!(secondary.get(), 1);
+        assert_eq!(primary.get(), 0);
+        harness.send(WindowEvent::MouseInput {
+            pressed: true,
+            button: MouseButton::Right,
+            serial: Some(InputSerial(73)),
+        });
+        harness.send(WindowEvent::MouseInput {
+            pressed: false,
+            button: MouseButton::Right,
+            serial: Some(InputSerial(74)),
+        });
+        assert_eq!(harness.state.last_input_serial.get(), Some(InputSerial(73)));
+        *harness.state.pointer_button_handler.borrow_mut() = Some(Rc::new(|_, _, _| true));
+        harness.send(WindowEvent::MouseInput {
+            pressed: true,
+            button: MouseButton::Right,
+            serial: None,
+        });
+        assert_eq!(secondary.get(), 2);
+    }
+
+    #[cfg(all(feature = "context-menu", target_os = "linux"))]
+    fn menu_app() -> AppHandle {
+        AppHandle {
+            commands: Rc::new(RefCell::new(AppCommands {
+                system_theme: None,
+                windows: Vec::new(),
+                exit_requested: false,
+                proxy: test_proxy(),
+                next_job_id: 0,
+                background_jobs: HashMap::new(),
+            })),
+        }
+    }
+
+    #[cfg(all(feature = "context-menu", target_os = "linux"))]
+    #[test]
+    fn native_context_menu_preserves_press_serial_and_uses_nested_popup_parents() {
+        use creamui_widgets::{ContextMenu, ContextMenuItem};
+        let app = menu_app();
+        let parent = WindowEventHarness::new(|_| Box::new(BlankWidget));
+        let parent_handle = parent.menu_handle(app.clone(), true);
+        parent_handle.last_input_serial.set(Some(InputSerial(42)));
+        let request = PopupOptions::at_cursor(parent_handle.clone(), Point { x: 95.0, y: 80.0 });
+        parent_handle.last_input_serial.set(Some(InputSerial(43)));
+        let host = crate::ContextMenuHost::new();
+        host.open(
+            request,
+            vec![ContextMenuItem::submenu(
+                "new",
+                "New",
+                vec![ContextMenuItem::new("file", "File", || {})],
+            )],
+        );
+        assert!(host.uses_native_popup());
+        host.parent_focus_lost();
+        assert!(host.is_open());
+        let pending = app.commands.borrow_mut().windows.pop().unwrap();
+        assert!(!pending.options.decorations && pending.options.transparent);
+        assert!(pending.options.width > parent_handle.logical_size().width as u32);
+        let popup = pending.popup.as_ref().unwrap();
+        assert_eq!(popup.input_serial, Some(InputSerial(42)));
+        assert_eq!(popup.anchor.x, 95.0);
+        assert_eq!(popup.anchor.y, 80.0);
+        assert!(popup.resize_to_fit);
+        let menu = host.controller();
+        creamui_reactive::with_context_scope(|| {
+            creamui_reactive::provide_context(ThemeProvider::new(Theme::light()));
+            let mut recorder = SceneRecorder::new();
+            recorder.begin(248, 42, 1.0, Color::rgba(0, 0, 0, 0), Theme::light().colors);
+            creamui_core::Renderer::new().render(
+                Box::new(ContextMenu::pane(
+                    &menu,
+                    vec![],
+                    Size {
+                        width: 248.0,
+                        height: 42.0,
+                    },
+                )),
+                Size {
+                    width: 248.0,
+                    height: 42.0,
+                },
+                &mut recorder,
+            );
+        });
+        let root = WindowEventHarness::new(|_| Box::new(BlankWidget));
+        let root_handle = root.menu_handle(app.clone(), true);
+        (pending.on_window_ready)(root_handle.clone());
+        menu.handle_key(&Key::Down);
+        menu.handle_key(&Key::Right);
+        let child = app
+            .commands
+            .borrow_mut()
+            .windows
+            .pop()
+            .expect("submenu popup");
+        let popup = child.popup.as_ref().unwrap();
+        assert!(Rc::ptr_eq(&popup.parent.window, &root_handle.window));
+        assert_eq!(popup.input_serial, Some(InputSerial(42)));
+        let submenu = WindowEventHarness::new(|_| Box::new(BlankWidget));
+        let submenu_handle = submenu.menu_handle(app.clone(), true);
+        (child.on_window_ready)(submenu_handle.clone());
+        root_handle.focus_lost_handler.borrow().as_ref().unwrap()();
+        assert!(host.is_open(), "focus can move into the submenu");
+        let close_child = submenu_handle.close_handler.borrow().clone().unwrap();
+        assert!(close_child());
+        assert_eq!(menu.visible_panes().len(), 1);
+        assert!(menu.is_open());
+        assert!(submenu_handle.close_requested.get());
+        root_handle.focus_lost_handler.borrow().as_ref().unwrap()();
+        assert!(!host.is_open());
+        assert!(root_handle.close_requested.get());
+    }
+
+    #[cfg(all(feature = "context-menu", target_os = "linux"))]
+    #[test]
+    fn replacement_popups_capture_the_current_client_input_instead_of_the_root_press() {
+        let app = menu_app();
+        let parent = WindowEventHarness::new(|_| Box::new(BlankWidget));
+        let handle = parent.menu_handle(app, true);
+        handle.last_input_serial.set(Some(InputSerial(42)));
+        let platform = Arc::new(InteractiveTestWindow::default());
+        platform
+            .latest_input_serial
+            .store(77, std::sync::atomic::Ordering::Relaxed);
+        *handle.window.borrow_mut() = Some(platform.clone());
+        let popup = PopupOptions::at_cursor(handle, Point::default());
+        assert_eq!(popup.input_serial, Some(InputSerial(77)));
+        platform
+            .latest_input_serial
+            .store(78, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(popup.input_serial, Some(InputSerial(77)));
+    }
+
+    #[cfg(all(feature = "context-menu", target_os = "linux"))]
+    #[test]
+    fn closing_a_parent_cancels_queued_native_menu_creation() {
+        let app = menu_app();
+        let parent = WindowEventHarness::new(|_| Box::new(BlankWidget));
+        let handle = parent.menu_handle(app.clone(), true);
+        handle.last_input_serial.set(Some(InputSerial(42)));
+        let host = crate::ContextMenuHost::new();
+        host.open(
+            PopupOptions::at_cursor(handle.clone(), Point::default()),
+            vec![creamui_widgets::ContextMenuItem::new("open", "Open", || {})],
+        );
+        let pending = app.commands.borrow_mut().windows.pop().unwrap();
+        handle.close();
+        assert!(!(pending.popup.unwrap().is_current.unwrap())());
+        assert!(!host.is_open());
+    }
+
+    #[cfg(all(feature = "context-menu", target_os = "linux"))]
+    #[test]
+    fn context_menu_falls_back_and_discards_cancelled_popup_requests() {
+        use creamui_widgets::ContextMenuItem;
+        let app = menu_app();
+        let parent = WindowEventHarness::new(|_| Box::new(BlankWidget));
+        let handle = parent.menu_handle(app.clone(), false);
+        handle.last_input_serial.set(Some(InputSerial(7)));
+        let host = crate::ContextMenuHost::new();
+        let items = || vec![ContextMenuItem::new("open", "Open", || {})];
+        host.open(
+            PopupOptions::at_cursor(handle.clone(), Point::default()),
+            items(),
+        );
+        assert!(!host.uses_native_popup());
+        assert!(app.commands.borrow().windows.is_empty());
+        let handle = parent.menu_handle(app.clone(), true);
+        host.open(
+            PopupOptions::at_cursor(handle.clone(), Point::default()),
+            items(),
+        );
+        let cancelled = app.commands.borrow_mut().windows.pop().unwrap();
+        host.close();
+        assert!(!(cancelled
+            .popup
+            .as_ref()
+            .unwrap()
+            .is_current
+            .as_ref()
+            .unwrap())());
+        host.open(PopupOptions::at_cursor(handle, Point::default()), items());
+        let pending = app.commands.borrow_mut().windows.pop().unwrap();
+        (cancelled.popup.unwrap().on_error.unwrap())("stale request".into());
+        assert!(host.uses_native_popup());
+        (pending.popup.unwrap().on_error.unwrap())("unsupported popup".into());
+        assert!(host.is_open());
+        assert!(!host.uses_native_popup());
+        creamui_reactive::with_context_scope(|| {
+            creamui_reactive::provide_context(ThemeProvider::new(Theme::light()));
+            assert!(host
+                .overlay(Size {
+                    width: 100.0,
+                    height: 100.0
+                })
+                .is_some());
+        });
+    }
+
+    #[test]
+    fn close_interceptor_defers_requests_until_the_document_is_ready() {
+        let harness = WindowEventHarness::new(|_| Box::new(creamui_widgets::Text::new("Editor")));
+        let ready = Rc::new(Cell::new(false));
+        let calls = Rc::new(Cell::new(0));
+        let guard_ready = ready.clone();
+        let guard_calls = calls.clone();
+        *harness.state.close_handler.borrow_mut() = Some(Rc::new(move || {
+            guard_calls.set(guard_calls.get() + 1);
+            guard_ready.get()
+        }));
+        harness.state.close_requested.set(true);
+        assert!(!harness.state.allow_close());
+        assert!(!harness.state.close_requested.get());
+        ready.set(true);
+        harness.state.close_requested.set(true);
+        assert!(harness.state.allow_close());
+        assert!(harness.state.close_requested.get());
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn native_keyboard_handler_consumes_tab_and_function_keys_before_builtin_actions() {
+        let widget_keys = Rc::new(Cell::new(0));
+        let keys = widget_keys.clone();
+        let mut harness = WindowEventHarness::new(move |_| {
+            let keys = keys.clone();
+            Box::new(
+                creamui_widgets::RawView::new(creamui_core::layout::Style {
+                    size: creamui_core::layout::Size {
+                        width: creamui_core::layout::Dimension::Length(40.0),
+                        height: creamui_core::layout::Dimension::Length(30.0),
+                    },
+                    ..Default::default()
+                })
+                .with_children(vec![
+                    Box::new(
+                        creamui_widgets::RawButton::new(
+                            creamui_core::layout::Style {
+                                size: creamui_core::layout::Size {
+                                    width: creamui_core::layout::Dimension::Length(40.0),
+                                    height: creamui_core::layout::Dimension::Length(30.0),
+                                },
+                                ..Default::default()
+                            },
+                            || {},
+                        )
+                        .on_key_press(move |_| keys.set(keys.get() + 1)),
+                    ),
+                    Box::new(creamui_widgets::RawButton::new(
+                        creamui_core::layout::Style {
+                            size: creamui_core::layout::Size {
+                                width: creamui_core::layout::Dimension::Length(40.0),
+                                height: creamui_core::layout::Dimension::Length(30.0),
+                            },
+                            ..Default::default()
+                        },
+                        || {},
+                    )),
+                ]),
+            )
+        });
+        harness.state.pipeline.focused.set(Some(0));
+        let received = Rc::new(RefCell::new(Vec::new()));
+        let sink = received.clone();
+        *harness.state.keyboard_handler.borrow_mut() = Some(Rc::new(move |event, modifiers| {
+            sink.borrow_mut().push((event, modifiers));
+            true
+        }));
+        harness.send(WindowEvent::ModifiersChanged(PlatformModifiers {
+            ctrl: true,
+            ..Default::default()
+        }));
+        for key in [PlatformKey::Tab, PlatformKey::F3, PlatformKey::F12] {
+            for pressed in [true, false] {
+                harness.send(WindowEvent::KeyboardInput(creamui_platform::KeyEvent {
+                    key: key.clone(),
+                    pressed,
+                    synthetic: false,
+                }));
+            }
+        }
+        assert_eq!(received.borrow().len(), 6);
+        assert!(received
+            .borrow()
+            .iter()
+            .all(|(_, modifiers)| modifiers.ctrl));
+        assert_eq!(harness.state.pipeline.focused.get(), Some(0));
+        assert_eq!(widget_keys.get(), 0);
+        // Unconsumed events continue through normal widget focus traversal.
+        *harness.state.keyboard_handler.borrow_mut() = Some(Rc::new(|_, _| false));
+        harness.send(WindowEvent::KeyboardInput(creamui_platform::KeyEvent {
+            key: PlatformKey::Tab,
+            pressed: true,
+            synthetic: false,
+        }));
+        assert_eq!(received.borrow().len(), 6);
+        assert_eq!(harness.state.pipeline.focused.get(), Some(1));
+        harness.state.pipeline.focused.set(Some(0));
+        harness.send(WindowEvent::KeyboardInput(creamui_platform::KeyEvent {
+            key: PlatformKey::Enter,
+            pressed: true,
+            synthetic: false,
+        }));
+        assert_eq!(widget_keys.get(), 1);
+    }
+
+    #[test]
+    fn background_drag_preserves_clicks_and_hybrid_resize_uses_the_press_serial() {
+        let clicks = Rc::new(Cell::new(0));
+        let mut harness = WindowEventHarness::new({
+            let clicks = clicks.clone();
+            move |_| {
+                let clicks = clicks.clone();
+                Box::new(
+                    creamui_widgets::CUIWindowDragArea::new()
+                        .size(100.0, 100.0)
+                        .child(Box::new(creamui_widgets::RawButton::new(
+                            creamui_core::layout::Style {
+                                size: creamui_core::layout::Size {
+                                    width: creamui_core::layout::Dimension::Length(40.0),
+                                    height: creamui_core::layout::Dimension::Length(40.0),
+                                },
+                                ..Default::default()
+                            },
+                            move || clicks.set(clicks.get() + 1),
+                        ))),
+                )
+            }
+        });
+        let window = Arc::new(InteractiveTestWindow::default());
+        *harness.state.pipeline.window.borrow_mut() = Some(window.clone());
+        harness.send(WindowEvent::DecorationsChanged(WindowDecorations {
+            mode: WindowDecorationMode::Hybrid,
+            ..Default::default()
+        }));
+        for (point, serial) in [
+            (Point { x: 60.0, y: 30.0 }, 41),
+            (Point { x: 20.0, y: 20.0 }, 42),
+            (Point { x: 2.0, y: 50.0 }, 43),
+        ] {
+            harness.send(WindowEvent::CursorMoved {
+                position: creamui_platform::PhysicalPosition {
+                    x: point.x as f64,
+                    y: point.y as f64,
+                },
+            });
+            harness.send(WindowEvent::MouseInput {
+                pressed: true,
+                button: MouseButton::Left,
+                serial: Some(InputSerial(serial)),
+            });
+            harness.send(WindowEvent::MouseInput {
+                pressed: false,
+                button: MouseButton::Left,
+                serial: Some(InputSerial(serial + 100)),
+            });
+        }
+        assert_eq!(
+            clicks.get(),
+            1,
+            "content handles the click, not the app's drag background"
+        );
+        assert_eq!(
+            *window.requests.lock().unwrap(),
+            vec![
+                (InputSerial(41), None),
+                (InputSerial(43), Some(ResizeDirection::West))
+            ]
+        );
+    }
+
+    #[test]
+    fn app_titlebar_clicks_minimize_maximize_restore_and_close_through_the_window_bridge() {
+        use creamui_widgets::{AppTitlebar, CaptionStyle, Text};
+
+        for style in [CaptionStyle::Round, CaptionStyle::Windows] {
+            let observed = Rc::new(RefCell::new(Vec::new()));
+            let mut harness = WindowEventHarness::new({
+                let observed = observed.clone();
+                move |size| {
+                    let titlebar = AppTitlebar::new(size.width)
+                        .caption_style(style)
+                        .center(Text::new("Custom titlebar"));
+                    observed.borrow_mut().push(titlebar.state());
+                    Box::new(titlebar)
+                }
+            });
+            let window = Arc::new(InteractiveTestWindow::default());
+            *window.size.lock().unwrap() = Some(creamui_platform::PhysicalSize {
+                width: 600,
+                height: 100,
+            });
+            *harness.state.pipeline.window.borrow_mut() = Some(window.clone());
+            harness.state.queue_viewport(Size {
+                width: 600.0,
+                height: 100.0,
+            });
+            let mut click = |button, maximized| {
+                let decorations = WindowDecorations {
+                    mode: WindowDecorationMode::Client,
+                    maximized,
+                    ..Default::default()
+                };
+                *window.decorations.lock().unwrap() = decorations;
+                harness.send(WindowEvent::DecorationsChanged(decorations));
+                harness.state.redraw();
+                assert_eq!(observed.borrow().last().unwrap().mode, TitlebarMode::Client);
+                assert_eq!(observed.borrow().last().unwrap().maximized, maximized);
+                let (width, gap, y) = match style {
+                    CaptionStyle::Round => (24.0, 10.0, 20.0),
+                    CaptionStyle::Windows => (46.0, 0.0, 16.0),
+                };
+                let index = match button {
+                    WindowButton::Minimize => 2.0,
+                    WindowButton::Maximize => 1.0,
+                    WindowButton::Close => 0.0,
+                };
+                harness.send(WindowEvent::CursorMoved {
+                    position: creamui_platform::PhysicalPosition {
+                        x: 600.0 - gap - width / 2.0 - index * (width + gap),
+                        y,
+                    },
+                });
+                for pressed in [true, false] {
+                    harness.send(WindowEvent::MouseInput {
+                        pressed,
+                        button: MouseButton::Left,
+                        serial: Some(InputSerial(42)),
+                    });
+                }
+            };
+            click(WindowButton::Minimize, false);
+            click(WindowButton::Maximize, false);
+            click(WindowButton::Maximize, true);
+            click(WindowButton::Close, false);
+            assert_eq!(*window.minimized.lock().unwrap(), [true]);
+            assert_eq!(*window.maximized.lock().unwrap(), [true, false]);
+            assert!(harness.state.close_requested.get());
+            assert!(window.requests.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn negotiated_decorations_rebuild_content_and_select_resize_ownership() {
+        let observed = Rc::new(RefCell::new(Vec::new()));
+        let mut harness = WindowEventHarness::new({
+            let observed = observed.clone();
+            move |_| {
+                observed.borrow_mut().push(use_window_decorations());
+                Box::new(BlankWidget)
+            }
+        });
+        assert_eq!(
+            observed.borrow().last().unwrap().mode,
+            WindowDecorationMode::Pending
+        );
+        for mode in [
+            WindowDecorationMode::Client,
+            WindowDecorationMode::Server,
+            WindowDecorationMode::Hybrid,
+            WindowDecorationMode::None,
+        ] {
+            let decorations = WindowDecorations {
+                mode,
+                ..Default::default()
+            };
+            harness.send(WindowEvent::DecorationsChanged(decorations));
+            assert_eq!(observed.borrow().last(), Some(&decorations));
+            assert_eq!(
+                harness.state.frameless_resizable,
+                matches!(
+                    mode,
+                    WindowDecorationMode::Client
+                        | WindowDecorationMode::None
+                        | WindowDecorationMode::Hybrid
+                )
+            );
+        }
+        let overlay = WindowDecorations {
+            mode: WindowDecorationMode::Hybrid,
+            controls: creamui_platform::CompositorControls {
+                x: 0,
+                y: 14,
+                width: 96,
+                height: 28,
+            },
+            ..Default::default()
+        };
+        harness.send(WindowEvent::DecorationsChanged(overlay));
+        assert_eq!(observed.borrow().last(), Some(&overlay));
+        let moved = WindowDecorations {
+            controls: creamui_platform::CompositorControls {
+                x: 20,
+                ..overlay.controls
+            },
+            ..overlay
+        };
+        harness.send(WindowEvent::DecorationsChanged(moved));
+        assert_eq!(observed.borrow().last(), Some(&moved));
+        harness.state.resizable = false;
+        harness.send(WindowEvent::DecorationsChanged(WindowDecorations {
+            mode: WindowDecorationMode::Client,
+            ..Default::default()
+        }));
+        assert!(!harness.state.frameless_resizable);
+    }
+
+    #[test]
+    fn suspension_cancels_drag_and_retains_pending_state_without_drawing() {
+        let count = Signal::new(0);
+        let builds = Rc::new(Cell::new(0));
+        let ends = Rc::new(Cell::new(0));
+        let mut harness = WindowEventHarness::new({
+            let count = count.clone();
+            let builds = builds.clone();
+            let ends = ends.clone();
+            move |_| {
+                count.get();
+                builds.set(builds.get() + 1);
+                Box::new(DraggableWidget {
+                    calls: Rc::new(RefCell::new(Vec::new())),
+                    end_calls: ends.clone(),
+                })
+            }
+        });
+        harness.send(touch(1, creamui_platform::TouchPhase::Started, 10.0, 10.0));
+        harness.send(touch(1, creamui_platform::TouchPhase::Moved, 20.0, 10.0));
+        assert!(harness.state.pending_drag.is_some());
+        assert!(harness.state.pipeline.frame.borrow().presented.is_some());
+        harness.state.suspend();
+        harness.state.suspend();
+        assert_eq!(ends.get(), 1);
+        assert!(harness.state.touch.is_none());
+        assert!(harness.state.drag_click.is_none());
+        assert!(harness.state.pending_drag.is_none());
+        assert!(harness.state.pipeline.frame.borrow().presented.is_none());
+        count.set(7);
+        let before = builds.get();
+        harness.state.redraw();
+        assert_eq!(builds.get(), before);
+        assert!(harness.state.pipeline.frame.borrow().presented.is_none());
+        assert!(harness
+            .state
+            .tick(Instant::now() + Duration::from_secs(10))
+            .is_none());
+        assert_eq!(count.peek(), 7);
+    }
+
+    #[test]
+    fn failed_scroll_presentation_retries_from_a_full_frame() {
+        use creamui_core::Painter;
+
+        let record = |offset| {
+            let mut recorder = SceneRecorder::new();
+            recorder.begin(100, 100, 1.0, Color::rgb(255, 255, 255), Default::default());
+            let rect = Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            };
+            recorder.fill_rect(rect, Color::rgb(255, 255, 255), 0.0);
+            recorder.push_scroll_layer(rect, 0.0, Point { x: 0.0, y: offset });
+            for row in 0..20 {
+                recorder.fill_rect(
+                    Rect {
+                        y: row as f32 * 10.0 - offset,
+                        height: 10.0,
+                        ..rect
+                    },
+                    Color::rgb(row * 10, 40, 80),
+                    0.0,
+                );
+            }
+            recorder.pop_scroll_layer();
+            recorder.finish()
+        };
+        let previous = record(0.0);
+        let next = record(10.0);
+        let diff = display_list::diff(Some(&previous), &next);
+        assert!(diff.scroll.is_some());
+        let mut raster = Rasterizer::new(100, 100);
+        raster.render(&previous, &crate::Damage::Full);
+        raster.apply(&next, &diff);
+        let harness = WindowEventHarness::new(|_| {
+            Box::new(DraggableWidget {
+                calls: Rc::new(RefCell::new(Vec::new())),
+                end_calls: Rc::new(Cell::new(0)),
+            })
+        });
+        let pipeline = harness.state.pipeline.clone();
+        {
+            let mut frame = pipeline.frame.borrow_mut();
+            frame.presented = Some(previous);
+            frame.raster = Some(raster);
+            frame.retry_frame(next);
+        }
+        pipeline.present(None);
+        let frame = pipeline.frame.borrow();
+        let mut expected = Rasterizer::new(100, 100);
+        expected.render(frame.presented.as_ref().unwrap(), &crate::Damage::Full);
+        assert_eq!(
+            frame.raster.as_ref().unwrap().pixmap().data(),
+            expected.pixmap().data()
+        );
+    }
+
+    struct TouchTextWidget {
+        starts: Rc<Cell<u32>>,
+        drags: Rc<Cell<u32>>,
+    }
+
+    impl creamui_core::Widget for TouchTextWidget {
+        fn style(&self) -> creamui_core::Style {
+            creamui_core::Style::new().width(100.0).height(100.0)
+        }
+
+        fn paint(&self, _: &mut dyn creamui_core::Painter, _: creamui_core::Rect) {}
+
+        fn focusable(&self) -> bool {
+            true
+        }
+
+        fn accepts_text_input(&self) -> bool {
+            true
+        }
+
+        fn on_key(&self) -> Option<Rc<dyn Fn(KeyInput)>> {
+            Some(Rc::new(|_| {}))
+        }
+
+        fn on_drag_start(&self) -> Option<Rc<dyn Fn(Point, Rect)>> {
+            let starts = self.starts.clone();
+            Some(Rc::new(move |_, _| starts.set(starts.get() + 1)))
+        }
+
+        fn on_drag(&self) -> Option<Rc<dyn Fn(Point, Rect)>> {
+            let drags = self.drags.clone();
+            Some(Rc::new(move |_, _| drags.set(drags.get() + 1)))
+        }
+    }
+
+    struct TouchScrollWidget {
+        deltas: Rc<RefCell<Vec<f32>>>,
+        clicks: Rc<Cell<u32>>,
+    }
+
+    impl creamui_core::Widget for TouchScrollWidget {
+        fn style(&self) -> creamui_core::Style {
+            creamui_core::Style::new().width(100.0).height(100.0)
+        }
+
+        fn paint(&self, _: &mut dyn creamui_core::Painter, _: creamui_core::Rect) {}
+
+        fn on_scroll(&self) -> Option<Rc<dyn Fn(f32)>> {
+            let deltas = self.deltas.clone();
+            Some(Rc::new(move |delta| deltas.borrow_mut().push(delta)))
+        }
+
+        fn on_click(&self) -> Option<Rc<dyn Fn()>> {
+            let clicks = self.clicks.clone();
+            Some(Rc::new(move || clicks.set(clicks.get() + 1)))
+        }
+    }
+
+    fn touch(id: u64, phase: creamui_platform::TouchPhase, x: f64, y: f64) -> WindowEvent {
+        WindowEvent::Touch {
+            id,
+            phase,
+            position: creamui_platform::PhysicalPosition { x, y },
+        }
+    }
+
+    #[test]
+    fn touch_drag_selects_text_and_back_dismisses_the_ime() {
+        let starts = Rc::new(Cell::new(0));
+        let drags = Rc::new(Cell::new(0));
+        let mut harness = WindowEventHarness::new({
+            let starts = starts.clone();
+            let drags = drags.clone();
+            move |_| {
+                Box::new(TouchTextWidget {
+                    starts: starts.clone(),
+                    drags: drags.clone(),
+                })
+            }
+        });
+
+        harness.send(touch(1, creamui_platform::TouchPhase::Started, 10.0, 10.0));
+        harness.send(touch(1, creamui_platform::TouchPhase::Moved, 40.0, 10.0));
+        harness.send(touch(1, creamui_platform::TouchPhase::Ended, 40.0, 10.0));
+
+        assert_eq!(starts.get(), 1);
+        assert_eq!(drags.get(), 1);
+        assert!(harness.state.ime_allowed);
+
+        harness.send(WindowEvent::KeyboardInput(creamui_platform::KeyEvent {
+            key: PlatformKey::Back,
+            pressed: true,
+            synthetic: false,
+        }));
+
+        assert!(!harness.state.ime_allowed);
+        assert_eq!(harness.state.pipeline.focused.get(), None);
+    }
+
+    #[cfg(feature = "router")]
+    #[test]
+    fn router_back_dismisses_ime_then_pops_then_closes_at_root() {
+        let router = creamui_router::Router::memory("/")
+            .dev_override(false)
+            .build()
+            .unwrap();
+        let provider = creamui_router::RouterProvider::new(router.clone());
+        let mut harness = WindowEventHarness::new(move |_| {
+            provider.render(|| {
+                Box::new(creamui_widgets::RawView::new(creamui_core::Style::default()))
+                    as BoxedWidget
+            })
+        });
+        router.navigate("/details").unwrap();
+        harness.state.ime_allowed = true;
+        let back = || {
+            WindowEvent::KeyboardInput(creamui_platform::KeyEvent {
+                key: PlatformKey::Back,
+                pressed: true,
+                synthetic: false,
+            })
+        };
+        harness.send(back());
+        assert!(!harness.state.ime_allowed);
+        assert_eq!(router.url(), "/details");
+        harness.send(back());
+        assert_eq!(router.url(), "/");
+        assert!(!harness.state.close_requested.get());
+        harness.send(back());
+        assert!(harness.state.close_requested.get());
+    }
+
+    #[test]
+    fn pointer_focus_hides_control_outlines_and_keyboard_focus_restores_them() {
+        let accent = Color::rgb(13, 24, 35);
+        let mut harness = WindowEventHarness::new(move |_| {
+            Box::new(creamui_widgets::RawSwitch::new(
+                false,
+                accent,
+                Color::rgb(40, 40, 40),
+                Color::rgb(255, 255, 255),
+                || {},
+            ))
+        });
+        let has_outline = |harness: &WindowEventHarness| {
+            harness.state.pipeline.frame.borrow().presented.as_ref().unwrap().items.iter().any(|item| {
+                matches!(&item.primitive, crate::display_list::Primitive::Quad(quad) if quad.border_color == accent)
+            })
+        };
+        harness.state.pointer_pos = Point { x: 10.0, y: 10.0 };
+        harness.send(WindowEvent::MouseInput {
+            pressed: true,
+            button: MouseButton::Left,
+            serial: None,
+        });
+        harness.state.redraw();
+        assert_eq!(harness.state.pipeline.focused.get(), Some(0));
+        assert!(!has_outline(&harness));
+        harness.send(WindowEvent::MouseInput {
+            pressed: false,
+            button: MouseButton::Left,
+            serial: None,
+        });
+        harness.key(KeyInput {
+            key: Key::Tab,
+            modifiers: Modifiers::default(),
+        });
+        harness.state.redraw();
+        assert!(has_outline(&harness));
+        harness.send(WindowEvent::MouseInput {
+            pressed: true,
+            button: MouseButton::Left,
+            serial: None,
+        });
+        harness.state.redraw();
+        assert!(!has_outline(&harness));
+    }
+
+    #[test]
+    fn ime_changes_poll_insets_until_the_animation_settles() {
+        let mut harness = WindowEventHarness::new(|_| {
+            Box::new(creamui_widgets::RawView::new(
+                creamui_core::layout::Style::default(),
+            ))
+        });
+        harness.state.set_ime_allowed(true);
+        harness.state.set_ime_allowed(false);
+        let (next, until) = harness.state.inset_poll.unwrap();
+        let wake = harness.state.tick(next).unwrap();
+        assert!(wake > next && wake <= next + Duration::from_millis(50));
+        assert!(harness.state.tick(until).is_none());
+        assert!(harness.state.inset_poll.is_none());
+    }
+
+    #[test]
+    fn file_prompt_focus_enables_ime_and_back_keeps_it_dismissed() {
+        let prompt = creamui_widgets::FilePickerController::default();
+        let mut harness = WindowEventHarness::new({
+            let prompt = prompt.clone();
+            move |_| {
+                prompt
+                    .host(|| Box::new(creamui_widgets::FilePicker::new("", |_| {}).prompt(&prompt)))
+            }
+        });
+        harness.send(touch(1, creamui_platform::TouchPhase::Started, 10.0, 10.0));
+        harness.send(touch(1, creamui_platform::TouchPhase::Ended, 10.0, 10.0));
+        harness.state.redraw();
+        assert!(prompt.is_open());
+        assert_eq!(harness.state.pipeline.focused.get(), Some(0));
+        assert!(harness.state.ime_allowed);
+        for expected in [1, 2, 0] {
+            harness.key(KeyInput {
+                key: Key::Tab,
+                modifiers: Modifiers::default(),
+            });
+            harness.state.redraw();
+            assert_eq!(harness.state.pipeline.focused.get(), Some(expected));
+        }
+        harness.send(WindowEvent::KeyboardInput(creamui_platform::KeyEvent {
+            key: PlatformKey::Back,
+            pressed: true,
+            synthetic: false,
+        }));
+        harness.state.redraw();
+        assert_eq!(harness.state.pipeline.focused.get(), None);
+        assert!(!harness.state.ime_allowed);
+        assert!(prompt.is_open());
+        harness.key(KeyInput {
+            key: Key::Tab,
+            modifiers: Modifiers::default(),
+        });
+        harness.state.redraw();
+        assert!(harness.state.ime_allowed);
+        harness.key(KeyInput {
+            key: Key::Escape,
+            modifiers: Modifiers::default(),
+        });
+        harness.state.redraw();
+        assert!(!prompt.is_open());
+        assert!(!harness.state.ime_allowed);
+    }
+
+    #[test]
+    fn touch_drag_scrolls_instead_of_clicking() {
+        let deltas = Rc::new(RefCell::new(Vec::new()));
+        let clicks = Rc::new(Cell::new(0));
+        let mut harness = WindowEventHarness::new({
+            let deltas = deltas.clone();
+            let clicks = clicks.clone();
+            move |_| {
+                Box::new(TouchScrollWidget {
+                    deltas: deltas.clone(),
+                    clicks: clicks.clone(),
+                })
+            }
+        });
+
+        harness.send(touch(1, creamui_platform::TouchPhase::Started, 10.0, 80.0));
+        harness.send(touch(1, creamui_platform::TouchPhase::Moved, 10.0, 40.0));
+        harness.send(touch(1, creamui_platform::TouchPhase::Ended, 10.0, 40.0));
+
+        assert_eq!(deltas.borrow().as_slice(), &[40.0]);
+        assert_eq!(clicks.get(), 0);
+    }
+
+    #[test]
+    fn touch_tap_activates_scrollable_content() {
+        let deltas = Rc::new(RefCell::new(Vec::new()));
+        let clicks = Rc::new(Cell::new(0));
+        let mut harness = WindowEventHarness::new({
+            let deltas = deltas.clone();
+            let clicks = clicks.clone();
+            move |_| {
+                Box::new(TouchScrollWidget {
+                    deltas: deltas.clone(),
+                    clicks: clicks.clone(),
+                })
+            }
+        });
+
+        harness.send(touch(1, creamui_platform::TouchPhase::Started, 10.0, 80.0));
+        harness.send(touch(1, creamui_platform::TouchPhase::Ended, 10.0, 80.0));
+
+        assert!(deltas.borrow().is_empty());
+        assert_eq!(clicks.get(), 1);
+    }
+
+    #[test]
+    fn page_keys_scroll_the_container_under_the_pointer() {
+        let deltas = Rc::new(RefCell::new(Vec::new()));
+        let clicks = Rc::new(Cell::new(0));
+        let mut harness = WindowEventHarness::new({
+            let deltas = deltas.clone();
+            let clicks = clicks.clone();
+            move |_| {
+                Box::new(TouchScrollWidget {
+                    deltas: deltas.clone(),
+                    clicks: clicks.clone(),
+                })
+            }
+        });
+        harness.state.pointer_pos = Point { x: 10.0, y: 10.0 };
+
+        for key in [PlatformKey::PageDown, PlatformKey::PageUp] {
+            harness.send(WindowEvent::KeyboardInput(creamui_platform::KeyEvent {
+                key,
+                pressed: true,
+                synthetic: false,
+            }));
+        }
+
+        assert_eq!(deltas.borrow().as_slice(), &[90.0, -90.0]);
+        assert_eq!(clicks.get(), 0);
+    }
+
+    #[test]
+    fn runtime_inspection_is_opt_in_and_reports_composited_content_damage() {
+        struct InspectionTools {
+            enabled: bool,
+            frames: Rc<RefCell<Vec<(creamui_core::runtime::RuntimeInspection, Vec<Rect>)>>>,
+        }
+        impl WindowDevtools for InspectionTools {
+            fn frame_presented(&mut self, _: &FrameReport) {}
+            fn paint_overlay(&self, _: &mut dyn creamui_core::Painter, _: Size) {}
+            fn refresh_interval(&self) -> Option<Duration> {
+                None
+            }
+            fn toggle(&mut self) -> bool {
+                false
+            }
+            fn command(&mut self, command: DevtoolsCommand) -> bool {
+                if command != DevtoolsCommand::ToggleTree {
+                    return false;
+                }
+                self.enabled = !self.enabled;
+                true
+            }
+            fn runtime_inspection_enabled(&self) -> bool {
+                self.enabled
+            }
+            fn runtime_inspected(
+                &mut self,
+                snapshot: creamui_core::runtime::RuntimeInspection,
+                damage: &[Rect],
+            ) {
+                self.frames.borrow_mut().push((snapshot, damage.to_vec()));
+            }
+        }
+        let mut runtime = Runtime::new();
+        let root = runtime.transaction().create_node(NodeKind::Container);
+        runtime.set_root(Some(root));
+        runtime.transaction().apply(Mutation::SetLayoutStyle {
+            node: root,
+            style: creamui_core::Style::new().width(20.0).height(20.0).layout,
+        });
+        runtime.transaction().apply(Mutation::SetPaintStyle {
+            node: root,
+            style: creamui_core::PaintStyle {
+                background: Some(Color::rgb(255, 0, 0).into()),
+                ..Default::default()
+            },
+        });
+        let runtime = SharedRuntime::new(runtime);
+        let mut harness = WindowEventHarness::retained(runtime.clone());
+        let frames = Rc::new(RefCell::new(Vec::new()));
+        harness.state.pipeline.frame.borrow_mut().devtools = Some(Box::new(InspectionTools {
+            enabled: false,
+            frames: frames.clone(),
+        }));
+        harness.state.pipeline.invalidate_paint();
+        harness.state.redraw();
+        assert!(frames.borrow().is_empty());
+
+        let toggle = WindowEvent::KeyboardInput(creamui_platform::KeyEvent {
+            key: PlatformKey::F4,
+            pressed: true,
+            synthetic: false,
+        });
+        harness.send(toggle.clone());
+        harness.state.redraw();
+        assert_eq!(frames.borrow().len(), 1);
+        runtime.transaction(|tx| {
+            tx.apply(Mutation::SetTransform {
+                node: root,
+                transform: creamui_core::runtime::Transform2D { x: 40.0, y: 0.0 },
+            })
+        });
+        harness.state.redraw();
+        {
+            let frames = frames.borrow();
+            let (snapshot, damage) = frames.last().unwrap();
+            assert_eq!(snapshot.nodes[0].visual_rect.x, 40.0);
+            assert!(snapshot.nodes[0]
+                .invalidations
+                .contains(creamui_core::runtime::DirtyFlags::COMPOSITE));
+            for point in [Point { x: 5.0, y: 5.0 }, Point { x: 45.0, y: 5.0 }] {
+                assert!(damage.iter().any(|rect| rect.contains(point)));
+            }
+            assert!(damage.iter().all(|rect| rect.width < 100.0));
+        }
+        let captured = frames.borrow().len();
+        harness.send(toggle);
+        harness.state.redraw();
+        assert_eq!(frames.borrow().len(), captured);
+        assert!(harness
+            .state
+            .pipeline
+            .frame
+            .borrow()
+            .inspected_content
+            .is_none());
+        assert!(runtime
+            .with_mut(|runtime| runtime.take_inspection())
+            .is_none());
+    }
+
+    #[test]
+    fn owned_view_mounts_once_and_keeps_context_bindings_events_and_pixels() {
+        let mounts = Rc::new(Cell::new(0));
+        let ticks = Signal::new(0u8);
+        let paints = Rc::new(Cell::new(0));
+        let runtime = Rc::new(RefCell::new(None));
+        let mut harness = WindowEventHarness::view({
+            let mounts = mounts.clone();
+            let ticks = ticks.clone();
+            let paints = paints.clone();
+            let runtime = runtime.clone();
+            move |_| {
+                mounts.set(mounts.get() + 1);
+                let ticks = ticks.clone();
+                let paints = paints.clone();
+                let runtime = runtime.clone();
+                View::new(move |cx| {
+                    assert_eq!(
+                        use_viewport(),
+                        Size {
+                            width: 100.0,
+                            height: 100.0
+                        }
+                    );
+                    *runtime.borrow_mut() = Some(cx.runtime().clone());
+                    let node = cx.container();
+                    cx.set_events(
+                        node,
+                        EventState {
+                            on_click: Some({
+                                let ticks = ticks.clone();
+                                Rc::new(move || ticks.update(|tick| *tick += 1))
+                            }),
+                            ..Default::default()
+                        },
+                    );
+                    cx.bind(move |tx| {
+                        paints.set(paints.get() + 1);
+                        let viewport = use_viewport();
+                        let theme = creamui_theme::use_theme();
+                        let tick = ticks.get();
+                        tx.apply(Mutation::SetLayoutStyle {
+                            node,
+                            style: creamui_core::Style::new()
+                                .width(viewport.width)
+                                .height(viewport.height)
+                                .layout,
+                        });
+                        tx.apply(Mutation::SetPaintStyle {
+                            node,
+                            style: creamui_core::PaintStyle {
+                                background: Some(
+                                    if tick == 0 {
+                                        theme.colors.accent
+                                    } else {
+                                        Color::rgb(0, 255, 0)
+                                    }
+                                    .into(),
+                                ),
+                                ..Default::default()
+                            },
+                        });
+                    });
+                    node
+                })
+            }
+        });
+        let first_runs = paints.get();
+        let runtime = runtime.borrow().as_ref().unwrap().clone();
+        let root = runtime.with(Runtime::root).unwrap();
+        let node = runtime.with(|runtime| runtime.get(root).unwrap().children.as_slice()[0]);
+        harness.send(WindowEvent::CursorMoved {
+            position: creamui_platform::PhysicalPosition { x: 10.0, y: 10.0 },
+        });
+        for pressed in [true, false] {
+            harness.send(WindowEvent::MouseInput {
+                pressed,
+                button: creamui_platform::MouseButton::Left,
+                serial: None,
+            });
+        }
+        harness.state.redraw();
+        assert_eq!(ticks.peek(), 1);
+        let pixel = harness
+            .state
+            .pipeline
+            .frame
+            .borrow()
+            .raster
+            .as_ref()
+            .unwrap()
+            .pixmap()
+            .pixel(10, 10)
+            .unwrap();
+        assert_eq!((pixel.red(), pixel.green(), pixel.blue()), (0, 255, 0));
+        harness.state.pipeline.surface.set(Size {
+            width: 120.0,
+            height: 140.0,
+        });
+        harness.state.pipeline.sync_frame();
+        harness.state.redraw();
+        assert_eq!(
+            runtime.with(|runtime| runtime.get(node).unwrap().layout.rect.width),
+            120.0
+        );
+        harness.state.pipeline.theme.set(Theme::light());
+        harness.state.redraw();
+        assert!(paints.get() > first_runs);
+        assert_eq!(mounts.get(), 1);
+        assert_eq!(runtime.with(Runtime::root), Some(root));
+        assert_eq!(runtime.with(Runtime::len), 2);
+        runtime.with(Runtime::check_invariants);
+    }
+
+    #[test]
+    fn suspension_keeps_owned_views_and_their_bindings_alive() {
+        let signal = Signal::new(0u32);
+        let mounts = Rc::new(Cell::new(0));
+        let cleaned = Rc::new(Cell::new(0));
+        let mut harness = WindowEventHarness::view({
+            let signal = signal.clone();
+            let mounts = mounts.clone();
+            let cleaned = cleaned.clone();
+            move |_| {
+                mounts.set(mounts.get() + 1);
+                View::new({
+                    let signal = signal.clone();
+                    let cleaned = cleaned.clone();
+                    move |cx| {
+                        cx.on_cleanup(move || cleaned.set(cleaned.get() + 1));
+                        let node = cx.text("");
+                        cx.bind(move |tx| {
+                            tx.apply(Mutation::SetText {
+                                node,
+                                text: signal.get().to_string().into(),
+                            })
+                        });
+                        node
+                    }
+                })
+            }
+        });
+        let runtime = harness.state.runtime().unwrap();
+        let root = runtime.with(Runtime::root).unwrap();
+        let node = runtime.with(|runtime| runtime.get(root).unwrap().children.as_slice()[0]);
+        harness.state.suspend();
+        signal.set(1);
+        harness.state.redraw();
+        assert_eq!(cleaned.get(), 0);
+        assert_eq!(mounts.get(), 1);
+        assert_eq!(runtime.with(Runtime::root), Some(root));
+        assert!(runtime.with(|runtime| matches!(&runtime.get(node).unwrap().kind, NodeKind::Text(text) if &*text.text == "1")));
+        drop(harness);
+        assert_eq!(cleaned.get(), 1);
+        assert!(runtime.with(Runtime::is_empty));
+    }
+
+    #[test]
+    fn closing_owned_view_disposes_it_even_while_the_pipeline_and_runtime_are_retained() {
+        let ticks = Signal::new(0u8);
+        let cleaned = Rc::new(Cell::new(0));
+        let runs = Rc::new(Cell::new(0));
+        let harness = WindowEventHarness::view({
+            let ticks = ticks.clone();
+            let cleaned = cleaned.clone();
+            let runs = runs.clone();
+            move |_| {
+                View::new({
+                    let ticks = ticks.clone();
+                    let cleaned = cleaned.clone();
+                    let runs = runs.clone();
+                    move |cx| {
+                        cx.on_cleanup(move || cleaned.set(cleaned.get() + 1));
+                        let node = cx.container();
+                        cx.bind(move |_| {
+                            ticks.get();
+                            runs.set(runs.get() + 1);
+                        });
+                        node
+                    }
+                })
+            }
+        });
+        let pipeline = harness.state.pipeline.clone();
+        let runtime = harness.state.runtime().unwrap();
+        let before = runs.get();
+        drop(harness);
+        assert_eq!(cleaned.get(), 1);
+        assert!(runtime.with(Runtime::is_empty));
+        ticks.set(1);
+        pipeline.theme.set(Theme::light());
+        assert_eq!(runs.get(), before);
+        runtime.with(Runtime::check_invariants);
+    }
+
+    #[test]
+    fn failed_owned_mount_recovers_without_retaining_partial_bindings() {
+        install_panic_dispatch();
+        let handled = Rc::new(Cell::new(0));
+        PANIC_HANDLER.with(|handler| {
+            let handled = handled.clone();
+            *handler.borrow_mut() = Some(Rc::new(move |_| handled.set(handled.get() + 1)));
+        });
+        let cleaned = Rc::new(Cell::new(0));
+        let signal = Signal::new(0u32);
+        let runs = Rc::new(Cell::new(0));
+        let harness = WindowEventHarness::view({
+            let cleaned = cleaned.clone();
+            let signal = signal.clone();
+            let runs = runs.clone();
+            move |_| {
+                View::new({
+                    let cleaned = cleaned.clone();
+                    let signal = signal.clone();
+                    let runs = runs.clone();
+                    move |cx| {
+                        cx.on_cleanup(move || cleaned.set(cleaned.get() + 1));
+                        cx.container();
+                        cx.bind(move |_| {
+                            signal.get();
+                            runs.set(runs.get() + 1);
+                        });
+                        panic!("owned mount failed");
+                    }
+                })
+            }
+        });
+        PANIC_HANDLER.with(|handler| *handler.borrow_mut() = None);
+        assert_eq!(handled.get(), 1);
+        assert_eq!(cleaned.get(), 1);
+        signal.set(1);
+        assert_eq!(runs.get(), 1);
+        let runtime = harness.state.runtime().unwrap();
+        assert_eq!(runtime.with(Runtime::len), 2);
+        runtime.with(Runtime::check_invariants);
+        drop(harness);
+        assert!(runtime.with(Runtime::is_empty));
+    }
+
+    #[test]
+    fn app_builder_routes_view_results_through_owned_runtime_startup() {
+        let mounts = Rc::new(Cell::new(0));
+        let mut app =
+            AppBuilder::new().window(WindowOptions::default(), Color::rgb(0, 0, 0), |_| {}, {
+                let mounts = mounts.clone();
+                move |_| {
+                    mounts.set(mounts.get() + 1);
+                    View::new(|cx| cx.container())
+                }
+            });
+        assert_eq!(mounts.get(), 0);
+        let source = app.specs.pop().unwrap().source;
+        assert!(matches!(source, UiSource::Runtime(_)));
+        let harness = WindowEventHarness::from_source(source);
+        assert_eq!(mounts.get(), 1);
+        let runtime = harness.state.runtime().unwrap();
+        drop(harness);
+        assert!(runtime.with(Runtime::is_empty));
+    }
+
+    #[test]
+    fn owned_views_are_isolated_between_windows() {
+        let a = Signal::new(0u8);
+        let b = Signal::new(0u8);
+        let make = |signal: Signal<u8>| {
+            WindowEventHarness::view(move |_| {
+                View::new({
+                    let signal = signal.clone();
+                    move |cx| {
+                        let node = cx.text("");
+                        cx.bind(move |tx| {
+                            tx.apply(Mutation::SetText {
+                                node,
+                                text: signal.get().to_string().into(),
+                            })
+                        });
+                        node
+                    }
+                })
+            })
+        };
+        let left = make(a.clone());
+        let right = make(b.clone());
+        let right_runtime = right.state.runtime().unwrap();
+        right.state.pipeline.needs_paint.set(false);
+        a.set(1);
+        assert!(!right.state.pipeline.needs_paint.get());
+        drop(left);
+        b.set(2);
+        assert!(!right_runtime.with(Runtime::is_empty));
+        assert!(right.state.pipeline.needs_paint.get());
+        drop(right);
+        assert!(right_runtime.with(Runtime::is_empty));
+    }
+
+    #[test]
+    fn runtime_window_paints_mutations_and_dispatches_clicks() {
+        let clicks = Rc::new(Cell::new(0));
+        let hovers = Rc::new(Cell::new(0));
+        let keys = Rc::new(Cell::new(0));
+        let scrolls = Rc::new(Cell::new(0));
+        let mut runtime = Runtime::new();
+        let root = {
+            let mut tx = runtime.transaction();
+            let root = tx.create_node(NodeKind::Container);
+            tx.apply(Mutation::SetLayoutStyle {
+                node: root,
+                style: creamui_core::Style::new().width(100.0).height(100.0).layout,
+            });
+            tx.apply(Mutation::SetPaintStyle {
+                node: root,
+                style: creamui_core::PaintStyle {
+                    background: Some(Color::rgb(255, 0, 0).into()),
+                    ..Default::default()
+                },
+            });
+            tx.apply(Mutation::SetEventHandlers {
+                node: root,
+                handlers: EventState {
+                    on_click: Some(Rc::new({
+                        let clicks = clicks.clone();
+                        move || clicks.set(clicks.get() + 1)
+                    })),
+                    on_hover: Some(Rc::new({
+                        let hovers = hovers.clone();
+                        move |entered| hovers.set(hovers.get() + if entered { 1 } else { -1 })
+                    })),
+                    on_key: Some(Rc::new({
+                        let keys = keys.clone();
+                        move |_| keys.set(keys.get() + 1)
+                    })),
+                    on_scroll: Some(Rc::new({
+                        let scrolls = scrolls.clone();
+                        move |_| scrolls.set(scrolls.get() + 1)
+                    })),
+                    focusable: true,
+                    ..Default::default()
+                },
+            });
+            root
+        };
+        runtime.set_root(Some(root));
+        let runtime = SharedRuntime::new(runtime);
+        let mut harness = WindowEventHarness::retained(runtime.clone());
+        let color = {
+            let frame = harness.state.pipeline.frame.borrow();
+            let pixel = frame
+                .raster
+                .as_ref()
+                .unwrap()
+                .pixmap()
+                .pixel(10, 10)
+                .unwrap();
+            (pixel.red(), pixel.green(), pixel.blue())
+        };
+        assert_eq!(color, (255, 0, 0));
+
+        harness.send(WindowEvent::CursorMoved {
+            position: creamui_platform::PhysicalPosition { x: 10.0, y: 10.0 },
+        });
+        assert_eq!(hovers.get(), 1);
+        harness.send(WindowEvent::MouseInput {
+            pressed: true,
+            button: MouseButton::Left,
+            serial: None,
+        });
+        harness.send(WindowEvent::MouseInput {
+            pressed: false,
+            button: MouseButton::Left,
+            serial: None,
+        });
+        assert_eq!(clicks.get(), 1);
+        harness.key(KeyInput {
+            key: Key::Char('x'),
+            modifiers: Modifiers::default(),
+        });
+        assert_eq!(keys.get(), 1);
+        harness.send(WindowEvent::MouseWheel {
+            delta: MouseScrollDelta::LineDelta(0.0, -1.0),
+        });
+        assert_eq!(scrolls.get(), 1);
+        harness.send(WindowEvent::CursorLeft);
+        assert_eq!(hovers.get(), 0);
+
+        runtime.transaction(|tx| {
+            tx.apply(Mutation::SetPaintStyle {
+                node: root,
+                style: creamui_core::PaintStyle {
+                    background: Some(Color::rgb(0, 255, 0).into()),
+                    ..Default::default()
+                },
+            });
+        });
+        assert!(harness.state.pipeline.needs_paint.get());
+        harness.state.redraw();
+        let frame = harness.state.pipeline.frame.borrow();
+        let pixel = frame
+            .raster
+            .as_ref()
+            .unwrap()
+            .pixmap()
+            .pixel(10, 10)
+            .unwrap();
+        assert_eq!((pixel.red(), pixel.green(), pixel.blue()), (0, 255, 0));
+    }
+
+    #[test]
+    fn runtime_window_preserves_decoded_image_fit_and_crop() {
+        let image =
+            creamui_core::RgbaImage::new(2, 1, vec![255, 0, 0, 255, 0, 0, 255, 255]).unwrap();
+        let mut runtime = Runtime::new();
+        let (root, image_node) = {
+            let mut tx = runtime.transaction();
+            let root = tx.create_node(NodeKind::Container);
+            let image_node = tx.create_node(NodeKind::Image(
+                ImageNode::decoded(image.clone()).with_fit(ImageFit::Cover),
+            ));
+            tx.insert_child(root, image_node, None);
+            tx.apply(Mutation::SetLayoutStyle {
+                node: root,
+                style: creamui_core::Style::new().width(40.0).height(40.0).layout,
+            });
+            tx.apply(Mutation::SetLayoutStyle {
+                node: image_node,
+                style: creamui_core::Style::new().width(40.0).height(40.0).layout,
+            });
+            (root, image_node)
+        };
+        runtime.set_root(Some(root));
+        let runtime = SharedRuntime::new(runtime);
+        let mut harness = WindowEventHarness::retained(runtime.clone());
+        let sample = |harness: &WindowEventHarness, x, y| {
+            let frame = harness.state.pipeline.frame.borrow();
+            let pixel = frame.raster.as_ref().unwrap().pixmap().pixel(x, y).unwrap();
+            (pixel.red(), pixel.green(), pixel.blue())
+        };
+        let left = sample(&harness, 5, 20);
+        let right = sample(&harness, 35, 20);
+        assert!(left.0 > left.2 && right.2 > right.0);
+        assert_eq!(sample(&harness, 45, 20), (0, 0, 0));
+
+        runtime.transaction(|tx| {
+            tx.apply(Mutation::SetImage {
+                node: image_node,
+                content: ImageContent::Decoded(image),
+                fit: ImageFit::Contain,
+            });
+        });
+        harness.state.redraw();
+        assert_eq!(sample(&harness, 5, 5), (0, 0, 0));
+        let left = sample(&harness, 5, 20);
+        let right = sample(&harness, 35, 20);
+        assert!(left.0 > left.2 && right.2 > right.0);
+
+        runtime.transaction(|tx| {
+            tx.apply(Mutation::SetOpacity {
+                node: image_node,
+                opacity: 0.5,
+            });
+            tx.apply(Mutation::SetTransform {
+                node: image_node,
+                transform: creamui_core::runtime::Transform2D { x: 10.0, y: 0.0 },
+            });
+        });
+        harness.state.redraw();
+        assert_eq!(sample(&harness, 5, 20), (0, 0, 0));
+        let shifted = sample(&harness, 15, 20);
+        assert!(shifted.0 > shifted.2 && (80..160).contains(&shifted.0));
+    }
+
+    #[cfg(feature = "system-theme")]
+    #[test]
+    fn fixed_theme_window_observes_host_variant_changes_through_the_hook() {
+        use creamui_theme::{use_system_appearance, SystemAppearance, SystemColorScheme};
+        SYSTEM_APPEARANCE.with(|provider| provider.set(SystemAppearance::default()));
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let output = seen.clone();
+        let mut harness = WindowEventHarness::new(move |_| {
+            output
+                .borrow_mut()
+                .push(use_system_appearance().get().variant);
+            Box::new(BlankWidget)
+        });
+        let fixed_theme = harness.state.pipeline.theme.get();
+        SYSTEM_APPEARANCE.with(|provider| {
+            provider.set(SystemAppearance {
+                color_scheme: SystemColorScheme::Dark,
+                variant: Some("midnight".into()),
+                ..Default::default()
+            })
+        });
+        harness.state.redraw();
+        assert_eq!(seen.borrow().last(), Some(&Some("midnight".into())));
+        assert_eq!(harness.state.pipeline.theme.get(), fixed_theme);
+        SYSTEM_APPEARANCE.with(|provider| provider.set(SystemAppearance::default()));
+    }
+
+    #[test]
+    fn runtime_window_rebuilds_theme_tokens_after_theme_change() {
+        let mut runtime = Runtime::new();
+        let root = {
+            let mut tx = runtime.transaction();
+            let root = tx.create_node(NodeKind::Container);
+            tx.apply(Mutation::SetLayoutStyle {
+                node: root,
+                style: creamui_core::Style::new().width(100.0).height(100.0).layout,
+            });
+            tx.apply(Mutation::SetPaintStyle {
+                node: root,
+                style: creamui_core::PaintStyle {
+                    background: Some(creamui_core::ColorToken::Accent.into()),
+                    ..Default::default()
+                },
+            });
+            root
+        };
+        runtime.set_root(Some(root));
+        let mut harness = WindowEventHarness::retained(SharedRuntime::new(runtime));
+        let mut theme = harness.state.pipeline.theme.get();
+        theme.colors.accent = Color::rgb(16, 32, 48);
+        harness.state.pipeline.theme.set(theme);
+        assert!(harness.state.pipeline.needs_paint.get());
+        harness.state.redraw();
+        let frame = harness.state.pipeline.frame.borrow();
+        let pixel = frame
+            .raster
+            .as_ref()
+            .unwrap()
+            .pixmap()
+            .pixel(10, 10)
+            .unwrap();
+        assert_eq!((pixel.red(), pixel.green(), pixel.blue()), (16, 32, 48));
+    }
+
+    #[test]
+    fn runtime_window_draws_text_decorations() {
+        let mut runtime = Runtime::new();
+        let root = {
+            let mut tx = runtime.transaction();
+            let root = tx.create_node(NodeKind::Text(creamui_core::runtime::TextNode {
+                text: Rc::from("Decorated"),
+            }));
+            tx.apply(Mutation::SetLayoutStyle {
+                node: root,
+                style: creamui_core::Style::new().width(100.0).height(30.0).layout,
+            });
+            tx.apply(Mutation::SetTypographyStyle {
+                node: root,
+                style: creamui_core::TypographyStyle {
+                    font_size: Some(16.0),
+                    color: Some(Color::rgb(255, 255, 255).into()),
+                    underline: Some(true),
+                    strikethrough: Some(true),
+                    ..Default::default()
+                },
+            });
+            root
+        };
+        runtime.set_root(Some(root));
+        let harness = WindowEventHarness::retained(SharedRuntime::new(runtime));
+        let frame = harness.state.pipeline.frame.borrow();
+        let list = frame.presented.as_ref().unwrap();
+        assert_eq!(
+            list.items
+                .iter()
+                .filter(|item| matches!(item.primitive, crate::display_list::Primitive::Text(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            list.items
+                .iter()
+                .filter(|item| matches!(item.primitive, crate::display_list::Primitive::Quad(_)))
+                .count(),
+            2
+        );
+    }
+
+    struct LayoutFeedbackWidget {
+        resolved_height: Rc<Cell<f32>>,
+    }
+
+    impl creamui_core::Widget for LayoutFeedbackWidget {
+        fn style(&self) -> creamui_core::Style {
+            creamui_core::Style::new().height(75.0)
+        }
+
+        fn paint(&self, _: &mut dyn creamui_core::Painter, _: creamui_core::Rect) {}
+
+        fn on_layout(&self, rect: creamui_core::Rect) -> bool {
+            if self.resolved_height.get() == rect.height {
+                return false;
+            }
+            self.resolved_height.set(rect.height);
+            true
+        }
+
+        fn reports_layout(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn layout_feedback_rebuilds_before_the_first_frame() {
+        let resolved_height = Rc::new(Cell::new(0.0));
+        let builds = Rc::new(Cell::new(0));
+        let harness = WindowEventHarness::new({
+            let resolved_height = resolved_height.clone();
+            let builds = builds.clone();
+            move |_| {
+                builds.set(builds.get() + 1);
+                Box::new(LayoutFeedbackWidget {
+                    resolved_height: resolved_height.clone(),
+                })
+            }
+        });
+
+        assert_eq!(resolved_height.get(), 75.0);
+        assert_eq!(builds.get(), 2);
+        assert!(!harness
+            .state
+            .pipeline
+            .frame
+            .borrow()
+            .renderer
+            .layout_feedback());
+    }
+
+    struct ScrollLayoutWidget {
+        content: bool,
+    }
+
+    impl creamui_core::Widget for ScrollLayoutWidget {
+        fn style(&self) -> creamui_core::Style {
+            creamui_core::layout::Style {
+                size: creamui_core::layout::Size {
+                    width: creamui_core::layout::Dimension::Length(100.0),
+                    height: creamui_core::layout::Dimension::Length(if self.content {
+                        200.0
+                    } else {
+                        100.0
+                    }),
+                },
+                flex_shrink: 0.0,
+                ..Default::default()
+            }
+            .into()
+        }
+
+        fn paint(&self, _: &mut dyn creamui_core::Painter, _: creamui_core::Rect) {}
+
+        fn children(&mut self) -> Vec<BoxedWidget> {
+            if self.content {
+                Vec::new()
+            } else {
+                vec![Box::new(Self { content: true })]
+            }
+        }
+
+        fn on_scroll_bounded(&self) -> Option<Rc<dyn Fn(f32, f32)>> {
+            (!self.content).then(|| Rc::new(|_, _| {}) as Rc<dyn Fn(f32, f32)>)
+        }
+
+        fn scroll_requires_layout(&self) -> bool {
+            !self.content
+        }
+    }
+
+    #[test]
+    fn layout_dependent_scroll_rebuilds_on_wheel_input() {
+        let builds = Rc::new(Cell::new(0));
+        let mut harness = WindowEventHarness::new({
+            let builds = builds.clone();
+            move |_| {
+                builds.set(builds.get() + 1);
+                Box::new(ScrollLayoutWidget { content: false })
+            }
+        });
+        let baseline = builds.get();
+
+        harness.send(WindowEvent::CursorMoved {
+            position: creamui_platform::PhysicalPosition { x: 5.0, y: 5.0 },
+        });
+        harness.send(WindowEvent::MouseWheel {
+            delta: MouseScrollDelta::LineDelta(0.0, -1.0),
+        });
+        harness.send(WindowEvent::RedrawRequested);
+
+        assert_eq!(builds.get(), baseline + 1);
+    }
+
+    struct InteractiveWidget {
+        clicks: Signal<usize>,
+        keys: Signal<String>,
+    }
+
+    struct ThemeInChildren;
+
+    impl creamui_core::Widget for ThemeInChildren {
+        fn style(&self) -> creamui_core::Style {
+            creamui_core::layout::Style::default().into()
+        }
+
+        fn paint(&self, _: &mut dyn creamui_core::Painter, _: creamui_core::Rect) {}
+
+        fn children(&mut self) -> Vec<BoxedWidget> {
+            let _ = creamui_theme::use_theme();
+            Vec::new()
+        }
+    }
+
+    impl creamui_core::Widget for InteractiveWidget {
+        fn style(&self) -> creamui_core::Style {
+            creamui_core::layout::Style {
+                size: creamui_core::layout::Size {
+                    width: creamui_core::layout::Dimension::Length(100.0),
+                    height: creamui_core::layout::Dimension::Length(100.0),
+                },
+                ..Default::default()
+            }
+            .into()
+        }
+
+        fn paint(&self, _: &mut dyn creamui_core::Painter, _: creamui_core::Rect) {}
+
+        fn focusable(&self) -> bool {
+            true
+        }
+
+        fn on_click(&self) -> Option<Rc<dyn Fn()>> {
+            let clicks = self.clicks.clone();
+            Some(Rc::new(move || clicks.update(|count| *count += 1)))
+        }
+
+        fn on_key(&self) -> Option<Rc<dyn Fn(KeyInput)>> {
+            let keys = self.keys.clone();
+            Some(Rc::new(move |input| {
+                if let Key::Char(character) = input.key {
+                    keys.update(|text| text.push(character));
+                }
+            }))
+        }
+    }
+
+    fn window_size() -> Size {
+        Size {
+            width: 100.0,
+            height: 100.0,
+        }
+    }
+
+    #[test]
+    fn build_ui_with_recovery_passes_through_without_a_registered_handler() {
+        PANIC_HANDLER.with(|cell| *cell.borrow_mut() = None);
+        let build: Rc<dyn Fn(Size) -> BoxedWidget> = Rc::new(|_size| Box::new(BlankWidget));
+        let _widget = build_ui_with_recovery(&build, window_size());
+    }
+
+    #[test]
+    fn build_ui_with_recovery_catches_a_panic_and_calls_the_handler() {
+        install_panic_dispatch();
+        let called = Rc::new(Cell::new(false));
+        let handler_called = called.clone();
+        PANIC_HANDLER.with(|cell| {
+            *cell.borrow_mut() = Some(Rc::new(move |details: &PanicDetails| {
+                handler_called.set(true);
+                assert_eq!(details.message, "boom");
+            }));
+        });
+
+        let build: Rc<dyn Fn(Size) -> BoxedWidget> = Rc::new(|_size| panic!("boom"));
+        let _widget = build_ui_with_recovery(&build, window_size());
+
+        assert!(called.get(), "on_panic handler must run for a caught panic");
+        PANIC_HANDLER.with(|cell| *cell.borrow_mut() = None);
+    }
+
+    #[test]
+    fn app_builder_accepts_a_one_shot_window_ready_callback() {
+        let message = String::from("ready");
+        let _app = AppBuilder::new().window(
+            WindowOptions::default(),
+            Color::rgba(0, 0, 0, 255),
+            move |_| drop(message),
+            |_| Box::new(BlankWidget),
+        );
+    }
+
+    #[test]
+    fn headless_harness_delivers_clicks_and_keys() {
+        let clicks = Signal::new(0);
+        let keys = Signal::new(String::new());
+        let mut harness = WindowEventHarness::new({
+            let clicks = clicks.clone();
+            let keys = keys.clone();
+            move |_| {
+                Box::new(InteractiveWidget {
+                    clicks: clicks.clone(),
+                    keys: keys.clone(),
+                })
+            }
+        });
+
+        harness.send(WindowEvent::CursorMoved {
+            position: creamui_platform::PhysicalPosition { x: 20.0, y: 20.0 },
+        });
+        harness.send(WindowEvent::MouseInput {
+            pressed: true,
+            button: MouseButton::Left,
+            serial: None,
+        });
+        harness.key(KeyInput {
+            key: Key::Char('x'),
+            modifiers: Modifiers::default(),
+        });
+
+        assert_eq!(clicks.get(), 1);
+        assert_eq!(keys.get(), "x");
+    }
+
+    struct FocusTestRoot {
+        children: Vec<BoxedWidget>,
+    }
+
+    impl creamui_core::Widget for FocusTestRoot {
+        fn style(&self) -> creamui_core::Style {
+            creamui_core::layout::Style::default().into()
+        }
+
+        fn paint(&self, _: &mut dyn creamui_core::Painter, _: creamui_core::Rect) {}
+
+        fn children(&mut self) -> Vec<BoxedWidget> {
+            std::mem::take(&mut self.children)
+        }
+    }
+
+    struct FocusTestLeaf {
+        keys: Rc<Cell<usize>>,
+    }
+
+    impl creamui_core::Widget for FocusTestLeaf {
+        fn style(&self) -> creamui_core::Style {
+            creamui_core::layout::Style {
+                size: creamui_core::layout::Size {
+                    width: creamui_core::layout::Dimension::Length(20.0),
+                    height: creamui_core::layout::Dimension::Length(20.0),
+                },
+                flex_shrink: 0.0,
+                ..Default::default()
+            }
+            .into()
+        }
+
+        fn paint(&self, _: &mut dyn creamui_core::Painter, _: creamui_core::Rect) {}
+
+        fn focusable(&self) -> bool {
+            true
+        }
+
+        fn on_key(&self) -> Option<Rc<dyn Fn(KeyInput)>> {
+            let keys = self.keys.clone();
+            Some(Rc::new(move |_| keys.set(keys.get() + 1)))
+        }
+    }
+
+    #[test]
+    fn window_keeps_keyboard_focus_on_keyed_control_after_insert_and_remove() {
+        let order = Rc::new(RefCell::new(vec![1, 2]));
+        let keys: Vec<_> = (0..3).map(|_| Rc::new(Cell::new(0))).collect();
+        let mut harness = WindowEventHarness::new({
+            let order = order.clone();
+            let keys = keys.clone();
+            move |_| {
+                Box::new(FocusTestRoot {
+                    children: order
+                        .borrow()
+                        .iter()
+                        .map(|&id| {
+                            creamui_core::keyed(
+                                FocusTestLeaf {
+                                    keys: keys[id].clone(),
+                                },
+                                id as u64,
+                            )
+                        })
+                        .collect(),
+                })
+            }
+        });
+        harness.state.pipeline.focused.set(Some(1));
+        harness.state.pipeline.invalidate_paint();
+        harness.state.redraw();
+
+        *order.borrow_mut() = vec![0, 1, 2];
+        harness.state.pipeline.build();
+        harness.state.redraw();
+        assert_eq!(harness.state.pipeline.focused.get(), Some(2));
+        harness.key(KeyInput {
+            key: Key::Enter,
+            modifiers: Modifiers::default(),
+        });
+        assert_eq!(keys[2].get(), 1);
+        assert_eq!(keys[1].get(), 0);
+
+        *order.borrow_mut() = vec![0, 2];
+        harness.state.pipeline.build();
+        harness.state.redraw();
+        assert_eq!(harness.state.pipeline.focused.get(), Some(1));
+        harness.key(KeyInput {
+            key: Key::Enter,
+            modifiers: Modifiers::default(),
+        });
+        assert_eq!(keys[2].get(), 2);
+
+        *order.borrow_mut() = vec![0];
+        harness.state.pipeline.build();
+        harness.state.redraw();
+        assert_eq!(harness.state.pipeline.focused.get(), None);
+        harness.key(KeyInput {
+            key: Key::Enter,
+            modifiers: Modifiers::default(),
+        });
+        assert_eq!(keys[0].get(), 0);
+    }
+
+    struct DraggableWidget {
+        calls: Rc<RefCell<Vec<Point>>>,
+        end_calls: Rc<Cell<u32>>,
+    }
+
+    impl creamui_core::Widget for DraggableWidget {
+        fn style(&self) -> creamui_core::Style {
+            creamui_core::layout::Style {
+                size: creamui_core::layout::Size {
+                    width: creamui_core::layout::Dimension::Length(100.0),
+                    height: creamui_core::layout::Dimension::Length(100.0),
+                },
+                ..Default::default()
+            }
+            .into()
+        }
+
+        fn paint(&self, _: &mut dyn creamui_core::Painter, _: creamui_core::Rect) {}
+
+        fn on_drag(&self) -> Option<Rc<dyn Fn(Point, Rect)>> {
+            let calls = self.calls.clone();
+            Some(Rc::new(move |local, _rect| calls.borrow_mut().push(local)))
+        }
+
+        fn on_drag_end(&self) -> Option<Rc<dyn Fn()>> {
+            let end_calls = self.end_calls.clone();
+            Some(Rc::new(move || end_calls.set(end_calls.get() + 1)))
+        }
+    }
+
+    #[test]
+    fn cursor_moved_during_a_drag_coalesces_to_the_latest_position_per_redraw() {
+        let calls: Rc<RefCell<Vec<Point>>> = Rc::new(RefCell::new(Vec::new()));
+        let end_calls = Rc::new(Cell::new(0));
+        let mut harness = WindowEventHarness::new({
+            let calls = calls.clone();
+            let end_calls = end_calls.clone();
+            move |_| {
+                Box::new(DraggableWidget {
+                    calls: calls.clone(),
+                    end_calls: end_calls.clone(),
+                })
+            }
+        });
+
+        harness.send(WindowEvent::CursorMoved {
+            position: creamui_platform::PhysicalPosition { x: 10.0, y: 10.0 },
+        });
+        harness.send(WindowEvent::MouseInput {
+            pressed: true,
+            button: MouseButton::Left,
+            serial: None,
+        });
+        assert_eq!(
+            calls.borrow().len(),
+            1,
+            "the initial press dispatches immediately"
+        );
+
+        harness.send(WindowEvent::CursorMoved {
+            position: creamui_platform::PhysicalPosition { x: 20.0, y: 20.0 },
+        });
+        harness.send(WindowEvent::CursorMoved {
+            position: creamui_platform::PhysicalPosition { x: 30.0, y: 30.0 },
+        });
+        assert_eq!(
+            calls.borrow().len(),
+            1,
+            "raw motion events during a drag must not each dispatch the handler"
+        );
+
+        harness.send(WindowEvent::RedrawRequested);
+        assert_eq!(
+            calls.borrow().len(),
+            2,
+            "a redraw flushes exactly one call, for the latest queued position"
+        );
+        assert_eq!(calls.borrow()[1], Point { x: 30.0, y: 30.0 });
+    }
+
+    #[test]
+    fn real_wayland_drag_events_drive_the_same_on_drag_callbacks() {
+        let calls: Rc<RefCell<Vec<Point>>> = Rc::new(RefCell::new(Vec::new()));
+        let end_calls = Rc::new(Cell::new(0));
+        let mut harness = WindowEventHarness::new({
+            let calls = calls.clone();
+            let end_calls = end_calls.clone();
+            move |_| {
+                Box::new(DraggableWidget {
+                    calls: calls.clone(),
+                    end_calls: end_calls.clone(),
+                })
+            }
+        });
+
+        harness.send(WindowEvent::CursorMoved {
+            position: creamui_platform::PhysicalPosition { x: 10.0, y: 10.0 },
+        });
+        harness.send(WindowEvent::MouseInput {
+            pressed: true,
+            button: MouseButton::Left,
+            serial: None,
+        });
+        assert_eq!(
+            calls.borrow().len(),
+            1,
+            "the initial press dispatches immediately"
+        );
+
+        // Once a real drag starts, the compositor stops sending CursorMoved
+        // and sends these instead.
+        harness.send(WindowEvent::DragMoved {
+            position: creamui_platform::PhysicalPosition { x: 40.0, y: 40.0 },
+        });
+        harness.send(WindowEvent::RedrawRequested);
+        assert_eq!(calls.borrow().len(), 2);
+        assert_eq!(calls.borrow()[1], Point { x: 40.0, y: 40.0 });
+
+        harness.send(WindowEvent::DragDropped);
+        assert_eq!(
+            end_calls.get(),
+            1,
+            "a drop must end the drag like releasing the mouse does"
+        );
+    }
+
+    #[test]
+    fn delayed_file_drops_keep_the_drop_position_after_pointer_motion() {
+        let mut harness = WindowEventHarness::new(|_| {
+            Box::new(creamui_widgets::layout::Flex::row().size(100.0, 100.0))
+        });
+        let received = Rc::new(RefCell::new(Vec::new()));
+        let result = received.clone();
+        *harness.state.file_drop_handler.borrow_mut() = Some(Rc::new(move |paths, point| {
+            result.borrow_mut().push((paths, point))
+        }));
+        harness.send(WindowEvent::CursorMoved {
+            position: crate::platform::PhysicalPosition { x: 90.0, y: 90.0 },
+        });
+        harness.send(WindowEvent::FilesDroppedAt {
+            paths: vec!["/tmp/app.desktop".into()],
+            position: crate::platform::PhysicalPosition { x: 20.0, y: 30.0 },
+        });
+        let received = received.borrow();
+        assert_eq!(
+            received[0].0,
+            vec![std::path::PathBuf::from("/tmp/app.desktop")]
+        );
+        assert_eq!(received[0].1, Point { x: 20.0, y: 30.0 });
+    }
+
+    #[test]
+    fn native_file_drops_route_to_widgets_before_window_fallbacks() {
+        struct Target(Rc<Cell<u32>>);
+        impl creamui_core::Widget for Target {
+            fn style(&self) -> creamui_core::Style {
+                creamui_core::Style::new().width(40.0).height(40.0)
+            }
+            fn paint(&self, _: &mut dyn creamui_core::Painter, _: Rect) {}
+            fn file_drop_target(&self) -> Option<creamui_core::FileDropTarget> {
+                let calls = self.0.clone();
+                Some(creamui_core::FileDropTarget {
+                    accepts: Rc::new(|path| path.extension().is_some_and(|ext| ext == "desktop")),
+                    on_drop: Rc::new(move |_| calls.set(calls.get() + 1)),
+                })
+            }
+        }
+        let calls = Rc::new(Cell::new(0));
+        let target = calls.clone();
+        let mut harness = WindowEventHarness::new(move |_| Box::new(Target(target.clone())));
+        let fallback = Rc::new(Cell::new(0));
+        let result = fallback.clone();
+        *harness.state.file_drop_handler.borrow_mut() =
+            Some(Rc::new(move |_, _| result.set(result.get() + 1)));
+        for (path, x) in [
+            ("/tmp/app.desktop", 20.0),
+            ("/tmp/file.txt", 20.0),
+            ("/tmp/app.desktop", 80.0),
+        ] {
+            harness.send(WindowEvent::FilesDroppedAt {
+                paths: vec![path.into()],
+                position: crate::platform::PhysicalPosition { x, y: 20.0 },
+            });
+        }
+        assert_eq!(calls.get(), 1);
+        assert_eq!(fallback.get(), 1);
+    }
+
+    #[test]
+    fn popup_dismissal_keeps_the_drag_origin_until_the_transfer_finishes() {
+        let mut harness = WindowEventHarness::new(|_| {
+            Box::new(creamui_widgets::layout::Flex::row().size(100.0, 100.0))
+        });
+        harness.state.native_drag_active.set(true);
+        harness.send(WindowEvent::PopupDone);
+        assert!(!harness.state.close_requested.get());
+        harness.send(WindowEvent::DragSourceFinished);
+        assert!(harness.state.close_requested.get());
+        assert!(!harness.state.native_drag_active.peek());
+    }
+
+    #[test]
+    fn native_drags_report_pointer_presence_for_auto_hiding_surfaces() {
+        let mut harness = WindowEventHarness::new(|_| {
+            Box::new(creamui_widgets::layout::Flex::row().size(100.0, 100.0))
+        });
+        let presence = Rc::new(RefCell::new(Vec::new()));
+        let events = presence.clone();
+        *harness.state.pointer_presence_handler.borrow_mut() =
+            Some(Rc::new(move |inside| events.borrow_mut().push(inside)));
+        harness.send(WindowEvent::DragEntered {
+            position: crate::platform::PhysicalPosition { x: 20.0, y: 30.0 },
+        });
+        harness.send(WindowEvent::DragMoved {
+            position: crate::platform::PhysicalPosition { x: 30.0, y: 30.0 },
+        });
+        harness.send(WindowEvent::DragLeft);
+        assert_eq!(*presence.borrow(), vec![true, true, false]);
+    }
+
+    struct HoverCountingWidget {
+        paint_calls: Rc<Cell<usize>>,
+    }
+
+    #[test]
+    fn native_pointer_presence_is_reported_before_widget_hover_dispatch() {
+        let mut harness = WindowEventHarness::new(|_| {
+            Box::new(HoverCountingWidget {
+                paint_calls: Rc::new(Cell::new(0)),
+            })
+        });
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let recorded = events.clone();
+        *harness.state.pointer_presence_handler.borrow_mut() =
+            Some(Rc::new(move |inside| recorded.borrow_mut().push(inside)));
+        harness.send(WindowEvent::CursorMoved {
+            position: creamui_platform::PhysicalPosition { x: 10.0, y: 10.0 },
+        });
+        harness.send(WindowEvent::CursorMoved {
+            position: creamui_platform::PhysicalPosition { x: 20.0, y: 20.0 },
+        });
+        harness.send(WindowEvent::CursorLeft);
+        assert_eq!(*events.borrow(), vec![true, true, false]);
+    }
+
+    impl creamui_core::Widget for HoverCountingWidget {
+        fn style(&self) -> creamui_core::Style {
+            creamui_core::layout::Style {
+                size: creamui_core::layout::Size {
+                    width: creamui_core::layout::Dimension::Length(100.0),
+                    height: creamui_core::layout::Dimension::Length(100.0),
+                },
+                ..Default::default()
+            }
+            .into()
+        }
+
+        fn paint(&self, _: &mut dyn creamui_core::Painter, _: creamui_core::Rect) {
+            self.paint_calls.set(self.paint_calls.get() + 1);
+        }
+
+        fn on_hover(&self) -> Option<Rc<dyn Fn(bool)>> {
+            Some(Rc::new(|_| {}))
+        }
+    }
+
+    #[test]
+    fn cursor_moved_within_the_same_hover_region_does_not_repaint() {
+        let paint_calls = Rc::new(Cell::new(0));
+        let mut harness = WindowEventHarness::new({
+            let paint_calls = paint_calls.clone();
+            move |_| {
+                Box::new(HoverCountingWidget {
+                    paint_calls: paint_calls.clone(),
+                })
+            }
+        });
+
+        let baseline = paint_calls.get();
+        harness.send(WindowEvent::CursorMoved {
+            position: creamui_platform::PhysicalPosition { x: 10.0, y: 10.0 },
+        });
+        harness.send(WindowEvent::RedrawRequested);
+        let after_enter = paint_calls.get();
+        assert!(
+            after_enter > baseline,
+            "entering a hover region must still repaint"
+        );
+
+        harness.send(WindowEvent::CursorMoved {
+            position: creamui_platform::PhysicalPosition { x: 20.0, y: 20.0 },
+        });
+        harness.send(WindowEvent::RedrawRequested);
+        assert_eq!(
+            paint_calls.get(),
+            after_enter,
+            "moving within the same hover region must not trigger another repaint"
+        );
+    }
+
+    #[test]
+    fn explicit_repaint_does_not_invalidate_layout_or_rebuild() {
+        let builds = Rc::new(Cell::new(0));
+        let paints = Rc::new(Cell::new(0));
+        let mut harness = WindowEventHarness::new({
+            let builds = builds.clone();
+            let paints = paints.clone();
+            move |_| {
+                builds.set(builds.get() + 1);
+                Box::new(HoverCountingWidget {
+                    paint_calls: paints.clone(),
+                })
+            }
+        });
+        let app = AppHandle::new();
+        let handle = harness.menu_handle(app, false);
+        let baseline_builds = builds.get();
+        let baseline_paints = paints.get();
+        handle.request_repaint();
+        assert!(!harness.state.pipeline.needs_layout.get());
+        harness.send(WindowEvent::RedrawRequested);
+        assert_eq!(builds.get(), baseline_builds);
+        assert_eq!(paints.get(), baseline_paints + 1);
+    }
+
+    struct SmallHoverWidget {
+        paint_calls: Rc<Cell<usize>>,
+    }
+
+    impl creamui_core::Widget for SmallHoverWidget {
+        fn style(&self) -> creamui_core::Style {
+            creamui_core::layout::Style {
+                size: creamui_core::layout::Size {
+                    width: creamui_core::layout::Dimension::Length(20.0),
+                    height: creamui_core::layout::Dimension::Length(20.0),
+                },
+                ..Default::default()
+            }
+            .into()
+        }
+
+        fn paint(&self, painter: &mut dyn creamui_core::Painter, rect: creamui_core::Rect) {
+            self.paint_calls.set(self.paint_calls.get() + 1);
+            let color = if painter.hovered(rect) {
+                Color::rgb(255, 0, 0)
+            } else {
+                Color::rgb(0, 0, 255)
+            };
+            painter.fill_rect(rect, color, 0.0);
+        }
+
+        fn on_hover(&self) -> Option<Rc<dyn Fn(bool)>> {
+            Some(Rc::new(|_| {}))
+        }
+    }
+
+    struct SmallHoverRoot {
+        paint_calls: Rc<Cell<usize>>,
+    }
+
+    impl creamui_core::Widget for SmallHoverRoot {
+        fn style(&self) -> creamui_core::Style {
+            creamui_core::layout::Style {
+                size: creamui_core::layout::Size {
+                    width: creamui_core::layout::Dimension::Length(100.0),
+                    height: creamui_core::layout::Dimension::Length(100.0),
+                },
+                ..Default::default()
+            }
+            .into()
+        }
+
+        fn paint(&self, _: &mut dyn creamui_core::Painter, _: creamui_core::Rect) {}
+
+        fn children(&mut self) -> Vec<BoxedWidget> {
+            vec![Box::new(SmallHoverWidget {
+                paint_calls: self.paint_calls.clone(),
+            })]
+        }
+    }
+
+    #[test]
+    fn many_invalidations_coalesce_into_one_frame() {
+        let paint_calls = Rc::new(Cell::new(0));
+        let mut harness = WindowEventHarness::new({
+            let paint_calls = paint_calls.clone();
+            move |_| {
+                Box::new(SmallHoverRoot {
+                    paint_calls: paint_calls.clone(),
+                })
+            }
+        });
+        let baseline = paint_calls.get();
+        for _ in 0..10 {
+            harness.state.pipeline.invalidate_layout();
+            harness.state.pipeline.invalidate_paint();
+        }
+        assert_eq!(
+            paint_calls.get(),
+            baseline,
+            "invalidation alone never paints"
+        );
+        harness.send(WindowEvent::RedrawRequested);
+        harness.send(WindowEvent::RedrawRequested);
+        assert_eq!(paint_calls.get(), baseline + 1);
+    }
+
+    #[test]
+    fn hovering_a_small_region_presents_only_its_pixels() {
+        let mut harness = WindowEventHarness::new(|_| {
+            Box::new(SmallHoverRoot {
+                paint_calls: Rc::new(Cell::new(0)),
+            })
+        });
+        harness.send(WindowEvent::CursorMoved {
+            position: creamui_platform::PhysicalPosition { x: 10.0, y: 10.0 },
+        });
+        harness.send(WindowEvent::RedrawRequested);
+        let frame = harness.state.pipeline.frame.borrow();
+        let report = &frame.last_report;
+        assert!(report.damaged_pixels > 0, "the hovered widget must repaint");
+        assert!(
+            report.damaged_pixels < report.frame_pixels,
+            "a hover change must not repaint the whole window: {report:?}"
+        );
+    }
+
+    #[test]
+    fn resizing_updates_layout_on_the_next_frame() {
+        let sizes = Rc::new(RefCell::new(Vec::new()));
+        let hook_sizes = Rc::new(RefCell::new(Vec::new()));
+        let mut harness = WindowEventHarness::new({
+            let sizes = sizes.clone();
+            let hook_sizes = hook_sizes.clone();
+            move |size| {
+                sizes.borrow_mut().push(size);
+                hook_sizes.borrow_mut().push(use_viewport());
+                Box::new(BlankWidget)
+            }
+        });
+        for width in [120, 140, 160] {
+            harness.send(WindowEvent::Resized(creamui_platform::PhysicalSize {
+                width,
+                height: 90,
+            }));
+        }
+        let builds = sizes.borrow().len();
+        harness.send(WindowEvent::RedrawRequested);
+        assert_eq!(sizes.borrow().len(), builds + 1, "one rebuild per frame");
+        assert_eq!(sizes.borrow().last().unwrap().width, 160.0);
+        assert_eq!(hook_sizes.borrow().last().unwrap().width, 160.0);
+        let frame = harness.state.pipeline.frame.borrow();
+        assert_eq!(frame.presented.as_ref().unwrap().width, 160);
+    }
+
+    #[test]
+    fn safe_area_hook_tracks_system_insets() {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let harness = WindowEventHarness::new({
+            let seen = seen.clone();
+            move |_| {
+                seen.borrow_mut().push(use_safe_area());
+                Box::new(BlankWidget)
+            }
+        });
+        assert_eq!(seen.borrow().last().copied(), Some(SafeArea::ZERO));
+        harness.state.pipeline.safe_area.set(SafeArea {
+            top: 24.0,
+            right: 0.0,
+            bottom: 16.0,
+            left: 8.0,
+        });
+        assert_eq!(
+            seen.borrow().last().copied(),
+            Some(SafeArea {
+                top: 24.0,
+                right: 0.0,
+                bottom: 16.0,
+                left: 8.0,
+            })
+        );
+    }
+
+    #[test]
+    fn screen_class_uses_adaptive_width_boundaries() {
+        let size = |width| Size {
+            width,
+            height: 600.0,
+        };
+        assert_eq!(
+            ScreenClass::from_viewport(size(639.0)),
+            ScreenClass::Compact
+        );
+        assert_eq!(ScreenClass::from_viewport(size(640.0)), ScreenClass::Medium);
+        assert_eq!(ScreenClass::from_viewport(size(959.0)), ScreenClass::Medium);
+        assert_eq!(
+            ScreenClass::from_viewport(size(960.0)),
+            ScreenClass::Expanded
+        );
+    }
+
+    #[test]
+    fn frameless_windows_expose_resize_edges() {
+        let mut harness = WindowEventHarness::new(|_| Box::new(BlankWidget));
+        harness.state.frameless_resizable = true;
+        harness.state.pointer_pos = Point { x: 2.0, y: 2.0 };
+        assert_eq!(
+            harness.state.resize_direction(),
+            Some(ResizeDirection::NorthWest)
+        );
+        harness.state.pointer_pos = Point { x: 50.0, y: 50.0 };
+        assert_eq!(harness.state.resize_direction(), None);
+    }
+
+    #[cfg(all(feature = "context-menu", target_os = "linux"))]
+    #[test]
+    fn native_context_menu_loses_focus_and_can_be_opened_again() {
+        use creamui_widgets::ContextMenuItem;
+        let app = menu_app();
+        let parent = WindowEventHarness::new(|_| Box::new(BlankWidget));
+        let parent_handle = parent.menu_handle(app.clone(), true);
+        parent_handle.last_input_serial.set(Some(InputSerial(42)));
+        let host = crate::ContextMenuHost::new();
+        for event in [WindowEvent::Focused(false), WindowEvent::PopupDone] {
+            host.open(
+                PopupOptions::at_cursor(parent_handle.clone(), Point { x: 10.0, y: 10.0 }),
+                vec![ContextMenuItem::new("open", "Open", || {})],
+            );
+            let pending = app.commands.borrow_mut().windows.pop().unwrap();
+            assert!(pending.options.focus_first);
+            let mut popup = WindowEventHarness::new(|_| Box::new(BlankWidget));
+            let popup_handle = popup.menu_handle(app.clone(), true);
+            (pending.on_window_ready)(popup_handle.clone());
+            popup.send(WindowEvent::Focused(true));
+            assert!(host.is_open());
+            popup.send(event);
+            assert!(!host.is_open());
+            assert!(popup_handle.close_requested.get());
+        }
+    }
+
+    #[cfg(all(feature = "context-menu", target_os = "linux"))]
+    #[test]
+    fn context_menus_replace_other_hosts_and_cancel_their_queued_popups() {
+        use creamui_widgets::ContextMenuItem;
+        let app = menu_app();
+        let parent = WindowEventHarness::new(|_| Box::new(BlankWidget));
+        let handle = parent.menu_handle(app.clone(), true);
+        handle.last_input_serial.set(Some(InputSerial(42)));
+        let first = crate::ContextMenuHost::new();
+        let second = crate::ContextMenuHost::new();
+        let open = |host: &crate::ContextMenuHost| {
+            host.open(
+                PopupOptions::at_cursor(handle.clone(), Point::default()),
+                vec![ContextMenuItem::new("open", "Open", || {})],
+            )
+        };
+        open(&first);
+        let stale = app.commands.borrow_mut().windows.pop().unwrap();
+        open(&second);
+        assert!(!first.is_open());
+        assert!(second.is_open());
+        assert!(!(stale.popup.unwrap().is_current.unwrap())());
+        let pending = app.commands.borrow_mut().windows.pop().unwrap();
+        let popup = WindowEventHarness::new(|_| Box::new(BlankWidget));
+        let popup_handle = popup.menu_handle(app.clone(), true);
+        (pending.on_window_ready)(popup_handle.clone());
+        open(&first);
+        assert!(!second.is_open());
+        assert!(popup_handle.close_requested.get());
+        assert!(first.is_open());
+    }
+
+    #[test]
+    fn popup_done_requests_close() {
+        let mut harness = WindowEventHarness::new(|_| Box::new(BlankWidget));
+        harness.send(WindowEvent::PopupDone);
+        assert!(harness.state.close_requested.get());
+    }
+
+    #[test]
+    fn frame_scope_is_available_to_lazy_children() {
+        let _harness = WindowEventHarness::new(|_| Box::new(ThemeInChildren));
+    }
+
+    // `EventLoop::build()` refuses to run outside the main thread, which
+    // `cargo test` never is — the X11 `any_thread` escape hatch is the only
+    // way to get a real `EventLoopProxy` here, and the adapter allows only one
+    // `EventLoop` per process, so the (leaked) loop behind it is
+    // shared across every test that needs a proxy. This only proves the
+    // registration/dispatch logic below; the hop through a real running
+    // `ActiveEventLoop`'s `user_event` is pre-existing adapter machinery
+    // already exercised by the tray feature, not re-tested here.
+    #[cfg(target_os = "linux")]
+    fn test_proxy() -> EventLoopProxy<AppEvent> {
+        static PROXY: std::sync::OnceLock<EventLoopProxy<AppEvent>> = std::sync::OnceLock::new();
+        PROXY
+            .get_or_init(|| {
+                let mut builder = EventLoop::<AppEvent>::with_user_event();
+                builder.with_any_thread(true);
+                let event_loop = builder
+                    .build()
+                    .expect("failed to build a headless event loop");
+                let proxy = event_loop.create_proxy();
+                std::mem::forget(event_loop);
+                proxy
+            })
+            .clone()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spawn_background_runs_work_off_thread_and_resolve_background_job_delivers_it() {
+        let commands = Rc::new(RefCell::new(AppCommands {
+            system_theme: None,
+            windows: Vec::new(),
+            exit_requested: false,
+            proxy: test_proxy(),
+            next_job_id: 0,
+            background_jobs: HashMap::new(),
+        }));
+        let handle = AppHandle {
+            commands: commands.clone(),
+        };
+
+        let result: Rc<Cell<Option<u32>>> = Rc::new(Cell::new(None));
+        let result_for_done = result.clone();
+        let (worked_tx, worked_rx) = std::sync::mpsc::channel::<std::thread::ThreadId>();
+        handle.spawn_background(
+            move || {
+                let _ = worked_tx.send(std::thread::current().id());
+                42u32
+            },
+            move |value| result_for_done.set(Some(value)),
+        );
+
+        let worker_thread = worked_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("work did not run on a background thread in time");
+        assert_ne!(
+            worker_thread,
+            std::thread::current().id(),
+            "work must run off the calling thread"
+        );
+
+        assert_eq!(commands.borrow().background_jobs.len(), 1);
+        assert!(result.get().is_none(), "on_done must not have run yet");
+
+        resolve_background_job(&commands, 0, Box::new(42u32));
+
+        assert_eq!(result.get(), Some(42));
+        assert!(commands.borrow().background_jobs.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_background_job_is_a_no_op_for_an_unknown_or_already_resolved_id() {
+        let commands = Rc::new(RefCell::new(AppCommands {
+            system_theme: None,
+            windows: Vec::new(),
+            exit_requested: false,
+            proxy: test_proxy(),
+            next_job_id: 0,
+            background_jobs: HashMap::new(),
+        }));
+        resolve_background_job(&commands, 99, Box::new(0u32));
+    }
+
+    #[test]
+    fn compositor_disconnect_errors_are_clean_event_loop_exits() {
+        assert!(event_loop_connection_closed(
+            "Io error: Broken pipe (os error 32)"
+        ));
+        assert!(event_loop_connection_closed("Connection reset by peer"));
+        assert!(!event_loop_connection_closed(
+            "failed to initialize renderer"
+        ));
+    }
+}

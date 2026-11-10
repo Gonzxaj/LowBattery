@@ -1,0 +1,242 @@
+struct Globals {
+    viewport: vec2<f32>,
+    _pad: vec2<f32>,
+};
+
+@group(0) @binding(0) var<uniform> globals: Globals;
+@group(0) @binding(1) var clips: texture_2d<f32>;
+@group(1) @binding(0) var atlas: texture_2d<f32>;
+@group(1) @binding(1) var image_sampler: sampler;
+@group(2) @binding(0) var image: texture_2d<f32>;
+
+const KIND_QUAD: f32 = 0.0;
+const KIND_LINE: f32 = 1.0;
+const KIND_GLYPH: f32 = 2.0;
+const KIND_IMAGE: f32 = 3.0;
+const KIND_GRADIENT_QUAD: f32 = 4.0;
+const KIND_RADIAL_GRADIENT_QUAD: f32 = 5.0;
+const KIND_REPEATING_RADIAL_GRADIENT_QUAD: f32 = 6.0;
+
+const KIND_BITS: u32 = 4u;
+const CLIP_TEXELS_PER_ROW: u32 = 1024u;
+
+struct Instance {
+    @location(0) bounds: vec4<f32>,
+    @location(1) data: vec4<f32>,
+    @location(2) color: vec4<f32>,
+    @location(3) border_color: vec4<f32>,
+    @location(4) shape: vec3<f32>,
+    @location(5) tag: u32,
+};
+
+struct Varyings {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) @interpolate(flat) bounds: vec4<f32>,
+    @location(2) @interpolate(flat) color: vec4<f32>,
+    @location(3) @interpolate(flat) border_color: vec4<f32>,
+    @location(4) @interpolate(flat) data: vec4<f32>,
+    @location(5) @interpolate(flat) clip: vec4<f32>,
+    @location(6) @interpolate(flat) clip_index: u32,
+    @location(7) @interpolate(flat) params: vec4<f32>,
+    @location(8) @interpolate(flat) rounded_clip: vec4<f32>,
+};
+
+fn premultiply(color: vec4<f32>) -> vec4<f32> {
+    return vec4<f32>(color.rgb * color.a, color.a);
+}
+
+fn clip_coord(index: u32) -> vec2<i32> {
+    return vec2<i32>(i32(index % CLIP_TEXELS_PER_ROW), i32(index / CLIP_TEXELS_PER_ROW));
+}
+
+@vertex
+fn vs(@builtin(vertex_index) index: u32, instance: Instance) -> Varyings {
+    let kind = f32(instance.tag & ((1u << KIND_BITS) - 1u));
+    let clip_index = instance.tag >> KIND_BITS;
+    let clip_texel = clip_index * 2u;
+    let clip_extra = textureLoad(clips, clip_coord(clip_texel + 1u), 0);
+    var offset = clip_extra.xy;
+    if kind == KIND_GLYPH {
+        offset = round(offset);
+    }
+    let corner = vec2<f32>(f32(index & 1u), f32((index >> 1u) & 1u));
+    let b = instance.bounds + vec4<f32>(offset, offset);
+    var pixel = mix(b.xy, b.zw, corner);
+    if kind == KIND_GLYPH {
+        pixel.x += (1.0 - corner.y) * (b.w - b.y) * instance.shape.z;
+    }
+    var out: Varyings;
+    out.position = vec4<f32>(
+        pixel.x / globals.viewport.x * 2.0 - 1.0,
+        1.0 - pixel.y / globals.viewport.y * 2.0,
+        0.0,
+        1.0,
+    );
+    out.uv = corner;
+    if kind == KIND_IMAGE {
+        let turns = u32(instance.data.x);
+        if turns == 1u {
+            out.uv = vec2<f32>(corner.y, 1.0 - corner.x);
+        } else if turns == 2u {
+            out.uv = vec2<f32>(1.0) - corner;
+        } else if turns == 3u {
+            out.uv = vec2<f32>(1.0 - corner.y, corner.x);
+        }
+    }
+    out.bounds = b;
+    out.color = premultiply(instance.color);
+    out.border_color = premultiply(instance.border_color);
+    out.data = instance.data;
+    if kind == KIND_LINE || kind == KIND_GRADIENT_QUAD {
+        out.data += vec4<f32>(offset, offset);
+    } else if kind == KIND_RADIAL_GRADIENT_QUAD || kind == KIND_REPEATING_RADIAL_GRADIENT_QUAD {
+        out.data = vec4<f32>(out.data.xy + offset, out.data.zw);
+    }
+    out.clip = textureLoad(clips, clip_coord(clip_texel), 0);
+    out.params = vec4<f32>(kind, instance.shape.x, instance.shape.y, 0.0);
+    if (kind == KIND_RADIAL_GRADIENT_QUAD || kind == KIND_REPEATING_RADIAL_GRADIENT_QUAD) && instance.shape.z > 0.0 {
+        out.border_color = vec4<f32>(instance.shape.z, 0.0, 0.0, 0.0);
+    }
+    out.rounded_clip = vec4<f32>(0.0);
+    out.clip_index = 0u;
+    if clip_extra.w > 0.0 {
+        let first = u32(clip_extra.z);
+        out.rounded_clip = textureLoad(clips, clip_coord(first), 0);
+        out.params.w = textureLoad(clips, clip_coord(first + 1u), 0).x;
+        if clip_extra.w > 1.0 {
+            out.clip_index = clip_index + 1u;
+        }
+    }
+    return out;
+}
+
+fn rounded_rect_distance(p: vec2<f32>, b: vec4<f32>, radius: f32) -> f32 {
+    let center = (b.xy + b.zw) * 0.5;
+    let half_size = (b.zw - b.xy) * 0.5;
+    let r = min(radius, min(half_size.x, half_size.y));
+    let q = abs(p - center) - half_size + vec2<f32>(r);
+    return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - r;
+}
+
+fn segment_distance(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
+    let ab = b - a;
+    let t = clamp(dot(p - a, ab) / max(dot(ab, ab), 1e-6), 0.0, 1.0);
+    return length(p - a - ab * t);
+}
+
+fn radial_stop_color(progress: f32, stop_info: vec2<u32>, first_color: vec4<f32>, last_color: vec4<f32>, repeating: bool) -> vec4<f32> {
+    if stop_info.y < 2u {
+        let t = select(clamp(progress, 0.0, 1.0), fract(progress), repeating);
+        return mix(first_color, last_color, t);
+    }
+    let base = stop_info.x;
+    let first_offset = textureLoad(clips, clip_coord(base), 0).x;
+    let last_index = base + (stop_info.y - 1u) * 2u;
+    let last_offset = textureLoad(clips, clip_coord(last_index), 0).x;
+    let last = textureLoad(clips, clip_coord(last_index + 1u), 0);
+    var t = progress;
+    if repeating {
+        let period = last_offset - first_offset;
+        if period <= 1e-6 {
+            return last;
+        }
+        t = first_offset + fract((t - first_offset) / period) * period;
+    }
+    var previous_offset = first_offset;
+    var previous = textureLoad(clips, clip_coord(base + 1u), 0);
+    if t < first_offset {
+        return previous;
+    }
+    for (var i = 1u; i < stop_info.y; i += 1u) {
+        let index = base + i * 2u;
+        let next_offset = textureLoad(clips, clip_coord(index), 0).x;
+        let next = textureLoad(clips, clip_coord(index + 1u), 0);
+        if t < next_offset {
+            let fraction = clamp((t - previous_offset) / max(next_offset - previous_offset, 1e-6), 0.0, 1.0);
+            return mix(previous, next, fraction);
+        }
+        previous_offset = next_offset;
+        previous = next;
+    }
+    return last;
+}
+
+@fragment
+fn fs(in: Varyings) -> @location(0) vec4<f32> {
+    let p = in.position.xy;
+    let uv_dx = dpdx(in.uv);
+    let uv_dy = dpdy(in.uv);
+    if p.x < in.clip.x || p.y < in.clip.y || p.x > in.clip.z || p.y > in.clip.w {
+        discard;
+    }
+    var coverage = 1.0;
+    if in.params.w > 0.0 {
+        coverage = clamp(0.5 - rounded_rect_distance(p, in.rounded_clip, in.params.w), 0.0, 1.0);
+    }
+    if in.clip_index > 0u {
+        let extra = textureLoad(clips, clip_coord((in.clip_index - 1u) * 2u + 1u), 0);
+        for (var i = 1u; i < u32(extra.w); i += 1u) {
+            let index = u32(extra.z) + i * 2u;
+            let bounds = textureLoad(clips, clip_coord(index), 0);
+            let radius = textureLoad(clips, clip_coord(index + 1u), 0).x;
+            coverage *= clamp(0.5 - rounded_rect_distance(p, bounds, radius), 0.0, 1.0);
+        }
+    }
+
+    let kind = in.params.x;
+    var color: vec4<f32>;
+    if kind == KIND_QUAD || kind == KIND_GRADIENT_QUAD || kind == KIND_RADIAL_GRADIENT_QUAD || kind == KIND_REPEATING_RADIAL_GRADIENT_QUAD {
+        let outer = rounded_rect_distance(p, in.bounds, in.params.y);
+        coverage *= clamp(0.5 - outer, 0.0, 1.0);
+        if kind == KIND_RADIAL_GRADIENT_QUAD || kind == KIND_REPEATING_RADIAL_GRADIENT_QUAD {
+            let radii = max(in.data.zw, vec2<f32>(1e-6));
+            let distance = length((p - in.data.xy) / radii);
+            color = radial_stop_color(distance, vec2<u32>(u32(in.params.z), u32(in.border_color.x)), in.color, in.border_color, kind == KIND_REPEATING_RADIAL_GRADIENT_QUAD);
+        } else if kind == KIND_GRADIENT_QUAD {
+            let direction = in.data.zw - in.data.xy;
+            let progress = clamp(
+                dot(p - in.data.xy, direction) / max(dot(direction, direction), 1e-6),
+                0.0,
+                1.0,
+            );
+            color = mix(in.color, in.border_color, progress);
+        } else {
+            color = in.color;
+        }
+        let border = in.params.z;
+        if kind == KIND_QUAD && border > 0.0 {
+            let inset = vec4<f32>(border, border, -border, -border);
+            let inner = rounded_rect_distance(p, in.bounds + inset, max(in.params.y - border, 0.0));
+            let ring = in.border_color * clamp(0.5 + inner, 0.0, 1.0);
+            color = ring + color * (1.0 - ring.a);
+        }
+    } else if kind == KIND_LINE {
+        let distance = segment_distance(p, in.data.xy, in.data.zw) - in.params.z * 0.5;
+        coverage *= clamp(0.5 - distance, 0.0, 1.0);
+        color = in.color;
+    } else if kind == KIND_GLYPH {
+        let size = in.data.zw;
+        let texel = in.data.xy + min(floor(in.uv * size), size - vec2<f32>(1.0));
+        coverage *= textureLoad(atlas, vec2<i32>(texel), 0).r;
+        color = in.color;
+    } else {
+        let sampled = textureSampleGrad(image, image_sampler, in.uv, uv_dx, uv_dy);
+        if in.color.a > 0.0 {
+            color = in.color * sampled.a;
+        } else {
+            color = sampled;
+        }
+        if in.data.y > 0.0 {
+            let source = vec4<f32>(color.rgb, color.a);
+            let matrix = u32(in.params.z);
+            color = vec4<f32>(clamp(vec3<f32>(
+                dot(textureLoad(clips, clip_coord(matrix), 0), source),
+                dot(textureLoad(clips, clip_coord(matrix + 1u), 0), source),
+                dot(textureLoad(clips, clip_coord(matrix + 2u), 0), source)
+            ), vec3<f32>(0.0), vec3<f32>(color.a)), color.a);
+        }
+        color *= in.params.y;
+    }
+    return color * coverage;
+}

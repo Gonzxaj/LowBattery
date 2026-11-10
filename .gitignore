@@ -1,0 +1,15 @@
+# Build outputs (regenerate with ./build.sh)
+/target
+/dist
+
+# Docker build caches: cargo registry and the local MSIX dev signing key (private!)
+/.cache
+
+# Partner Center identity used for MSIX builds (template: installer/msix.env.example)
+/installer/msix.env
+
+# Logs and screen recordings from real PCs (Windows user name, device details)
+*.log
+*.mp4
+
+/docs
