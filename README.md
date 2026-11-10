@@ -71,3 +71,10 @@ La app escribe `%APPDATA%\LowBattery\lowbattery.log`, que se abre desde el tray 
 Con `--debug` también registra cada ciclo de lectura.
 
 La arquitectura, las APIs, la compatibilidad, las limitaciones y el plan de pruebas con hardware real están en [docs/RESEARCH.md](docs/RESEARCH.md).
+
+## Licencia
+
+Copyright (c) 2026 Gonzalo Carranza (Gonzxaj). Publicado bajo la [licencia MIT](LICENSE).
+
+Incluye una copia modificada de `creamui-render` (Apache-2.0) y otras dependencias de código abierto; ver [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+

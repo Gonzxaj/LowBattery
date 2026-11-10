@@ -1,3 +1,5 @@
+// Modified by Gonzalo Carranza (2026): Pipeline::invalidate_surface and its calls
+// (restore from minimized, WindowHandle::show) - see third_party/README.md.
 //! Window creation and the reactive render loop.
 //!
 //! [`run`] opens one window; [`AppBuilder`] opens several, all sharing one
