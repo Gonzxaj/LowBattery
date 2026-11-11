@@ -38,3 +38,17 @@ Upstream fixes, on github.com/sammwyy/creamui: restore repaint in branch
 `feat-app-id`.
 Remove each directory and its `[patch.crates-io]` entry in the root Cargo.toml
 once a creamui release includes the fix.
+
+**Window moved event (both crates):** creamui dropped winit's `WindowEvent::Moved`.
+`creamui-platform` now forwards it as `WindowEvent::Moved`, and `creamui-render` adds
+`WindowHandle::on_moved(|x, y| ...)` (logical pixels, like `position()`). LowBattery
+uses it to save the widget position once a drag stops, instead of sampling it on
+every battery poll. Never fires on Wayland, where windows can't know their position.
+
+**Native handles (`creamui-render`):** `WindowHandle::raw_window_handle()` and
+`raw_display_handle()` expose the `raw-window-handle` values creamui already uses to
+draw (Win32 HWND, Xlib window + display, Wayland surface). LowBattery uses them in
+`os::decorate_window` for the window icon and to keep the floating widget out of the
+taskbar / Alt+Tab: Win32 icon + `WS_EX_TOOLWINDOW` on Windows, `_NET_WM_ICON` +
+`_NET_WM_STATE_SKIP_TASKBAR/SKIP_PAGER` on X11. Wayland has no equivalent.
+

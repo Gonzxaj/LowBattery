@@ -14,17 +14,20 @@ Apache License 2.0 (full text in `third_party/creamui-render/LICENSE`).
 a window is restored from minimized and from `WindowHandle::show`, so Windows
 repaints the full window instead of leaving it blank or black, and
 `WindowHandle::resize` adopts sizes Wayland applies immediately (no `Resized`
-event), so a resized window isn't drawn stretched. The modified file
-carries a notice at its top.
+event), so a resized window isn't drawn stretched. It also adds
+`WindowOptions::app_id` (inherited by popups), `WindowHandle::on_moved` (window moved
+callback) and `WindowHandle::raw_window_handle` / `raw_display_handle` (the native
+handles it already holds). The modified file carries a notice at its top.
 
 ## CreamUI platform (Apache-2.0), modified copy
 
 `third_party/creamui-platform/` is a copy of **creamui-platform 0.3.0** (same commit) from the same
 project and license (full text in `third_party/creamui-platform/LICENSE`).
 
-**Changes:** `src/winit.rs` adds `set_app_id`, which sets the Wayland `app_id` and
-X11 `WM_CLASS` of new windows so Linux docks match them to the app's `.desktop`
-file. The modified file carries a notice at its top.
+**Changes:** `src/winit.rs` applies `WindowAttributes::app_id` as the Wayland `app_id`
+and X11 `WM_CLASS` of new windows so Linux docks match them to the app's `.desktop`
+file. `src/types.rs` and `src/winit.rs` also forward winit's window-moved event
+(`WindowEvent::Moved`), which `creamui-render` exposes as `WindowHandle::on_moved`. The modified files carry a notice at their top.
 
 ## Device protocol references
 

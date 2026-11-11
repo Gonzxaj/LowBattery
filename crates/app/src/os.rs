@@ -156,16 +156,18 @@ mod win {
         }
     }
 
-    /// Puts the exe's icon (resource 1) on every top-level window of the UI
-    /// thread and keeps the widget out of the taskbar. creamui 0.3 has no
-    /// window-icon / tool-window option and doesn't expose the HWND.
-    pub fn set_window_icons() {
-        use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM};
+    /// Gives a window the exe's icon (resource 1) and, for the floating widget
+    /// (`tool`), the tool-window style: no taskbar button, no Alt+Tab entry.
+    /// Works on the window's own HWND, which creamui exposes.
+    pub fn decorate_window(w: &creamui::WindowHandle, tool: bool) {
+        use raw_window_handle::RawWindowHandle;
+        use windows_sys::Win32::Foundation::HWND;
         use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-        use windows_sys::Win32::System::Threading::GetCurrentThreadId;
         use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-        unsafe extern "system" fn apply(hwnd: HWND, _: LPARAM) -> BOOL {
+        let Some(RawWindowHandle::Win32(handle)) = w.raw_window_handle() else { return };
+        let hwnd = handle.hwnd.get() as HWND;
+        unsafe {
             let module = GetModuleHandleW(std::ptr::null());
             for (which, metric_x, metric_y) in [(ICON_BIG, SM_CXICON, SM_CYICON), (ICON_SMALL, SM_CXSMICON, SM_CYSMICON)] {
                 // MAKEINTRESOURCE(1)
@@ -174,27 +176,23 @@ mod win {
                     SendMessageW(hwnd, WM_SETICON, which as usize, icon as isize);
                 }
             }
-            // The floating widget is a tool window: no taskbar button, no Alt+Tab entry.
-            let mut title = [0u16; 64];
-            let n = GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
-            if String::from_utf16_lossy(&title[..n.max(0) as usize]) == crate::ui::WIDGET_TITLE {
-                let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-                let tool = (ex | WS_EX_TOOLWINDOW as isize) & !(WS_EX_APPWINDOW as isize);
-                if tool != ex {
-                    // The taskbar only drops the button if the style changes while hidden.
-                    let visible = IsWindowVisible(hwnd) != 0;
-                    if visible {
-                        ShowWindow(hwnd, SW_HIDE);
-                    }
-                    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, tool);
-                    if visible {
-                        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-                    }
+            if !tool {
+                return;
+            }
+            let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            let tool_style = (ex | WS_EX_TOOLWINDOW as isize) & !(WS_EX_APPWINDOW as isize);
+            if tool_style != ex {
+                // The taskbar only drops the button if the style changes while hidden.
+                let visible = IsWindowVisible(hwnd) != 0;
+                if visible {
+                    ShowWindow(hwnd, SW_HIDE);
+                }
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, tool_style);
+                if visible {
+                    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                 }
             }
-            1
         }
-        unsafe { EnumThreadWindows(GetCurrentThreadId(), Some(apply), 0) };
     }
 
     /// Opens a file with its default handler (Notepad for .log).
@@ -376,7 +374,7 @@ mod stub {
     pub fn open_file(path: &std::path::Path) {
         log::info!("log file: {}", path.display());
     }
-    pub fn set_window_icons() {}
+    pub fn decorate_window(_: &creamui::WindowHandle, _: bool) {}
     pub fn launched_at_startup() -> bool {
         false
     }

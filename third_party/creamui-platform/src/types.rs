@@ -1,5 +1,6 @@
 // Modified by Gonzalo Carranza (2026): WindowAttributes::app_id, the Wayland
-// app_id / X11 WM_CLASS of a window - see third_party/README.md.
+// app_id / X11 WM_CLASS of a window, and WindowEvent::Moved - see
+// third_party/README.md.
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
@@ -524,6 +525,9 @@ pub enum WindowEvent {
     DecorationsChanged(WindowDecorations),
     CloseRequested,
     Resized(PhysicalSize),
+    /// The window's outer top-left moved (user drag or `set_outer_position`).
+    /// Never sent on Wayland, where clients can't know their position.
+    Moved(PhysicalPosition),
     ScaleFactorChanged {
         scale_factor: f64,
     },

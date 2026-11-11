@@ -42,6 +42,8 @@ pub struct App {
     main_win: Rc<RefCell<Option<WindowHandle>>>,
     widget_win: Rc<RefCell<Option<WindowHandle>>>,
     tray: Rc<RefCell<Option<os::Tray>>>,
+    /// Latest widget position of a drag still in progress (see `widget_moved`).
+    moved_to: Rc<std::cell::Cell<Option<(i32, i32)>>>,
 }
 
 fn open(w: &Rc<RefCell<Option<WindowHandle>>>) -> Option<WindowHandle> {
@@ -130,7 +132,7 @@ impl App {
             },
             ui::Palette::get(cfg.dark).bg,
             move |w| {
-                os::set_window_icons();
+                os::decorate_window(&w, false);
                 // No tray to come back from: closing the window quits.
                 let quit = quit.clone();
                 w.on_close_requested(move || {
@@ -156,6 +158,7 @@ impl App {
         let cfg = self.config.get();
         let ready = self.widget_win.clone();
         let app = self.clone();
+        let mover = self.clone();
         let on_top = cfg.widget.always_on_top;
         handle.append_window(
             WindowOptions {
@@ -173,7 +176,8 @@ impl App {
             Color::rgba(0, 0, 0, 0),
             move |w| {
                 w.set_always_on_top(on_top);
-                os::set_window_icons();
+                w.on_moved(move |x, y| mover.widget_moved(x, y));
+                os::decorate_window(&w, true);
                 if cfg.widget.position.is_none() {
                     if let Some((mw, _)) = w.monitor_size() {
                         w.set_position(mw - ui::WIDGET_W as i32 - 24, 24);
@@ -223,12 +227,35 @@ impl App {
         if ui::widget_rows(self).len() != rows_before {
             self.fit_widget();
         }
-        // Persist a moved widget. shortcut: sampled each poll, not on drag end (no move event exposed).
-        if let Some(pos) = open(&self.widget_win).and_then(|w| w.position()) {
-            if cfg.widget.position != Some(pos) {
-                self.set_config(|c| c.widget.position = Some(pos));
-            }
+    }
+
+    /// Moves arrive many times a second during a drag: remember the latest
+    /// and save once they stop (see `settle_widget_position`).
+    fn widget_moved(&self, x: i32, y: i32) {
+        if self.moved_to.replace(Some((x, y))).is_none() {
+            self.settle_widget_position();
         }
+    }
+
+    /// One timer per drag: re-arms while the widget keeps moving, then saves.
+    fn settle_widget_position(&self) {
+        let Some(handle) = self.handle.borrow().clone() else { return };
+        let seen = self.moved_to.get();
+        let app = self.clone();
+        handle.spawn_background(
+            || std::thread::sleep(Duration::from_millis(400)),
+            move |()| {
+                if app.moved_to.get() != seen {
+                    return app.settle_widget_position(); // still being dragged
+                }
+                if let Some(pos) = app.moved_to.take() {
+                    if app.config.get().widget.position != Some(pos) {
+                        log::debug!("widget moved to {pos:?}");
+                        app.set_config(|c| c.widget.position = Some(pos));
+                    }
+                }
+            },
+        );
     }
 }
 
@@ -274,6 +301,7 @@ fn main() {
         main_win: Rc::default(),
         widget_win: Rc::default(),
         tray: Rc::default(),
+        moved_to: Rc::default(),
     };
 
 

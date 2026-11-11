@@ -596,7 +596,7 @@ fn settings(app: &App, p: &Palette, cfg: &Config, _width: f32) -> BoxedWidget {
 // ---------------------------------------------------------------- widget
 
 pub const WIDGET_W: u32 = 250;
-/// Window title; os.rs finds the widget's HWND by it.
+/// Title of the floating widget window.
 pub const WIDGET_TITLE: &str = "lowbattery widget";
 const WIDGET_ROW: f32 = 30.0;
 const WIDGET_PAD: f32 = 12.0;

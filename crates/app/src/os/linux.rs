@@ -99,8 +99,67 @@ pub fn launched_at_startup() -> bool {
     false
 }
 
-/// Window icons come from the .desktop file, matched by APP_ID (see main.rs).
-pub fn set_window_icons() {}
+/// X11 only (the app runs there when the widget is kept on top): gives the
+/// window our icon (`_NET_WM_ICON`, used by some taskbars and Alt+Tab) and,
+/// for the floating widget (`tool`), keeps it out of the dock/taskbar and
+/// Alt+Tab (`_NET_WM_STATE_SKIP_TASKBAR` / `_SKIP_PAGER`). Wayland has no
+/// equivalent: docks take the icon from the .desktop file via the app_id.
+pub fn decorate_window(w: &creamui::WindowHandle, tool: bool) {
+    use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
+    use x11_dl::xlib;
+    let (Some(RawWindowHandle::Xlib(window)), Some(RawDisplayHandle::Xlib(display))) = (w.raw_window_handle(), w.raw_display_handle())
+    else {
+        return;
+    };
+    let (Some(display), Ok(x)) = (display.display, xlib::Xlib::open()) else { return };
+    // winit's own Xlib connection, used from its (the UI) thread.
+    let dpy = display.as_ptr().cast::<xlib::Display>();
+    let window = window.window;
+    unsafe {
+        let atom = |name: &std::ffi::CStr| (x.XInternAtom)(dpy, name.as_ptr(), xlib::False);
+        if let Some(icon) = icon_cardinals() {
+            (x.XChangeProperty)(dpy, window, atom(c"_NET_WM_ICON"), xlib::XA_CARDINAL, 32, xlib::PropModeReplace, icon.as_ptr().cast(), icon.len() as i32);
+        }
+        if tool {
+            // A mapped window asks the window manager (EWMH); writing the property itself is only for unmapped ones.
+            let mut data = xlib::ClientMessageData::new();
+            data.set_long(0, 1); // _NET_WM_STATE_ADD
+            data.set_long(1, atom(c"_NET_WM_STATE_SKIP_TASKBAR") as _);
+            data.set_long(2, atom(c"_NET_WM_STATE_SKIP_PAGER") as _);
+            data.set_long(3, 1); // source: normal application
+            let mut event = xlib::XEvent {
+                client_message: xlib::XClientMessageEvent {
+                    type_: xlib::ClientMessage,
+                    serial: 0,
+                    send_event: xlib::True,
+                    display: dpy,
+                    window,
+                    message_type: atom(c"_NET_WM_STATE"),
+                    format: 32,
+                    data,
+                },
+            };
+            let mask = xlib::SubstructureRedirectMask | xlib::SubstructureNotifyMask;
+            (x.XSendEvent)(dpy, (x.XDefaultRootWindow)(dpy), xlib::False, mask, &mut event);
+        }
+        (x.XFlush)(dpy);
+    }
+}
+
+/// `_NET_WM_ICON` data: width, height, then one ARGB pixel per CARDINAL
+/// (a C `long`, as Xlib wants for format 32).
+fn icon_cardinals() -> Option<Vec<std::os::raw::c_ulong>> {
+    let logo = creamui::ImageData::from_bytes(include_bytes!("../../../../assets/logo-96.png")).ok()?;
+    let mut out = vec![logo.width() as std::os::raw::c_ulong, logo.height() as std::os::raw::c_ulong];
+    out.extend(logo.pixels().as_chunks::<4>().0.iter().map(|&px| straight_argb(px) as std::os::raw::c_ulong));
+    Some(out)
+}
+
+/// Premultiplied RGBA (creamui's decode) -> straight ARGB (what EWMH expects).
+fn straight_argb([r, g, b, a]: [u8; 4]) -> u32 {
+    let straight = |c: u8| if a == 0 { 0 } else { ((c as u32 * 255 + a as u32 / 2) / a as u32).min(255) };
+    (a as u32) << 24 | straight(r) << 16 | straight(g) << 8 | straight(b)
+}
 
 /// shortcut: a second launch just exits; it does not ask the first one to show its window.
 pub fn single_instance() -> bool {
@@ -267,6 +326,15 @@ impl Tray {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn icon_pixels_are_unpremultiplied_argb() {
+        assert_eq!(super::straight_argb([128, 64, 0, 128]), 0x80FF_8000);
+        assert_eq!(super::straight_argb([0, 0, 0, 0]), 0);
+        assert_eq!(super::straight_argb([255, 255, 255, 255]), 0xFFFF_FFFF);
+        let icon = super::icon_cardinals().expect("logo decodes");
+        assert_eq!(icon.len(), 2 + (icon[0] * icon[1]) as usize);
+    }
+
     #[test]
     fn argb_moves_alpha_first() {
         assert_eq!(super::argb(vec![1, 2, 3, 4]), [4, 1, 2, 3]);

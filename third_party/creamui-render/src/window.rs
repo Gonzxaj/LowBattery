@@ -1,7 +1,8 @@
 // Modified by Gonzalo Carranza (2026): Pipeline::invalidate_surface and its calls
 // (restore from minimized, WindowHandle::show), and WindowHandle::resize adopting
-// sizes the platform applies at once (Wayland), and WindowOptions::app_id
-// (inherited by popups) - see third_party/README.md.
+// sizes the platform applies at once (Wayland), WindowOptions::app_id
+// (inherited by popups), WindowHandle::on_moved, and WindowHandle::raw_window_handle /
+// raw_display_handle - see third_party/README.md.
 //! Window creation and the reactive render loop.
 //!
 //! [`run`] opens one window; [`AppBuilder`] opens several, all sharing one
@@ -1747,6 +1748,7 @@ pub struct WindowHandle {
     on_chrome_changed: Rc<dyn Fn()>,
     close_requested: Rc<Cell<bool>>,
     focus_lost_handler: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
+    moved_handler: Rc<RefCell<Option<Rc<dyn Fn(i32, i32)>>>>,
     close_handler: Rc<RefCell<Option<Rc<dyn Fn() -> bool>>>>,
     keyboard_handler: KeyboardHandler,
     pointer_presence_handler: PointerPresenceHandler,
@@ -1927,6 +1929,26 @@ impl WindowHandle {
         ))
     }
 
+    /// The native window handle (Win32 HWND, X11 window, Wayland surface...)
+    /// for platform features creamui doesn't wrap. Advanced: changes made
+    /// through it bypass creamui and can break its assumptions. None until the
+    /// native window exists, or after it closed.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn raw_window_handle(&self) -> Option<raw_window_handle::RawWindowHandle> {
+        use raw_window_handle::HasWindowHandle;
+        let window = self.window.borrow();
+        window.as_ref()?.window_handle().ok().map(|handle| handle.as_raw())
+    }
+
+    /// The native display connection that goes with [`Self::raw_window_handle`]
+    /// (e.g. the Xlib `Display`), under the same caveats.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn raw_display_handle(&self) -> Option<raw_window_handle::RawDisplayHandle> {
+        use raw_window_handle::HasDisplayHandle;
+        let window = self.window.borrow();
+        window.as_ref()?.display_handle().ok().map(|handle| handle.as_raw())
+    }
+
     /// Returns the current monitor's logical size in pixels.
     pub fn monitor_size(&self) -> Option<(i32, i32)> {
         let window = self.window.borrow();
@@ -2021,6 +2043,14 @@ impl WindowHandle {
     /// Registering a new callback replaces the previous one.
     pub fn on_focus_lost(&self, handler: impl Fn() + 'static) {
         *self.focus_lost_handler.borrow_mut() = Some(Rc::new(handler));
+    }
+
+    /// Called when the window moves (dragged by the user or [`Self::set_position`]),
+    /// with its top-left in logical screen pixels like [`Self::position`]. Fires
+    /// repeatedly during a drag. Never fires on Wayland, where windows can't
+    /// know their position.
+    pub fn on_moved(&self, handler: impl Fn(i32, i32) + 'static) {
+        *self.moved_handler.borrow_mut() = Some(Rc::new(handler));
     }
 
     /// Moves keyboard focus to the first visible text input in this window.
@@ -2194,6 +2224,7 @@ struct WindowSpec {
     _runtime_subscription: Option<Rc<dyn Fn()>>,
     close_requested: Rc<Cell<bool>>,
     focus_lost_handler: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
+    moved_handler: Rc<RefCell<Option<Rc<dyn Fn(i32, i32)>>>>,
     close_handler: Rc<RefCell<Option<Rc<dyn Fn() -> bool>>>>,
     keyboard_handler: KeyboardHandler,
     pointer_presence_handler: PointerPresenceHandler,
@@ -2409,6 +2440,7 @@ struct WindowState {
     pipeline: Rc<Pipeline>,
     close_requested: Rc<Cell<bool>>,
     focus_lost_handler: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
+    moved_handler: Rc<RefCell<Option<Rc<dyn Fn(i32, i32)>>>>,
     close_handler: Rc<RefCell<Option<Rc<dyn Fn() -> bool>>>>,
     keyboard_handler: KeyboardHandler,
     pointer_presence_handler: PointerPresenceHandler,
@@ -3617,6 +3649,12 @@ impl WindowState {
                 }
                 self.pipeline.invalidate_paint();
             }
+            WindowEvent::Moved(position) => {
+                if let Some(handler) = self.moved_handler.borrow().as_ref().cloned() {
+                    let scale = self.pipeline.scale_factor.peek();
+                    handler((position.x / scale) as i32, (position.y / scale) as i32);
+                }
+            }
             WindowEvent::Focused(false) => {
                 log::trace!(
                     "creamui-render: focus lost for {:?}",
@@ -4198,6 +4236,7 @@ impl AppHandler {
             on_chrome_changed,
             close_requested: spec.close_requested.clone(),
             focus_lost_handler: spec.focus_lost_handler.clone(),
+            moved_handler: spec.moved_handler.clone(),
             close_handler: spec.close_handler.clone(),
             keyboard_handler: spec.keyboard_handler.clone(),
             pointer_presence_handler: spec.pointer_presence_handler.clone(),
@@ -4227,6 +4266,7 @@ impl AppHandler {
             pipeline,
             close_requested: spec.close_requested,
             focus_lost_handler: spec.focus_lost_handler,
+            moved_handler: spec.moved_handler,
             close_handler: spec.close_handler,
             keyboard_handler: spec.keyboard_handler,
             pointer_presence_handler: spec.pointer_presence_handler,
@@ -4930,6 +4970,7 @@ fn build_window_spec(
         _runtime_subscription: runtime_subscription,
         close_requested,
         focus_lost_handler: Rc::new(RefCell::new(None)),
+        moved_handler: Rc::new(RefCell::new(None)),
         close_handler: Rc::new(RefCell::new(None)),
         keyboard_handler: Rc::new(RefCell::new(None)),
         pointer_presence_handler: Rc::new(RefCell::new(None)),
@@ -5094,6 +5135,7 @@ mod tests {
                 pipeline: spec.pipeline,
                 close_requested: spec.close_requested,
                 focus_lost_handler: spec.focus_lost_handler,
+                moved_handler: spec.moved_handler,
                 close_handler: spec.close_handler,
                 keyboard_handler: spec.keyboard_handler,
                 pointer_presence_handler: spec.pointer_presence_handler,
@@ -5157,6 +5199,7 @@ mod tests {
                 on_chrome_changed: Rc::new(|| {}),
                 close_requested: self.state.close_requested.clone(),
                 focus_lost_handler: self.state.focus_lost_handler.clone(),
+                moved_handler: self.state.moved_handler.clone(),
                 close_handler: self.state.close_handler.clone(),
                 keyboard_handler: self.state.keyboard_handler.clone(),
                 pointer_presence_handler: self.state.pointer_presence_handler.clone(),

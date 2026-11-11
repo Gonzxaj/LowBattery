@@ -1241,10 +1241,12 @@ dependencies = [
  "embed-resource",
  "ksni",
  "log",
+ "raw-window-handle",
  "tauri-winrt-notification",
  "tray-icon",
  "windows",
  "windows-sys 0.59.0",
+ "x11-dl",
  "zbus",
 ]
 
