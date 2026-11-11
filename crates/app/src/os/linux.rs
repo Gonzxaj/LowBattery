@@ -161,6 +161,8 @@ fn argb(mut px: Vec<u8>) -> Vec<u8> {
 struct Model {
     lang: Lang,
     tooltip: String,
+    /// Shown at the top of the menu: GNOME's AppIndicator draws no tooltip.
+    devices: Vec<String>,
     icon: Vec<u8>,
     tx: mpsc::Sender<TrayAction>,
 }
@@ -197,14 +199,23 @@ impl ksni::Tray for Model {
             .into()
         };
         let [open, refresh, widget, log, quit] = tray_labels(self.lang);
-        vec![
+        let info = |label: String| -> ksni::MenuItem<Self> { ksni::menu::StandardItem { label, enabled: false, ..Default::default() }.into() };
+        let mut menu: Vec<ksni::MenuItem<Self>> = if self.devices.is_empty() {
+            vec![info(self.lang.t("No devices", "Sin dispositivos").into())]
+        } else {
+            // A literal "_" would be read as a mnemonic marker.
+            self.devices.iter().map(|d| info(d.replace('_', "__"))).collect()
+        };
+        menu.push(ksni::MenuItem::Separator);
+        menu.extend([
             item(open, TrayAction::Open),
             item(refresh, TrayAction::Refresh),
             item(widget, TrayAction::ToggleWidget),
             item(log, TrayAction::OpenLog),
             ksni::MenuItem::Separator,
             item(quit, TrayAction::Quit),
-        ]
+        ]);
+        menu
     }
 }
 
@@ -219,7 +230,7 @@ impl Tray {
     /// AppIndicator extension); main.rs then keeps the window visible.
     pub fn new(lang: Lang) -> Result<Self, String> {
         let (tx, rx) = mpsc::channel();
-        let model = Model { lang, tooltip: "lowbattery".into(), icon: argb(battery_icon(None, 0)), tx };
+        let model = Model { lang, tooltip: "lowbattery".into(), devices: Vec::new(), icon: argb(battery_icon(None, 0)), tx };
         // Sandboxes can't own the well-known org.kde.StatusNotifierItem-<pid> name.
         let handle = model.disable_dbus_name(sandboxed()).spawn().map_err(|e| e.to_string())?;
         Ok(Self { handle, rx: Mutex::new(Some(rx)), last: Default::default() })
@@ -238,6 +249,7 @@ impl Tray {
 
     pub fn update(&self, states: &[DeviceState], threshold: u8) {
         let tip = tooltip(states);
+        let devices = device_lines(states);
         let level = worst(states);
         let icon = (self.last.get() != Some(level)).then(|| {
             self.last.set(Some(level));
@@ -245,6 +257,7 @@ impl Tray {
         });
         self.handle.update(move |m| {
             m.tooltip = tip;
+            m.devices = devices;
             if let Some(icon) = icon {
                 m.icon = icon;
             }

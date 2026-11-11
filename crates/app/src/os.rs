@@ -3,7 +3,7 @@
 
 use battery_core::config::Lang;
 use battery_core::monitor::DeviceState;
-use battery_core::Link;
+use battery_core::{Charge, Link};
 
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))] // only real trays emit these
@@ -34,16 +34,30 @@ fn worst(states: &[DeviceState]) -> Option<u8> {
     states.iter().filter(|s| s.status.link == Link::Connected).filter_map(|s| s.status.level).min()
 }
 
+/// "Name 78%" per connected device that has a battery, "⚡" while charging.
+/// Feeds the tray tooltip (Windows, KDE...) and the Linux tray menu (GNOME
+/// draws no tooltips).
+fn device_lines(states: &[DeviceState]) -> Vec<String> {
+    states
+        .iter()
+        .filter(|s| s.status.link == Link::Connected && s.device.provider != battery_core::diag::GENERIC)
+        .map(|s| {
+            let bolt = if matches!(s.status.charge, Charge::Charging | Charge::Full) { " ⚡" } else { "" };
+            match s.status.level {
+                Some(l) => format!("{} {l}%{bolt}", s.device.name),
+                None => format!("{} —", s.device.name),
+            }
+        })
+        .collect()
+}
+
 fn tooltip(states: &[DeviceState]) -> String {
     let mut t = String::from("lowbattery");
-    for s in states.iter().filter(|s| s.status.link == Link::Connected) {
-        let line = match s.status.level {
-            Some(l) => format!("\n{} {l}%", s.device.name),
-            None => format!("\n{} —", s.device.name),
-        };
-        if t.len() + line.len() > 127 {
-            break; // Windows truncates tray tooltips at 128 UTF-16 units
+    for line in device_lines(states) {
+        if t.len() + 1 + line.len() > 127 {
+            break; // Windows truncates tray tooltips at 128 UTF-16 units (bytes >= units)
         }
+        t.push('\n');
         t.push_str(&line);
     }
     t
@@ -382,6 +396,24 @@ mod stub {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use battery_core::{BatteryStatus, Device, DeviceKind};
+
+    fn state(name: &str, provider: &'static str, status: BatteryStatus) -> DeviceState {
+        let device = Device { id: name.into(), name: name.into(), vendor: String::new(), model: None, kind: DeviceKind::Mouse, provider, locator: String::new() };
+        DeviceState { device, status, last_level: status.level, last_charge: status.charge, last_read: None }
+    }
+
+    #[test]
+    fn device_lines_show_charge_and_skip_batteryless() {
+        let states = [
+            state("Keyboard", "ff1c-keyboard", BatteryStatus::connected(99, Charge::Charging)),
+            state("Headset", "steelseries", BatteryStatus::connected(51, Charge::Discharging)),
+            state("Mouse", "razer", BatteryStatus::ASLEEP),
+            state("2.4G Receiver", battery_core::diag::GENERIC, BatteryStatus::PRESENT),
+        ];
+        assert_eq!(device_lines(&states), ["Keyboard 99% ⚡", "Headset 51%"]);
+        assert_eq!(tooltip(&states), "lowbattery\nKeyboard 99% ⚡\nHeadset 51%");
+    }
 
     #[test]
     fn icon_fill_tracks_level() {
