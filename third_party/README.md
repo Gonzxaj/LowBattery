@@ -16,7 +16,14 @@ Only what the build reads is kept: no `examples/`, `tests/`, `Cargo.lock` or
 on Windows, a window restored from minimized came back black, and one shown again
 after `hide()` (closed to the tray, reopened) came back blank, because the renderer
 only presents what changed since the last frame and Windows had discarded the
-pixels. See `Pipeline::invalidate_surface` in `src/window.rs`.
+pixels. See `Pipeline::invalidate_surface` in `src/window.rs`. On Linux X11 the
+same happened at startup and on restore: the server drops the pixels on map and
+asks for a repaint (Expose), which arrives as a plain `RedrawRequested` that can't
+be told apart from one the renderer queued, so only what changed was presented
+(at login, with device data loading, the widget's transparent corners stayed opaque
+black). `creamui-platform` now forwards winit's `Occluded` (X11 VisibilityNotify,
+sent on map) as `WindowEvent::Occluded`, and `Occluded(false)` calls
+`invalidate_surface`.
 
 **Programmatic resize (Wayland):** winit applies `request_inner_size` immediately
 on Wayland and emits no `Resized`, so after `WindowHandle::resize` the renderer

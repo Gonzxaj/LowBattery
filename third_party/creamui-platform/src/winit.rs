@@ -1,6 +1,7 @@
 // Modified by Gonzalo Carranza (2026): WindowAttributes::app_id, the Wayland
 // app_id / X11 WM_CLASS of a window, and winit's Moved event forwarded as
-// WindowEvent::Moved - see third_party/README.md.
+// WindowEvent::Moved, and winit's Occluded event forwarded as WindowEvent::Occluded -
+// see third_party/README.md.
 use raw_window_handle::{HandleError, HasDisplayHandle, HasWindowHandle, RawWindowHandle};
 use std::collections::HashMap;
 use std::fmt;
@@ -763,6 +764,7 @@ fn from_winit_window_event(event: winit::event::WindowEvent) -> WindowEvent {
             y: position.y as f64,
         }),
         winit::event::WindowEvent::Focused(focused) => WindowEvent::Focused(focused),
+        winit::event::WindowEvent::Occluded(occluded) => WindowEvent::Occluded(occluded),
         winit::event::WindowEvent::MouseWheel { delta, .. } => WindowEvent::MouseWheel {
             delta: match delta {
                 WinitScrollDelta::LineDelta(x, y) => MouseScrollDelta::LineDelta(x, y),

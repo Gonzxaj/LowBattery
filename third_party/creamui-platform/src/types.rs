@@ -1,5 +1,5 @@
 // Modified by Gonzalo Carranza (2026): WindowAttributes::app_id, the Wayland
-// app_id / X11 WM_CLASS of a window, and WindowEvent::Moved - see
+// app_id / X11 WM_CLASS of a window, WindowEvent::Moved and WindowEvent::Occluded - see
 // third_party/README.md.
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(target_arch = "wasm32"))]
@@ -528,6 +528,9 @@ pub enum WindowEvent {
     /// The window's outer top-left moved (user drag or `set_outer_position`).
     /// Never sent on Wayland, where clients can't know their position.
     Moved(PhysicalPosition),
+    /// X11 VisibilityNotify: `false` when the window became visible (mapped),
+    /// whose pixels the server dropped. Not sent on other platforms.
+    Occluded(bool),
     ScaleFactorChanged {
         scale_factor: f64,
     },
