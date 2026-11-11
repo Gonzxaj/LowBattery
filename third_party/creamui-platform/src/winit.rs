@@ -1,5 +1,5 @@
-// Modified by Gonzalo Carranza (2026): set_app_id, applied as the Wayland
-// app_id / X11 WM_CLASS of every window - see third_party/README.md.
+// Modified by Gonzalo Carranza (2026): WindowAttributes::app_id, the Wayland
+// app_id / X11 WM_CLASS of a window - see third_party/README.md.
 use raw_window_handle::{HandleError, HasDisplayHandle, HasWindowHandle, RawWindowHandle};
 use std::collections::HashMap;
 use std::fmt;
@@ -324,16 +324,6 @@ impl HasDisplayHandle for Window {
     }
 }
 
-static APP_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-
-/// Names the app to the Linux desktop: Wayland `app_id` and X11 `WM_CLASS`
-/// of every window created afterwards. It must equal the `.desktop` file's
-/// name (without `.desktop`) for docks to show that file's name and icon.
-/// Call once, before the first window; later calls are ignored.
-pub fn set_app_id(id: &str) {
-    let _ = APP_ID.set(id.to_owned());
-}
-
 pub struct ActiveEventLoop<'a> {
     inner: &'a WinitActiveEventLoop,
     ids: &'a WindowIds,
@@ -379,11 +369,11 @@ impl ActiveEventLoop<'_> {
         if let Some(position) = attributes.position {
             inner = inner.with_position(winit::dpi::LogicalPosition::new(position.x, position.y));
         }
-        #[cfg(all(feature = "desktop", target_os = "linux"))]
-        if let Some(id) = APP_ID.get() {
-            use winit::platform::wayland::WindowAttributesExtWayland;
-            // Same field winit reads for X11's WM_CLASS (class = id).
-            inner = WindowAttributesExtWayland::with_name(inner, id.as_str(), id.as_str());
+        // winit uses this name as the Wayland `app_id` and the X11 `WM_CLASS`.
+        #[cfg(all(target_os = "linux", any(feature = "desktop", feature = "x11")))]
+        if let Some(app_id) = attributes.app_id {
+            use winit::platform::x11::WindowAttributesExtX11;
+            inner = inner.with_name(app_id.clone(), app_id);
         }
         #[cfg(target_arch = "wasm32")]
         {

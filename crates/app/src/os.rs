@@ -15,6 +15,20 @@ pub enum TrayAction {
     Quit,
 }
 
+/// Window app ID: Linux docks match it to our .desktop file (name, icon).
+pub fn app_id() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    return Some(APP_ID.to_owned());
+    #[cfg(not(target_os = "linux"))]
+    None
+}
+
+/// True on a Linux Wayland session with XWayland available while the app still
+/// runs on Wayland: keeping the widget on top needs a restart (see `prefer_x11`).
+pub fn on_top_needs_restart(on_top: bool) -> bool {
+    cfg!(target_os = "linux") && on_top && std::env::var_os("WAYLAND_DISPLAY").is_some() && std::env::var_os("DISPLAY").is_some()
+}
+
 /// Lowest live level drives the tray glyph (the device you need to charge).
 fn worst(states: &[DeviceState]) -> Option<u8> {
     states.iter().filter(|s| s.status.link == Link::Connected).filter_map(|s| s.status.level).min()

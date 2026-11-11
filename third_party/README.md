@@ -10,7 +10,7 @@ re-apply our diff (what differs from the packaged sources), and bump the `rev`.
 Only what the build reads is kept: no `examples/`, `tests/`, `Cargo.lock` or
 `Cargo.toml.orig` (and their `[[example]]`/`[[test]]` entries are removed).
 
-`creamui-render/` is creamui-render with two fixes.
+`creamui-render/` is creamui-render with two fixes and one addition.
 
 **Restore repaint (Windows):**
 on Windows, a window restored from minimized came back black, and one shown again
@@ -24,11 +24,17 @@ kept drawing at the old size and the compositor stretched it (the floating widge
 grows from 1 row to N). `WindowHandle::resize` now reads the applied size back and
 updates the surface itself.
 
-`creamui-platform/` is creamui-platform with one addition: `set_app_id()` (in `src/winit.rs`, re-exported from `lib.rs`), applied as
-the Wayland `app_id` / X11 `WM_CLASS` of every window. Without it GNOME/KDE docks
-show the app as "Unknown" with a generic icon, because they match windows to their
-`.desktop` file by that id. LowBattery calls it on Linux before the first window.
+**App ID (Linux):** `WindowOptions::app_id`, passed down to the platform and
+inherited by popups opened from a window.
 
-Upstream fix for the restore repaint: branch `bug-minimize-win32` of github.com/sammwyy/creamui.
+`creamui-platform/` is creamui-platform with one addition: `WindowAttributes::app_id`,
+applied as the Wayland `app_id` / X11 `WM_CLASS` of the window (`src/winit.rs`; the
+native Wayland backend in `src/wayland/runtime.rs` uses it over the executable name).
+Without it GNOME/KDE docks show the app as "Unknown" with a generic icon, because they
+match windows to their `.desktop` file by that id. LowBattery sets it on both windows.
+
+Upstream fixes, on github.com/sammwyy/creamui: restore repaint in branch
+`bug-minimize-win32` (PR #4), programmatic resize in `fix-wayland-resize`, app ID in
+`feat-app-id`.
 Remove each directory and its `[patch.crates-io]` entry in the root Cargo.toml
 once a creamui release includes the fix.

@@ -74,6 +74,26 @@ pub fn set_autostart(enabled: bool) -> Result<(), String> {
         .map_err(|e| format!("{}: {e}", file.display()))
 }
 
+/// The session's Wayland socket, kept for the apps we launch after `prefer_x11`.
+static WAYLAND_DISPLAY: std::sync::OnceLock<std::ffi::OsString> = std::sync::OnceLock::new();
+
+/// Wayland lets no client keep a window above the others (or place it), so a
+/// pinned widget runs the whole app on XWayland, where GNOME/KDE honor both.
+/// Must run before the first window: winit picks Wayland whenever
+/// WAYLAND_DISPLAY is set. No-op without XWayland (DISPLAY unset, e.g. Flatpak's
+/// fallback-x11), where the widget just isn't kept on top.
+pub fn prefer_x11(on_top: bool) {
+    if !super::on_top_needs_restart(on_top) {
+        return;
+    }
+    if let Some(wl) = std::env::var_os("WAYLAND_DISPLAY") {
+        let _ = WAYLAND_DISPLAY.set(wl);
+    }
+    log::info!("widget kept on top: running on X11 (XWayland); Wayland can't keep windows above");
+    // Single-threaded here: called first thing in main.
+    std::env::remove_var("WAYLAND_DISPLAY");
+}
+
 /// Linux apps get `--minimized` from the autostart entry itself.
 pub fn launched_at_startup() -> bool {
     false
@@ -120,7 +140,12 @@ pub fn notify(title: &str, body: &str) {
 /// Opens a file with the desktop's default handler.
 pub fn open_file(path: &std::path::Path) {
     let path = path.to_owned();
-    std::thread::spawn(move || match std::process::Command::new("xdg-open").arg(&path).status() {
+    let mut cmd = std::process::Command::new("xdg-open");
+    cmd.arg(&path);
+    if let Some(wl) = WAYLAND_DISPLAY.get() {
+        cmd.env("WAYLAND_DISPLAY", wl); // the editor shouldn't inherit our X11 fallback
+    }
+    std::thread::spawn(move || match cmd.status() {
         Ok(s) if s.success() => {}
         r => log::error!("xdg-open {}: {r:?}", path.display()),
     });

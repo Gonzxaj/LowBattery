@@ -1,3 +1,5 @@
+// Modified by Gonzalo Carranza (2026): WindowAttributes::app_id, the Wayland
+// app_id / X11 WM_CLASS of a window - see third_party/README.md.
 mod compositor;
 
 use super::*;
@@ -45,6 +47,7 @@ impl ApplicationHandler<Event> for App {
         let window = event_loop
             .create_window(WindowAttributes {
                 decorations: self.decorations,
+                app_id: (!self.decorations).then(|| "org.example.App".to_owned()),
                 ..Default::default()
             })
             .unwrap();
@@ -135,11 +138,18 @@ fn exercise_titlebar(decorations: bool) {
             .collect::<Vec<_>>(),
         [false, true, false]
     );
-    let executable = std::env::current_exe().unwrap();
-    assert_eq!(
-        server.app_ids(),
-        [executable.file_stem().unwrap().to_string_lossy()]
-    );
+    // An explicit `app_id` replaces the one derived from the executable.
+    let expected = if decorations {
+        let executable = std::env::current_exe().unwrap();
+        executable
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        "org.example.App".to_owned()
+    };
+    assert_eq!(server.app_ids(), [expected]);
     assert_eq!(server.minimums(), [(1, 1), (640, 480), (960, 560), (0, 0)]);
     assert_eq!(
         server.actions(),

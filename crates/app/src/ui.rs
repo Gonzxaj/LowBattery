@@ -566,7 +566,12 @@ fn settings(app: &App, p: &Palette, cfg: &Config, _width: f32) -> BoxedWidget {
                     row(
                         p,
                         l.t("Always on top", "Siempre visible"),
-                        l.t("Above other windows", "Por encima de otras ventanas").into(),
+                        if crate::os::on_top_needs_restart(cfg.widget.always_on_top) {
+                            l.t("Restart the app to apply (Wayland)", "Se aplica al reiniciar la app (Wayland)")
+                        } else {
+                            l.t("Above other windows", "Por encima de otras ventanas")
+                        }
+                        .into(),
                         switch(app, cfg.widget.always_on_top, |c| c.widget.always_on_top = !c.widget.always_on_top),
                     ),
                     row(p, l.t("Opacity", "Opacidad"), format!("{:.0}%", cfg.widget.opacity * 100.0), Box::new(opacity)),

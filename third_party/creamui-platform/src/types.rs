@@ -1,3 +1,5 @@
+// Modified by Gonzalo Carranza (2026): WindowAttributes::app_id, the Wayland
+// app_id / X11 WM_CLASS of a window - see third_party/README.md.
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
@@ -496,6 +498,9 @@ pub struct WindowAttributes {
     pub decorations: bool,
     pub transparent: bool,
     pub role: WindowRole,
+    /// Linux desktop ID (Wayland `app_id`, X11 `WM_CLASS`) that matches the
+    /// app's `.desktop` file. `None` keeps the backend's default.
+    pub app_id: Option<String>,
 }
 
 impl Default for WindowAttributes {
@@ -508,6 +513,7 @@ impl Default for WindowAttributes {
             decorations: true,
             transparent: false,
             role: WindowRole::Normal,
+            app_id: None,
         }
     }
 }

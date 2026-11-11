@@ -19,7 +19,7 @@ pub use self::wayland::runtime::{
 };
 #[cfg(not(all(feature = "wayland", target_os = "linux")))]
 pub use self::winit::{
-    set_app_id, ActiveEventLoop, ApplicationHandler, EventLoop, EventLoopBuilder, EventLoopProxy, Window,
+    ActiveEventLoop, ApplicationHandler, EventLoop, EventLoopBuilder, EventLoopProxy, Window,
 };
 #[cfg(all(feature = "android", target_os = "android"))]
 pub use ::winit::platform::android::activity::AndroidApp;

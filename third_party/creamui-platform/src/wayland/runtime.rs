@@ -1,3 +1,5 @@
+// Modified by Gonzalo Carranza (2026): WindowAttributes::app_id, the Wayland
+// app_id / X11 WM_CLASS of a window - see third_party/README.md.
 use crate::{
     BackendKind, BlurRegion, CompositorControls, CompositorIntegrationMode,
     CompositorIntegrationRequest, ControlFlow, CursorIcon, DecorationNegotiation, DragIcon, Key,
@@ -319,10 +321,11 @@ impl ActiveEventLoop<'_> {
             .xdg_shell
             .create_window(surface, decorations, self.queue_handle);
         window.set_title(attributes.title);
-        if let Some(app_id) = std::env::current_exe()
-            .ok()
-            .and_then(|path| application_id(&path))
-        {
+        if let Some(app_id) = attributes.app_id.or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|path| application_id(&path))
+        }) {
             window.set_app_id(app_id);
         }
         let (minimum, maximum) = window_size_limits(attributes.size, attributes.resizable);

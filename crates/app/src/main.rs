@@ -125,6 +125,7 @@ impl App {
                 // window (winit's set_visible is a no-op there), so Linux closes
                 // it for real and the tray's "Open" builds a new one.
                 close_behavior: if cfg!(windows) { CloseBehavior::Hide } else { CloseBehavior::Close },
+                app_id: os::app_id(),
                 ..Default::default()
             },
             ui::Palette::get(cfg.dark).bg,
@@ -166,6 +167,7 @@ impl App {
                 decorations: false,
                 transparent: true,
                 theme: ui::Palette::get(cfg.dark).theme(cfg.dark),
+                app_id: os::app_id(),
                 ..Default::default()
             },
             Color::rgba(0, 0, 0, 0),
@@ -243,6 +245,8 @@ fn main() {
     }
 
     let config = Config::load();
+    #[cfg(target_os = "linux")]
+    os::prefer_x11(config.widget.always_on_top);
     let interval = Duration::from_secs(config.poll_secs);
     let widget_visible = config.widget.visible;
     let provider_list = if demo { vec![Box::new(providers::demo::Demo::default()) as _] } else { providers::all() };
@@ -272,9 +276,6 @@ fn main() {
         tray: Rc::default(),
     };
 
-    // Lets GNOME/KDE docks match our windows to the .desktop file (name, icon).
-    #[cfg(target_os = "linux")]
-    creamui::platform::set_app_id(os::APP_ID);
 
     AppBuilder::new()
         .keep_running()
