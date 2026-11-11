@@ -21,3 +21,7 @@
 /stage
 /prime
 *.snap
+
+# Leftovers from building or patching the vendored crates
+/third_party/*/target
+*.orig

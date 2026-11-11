@@ -14,19 +14,17 @@ use std::rc::Rc;
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
-/// Deliver items produced by a blocking `next()` to `on` on the UI thread.
-/// `next()` returning None ends the stream.
-/// shortcut: re-arms one `spawn_background` per item because creamui 0.3.0 has no
-/// `spawn_stream`; switch to it once a release ships it.
+/// Deliver items produced by a blocking `next()` to `on` on the UI thread,
+/// from one background thread. `next()` returning None ends the stream.
 pub fn forward<T: Send + 'static>(handle: &AppHandle, next: Arc<dyn Fn() -> Option<T> + Send + Sync>, on: Rc<dyn Fn(T)>) {
-    let again = handle.clone();
-    let n = next.clone();
-    handle.spawn_background(move || n(), move |item| {
-        if let Some(item) = item {
-            on(item);
-            forward(&again, next, on);
-        }
-    });
+    handle.spawn_stream(
+        move |emit| {
+            while let Some(item) = next() {
+                emit(item);
+            }
+        },
+        move |item| on(item),
+    );
 }
 
 /// UI-thread state. Cheap to clone (Rc / Signal handles).

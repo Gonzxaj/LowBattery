@@ -9,11 +9,13 @@ use crate::display_list::{
 };
 use crate::text::{GlyphBitmap, GlyphKey};
 use bytemuck::{Pod, Zeroable};
+use creamui_core::NativeImage;
 use creamui_platform::PlatformWindow;
 use creamui_theme::Color;
 use rustc_hash::FxHashMap;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -58,6 +60,45 @@ struct Instance {
     shape: [f32; 3],
     /// Primitive kind in the low `KIND_BITS`, clip table index above them.
     tag: u32,
+}
+
+fn instance_upload_ranges(
+    instances: &[Instance],
+    uploaded: &[Instance],
+    ranges: &mut Vec<Range<usize>>,
+) {
+    ranges.clear();
+    let mut coalesced = false;
+    for (block, chunk) in instances.chunks(64).enumerate() {
+        let start = block * 64;
+        if uploaded.get(start..start + chunk.len()).is_some_and(|old| {
+            bytemuck::cast_slice::<_, u8>(chunk) == bytemuck::cast_slice::<_, u8>(old)
+        }) {
+            continue;
+        }
+        for (offset, instance) in chunk.iter().enumerate() {
+            let index = start + offset;
+            let changed = uploaded
+                .get(index)
+                .is_none_or(|old| bytemuck::bytes_of(instance) != bytemuck::bytes_of(old));
+            if !changed {
+                continue;
+            }
+            if let Some(range) = ranges.last_mut() {
+                if coalesced || index - range.end <= MIN_INSTANCE_UPLOAD_GAP {
+                    range.end = index + 1;
+                    continue;
+                }
+            }
+            ranges.push(index..index + 1);
+            if ranges.len() > MAX_INSTANCE_UPLOAD_RANGES {
+                let first = ranges[0].start;
+                ranges.clear();
+                ranges.push(first..index + 1);
+                coalesced = true;
+            }
+        }
+    }
 }
 
 #[repr(C)]
@@ -834,6 +875,34 @@ impl GpuShared {
         );
     }
 
+    fn prepare_native_image(&mut self, image: &NativeImage, frame: u64) {
+        if let Some(texture) = self.images.get_mut(&image.id()) {
+            texture.used = frame;
+            return;
+        }
+        let view = image
+            .resource::<wgpu::TextureView>()
+            .expect("native image requires a wgpu texture view");
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("creamui-native-image"),
+            layout: &self.image_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(view),
+            }],
+        });
+        self.images.insert(
+            image.id(),
+            ImageTexture {
+                bind_group,
+                level: 0,
+                used: frame,
+                holders: 0,
+                transient: true,
+            },
+        );
+    }
+
     fn evict_images(&mut self) {
         let horizon = self.frame.saturating_sub(IMAGE_CACHE_FRAMES);
         let transient_horizon = self.frame.saturating_sub(2);
@@ -1081,6 +1150,7 @@ impl GpuRenderer {
         for item in &list.items {
             let image = match &item.primitive {
                 Primitive::Image(image) => Some(image.image.id()),
+                Primitive::NativeImage(image) => Some(image.image.id()),
                 _ => None,
             };
             if image != batch_image && self.instances.len() as u32 > batch_start {
@@ -1236,6 +1306,17 @@ impl GpuRenderer {
                         ..Zeroable::zeroed()
                     });
                 }
+                Primitive::NativeImage(prim) => {
+                    shared.prepare_native_image(&prim.image, frame);
+                    self.frame_images.push(prim.image.id());
+                    let b = prim.bounds;
+                    self.instances.push(Instance {
+                        bounds: [b.x0, b.y0, b.x1, b.y1],
+                        shape: [1.0, 0.0, 0.0],
+                        tag: KIND_IMAGE | clip,
+                        ..Zeroable::zeroed()
+                    });
+                }
             }
         }
         if self.instances.len() as u32 > batch_start {
@@ -1352,29 +1433,7 @@ impl GpuRenderer {
                 self.last_upload.push(0..self.instances.len());
             }
         } else {
-            let mut coalesced = false;
-            for (index, instance) in self.instances.iter().enumerate() {
-                let changed = self
-                    .uploaded
-                    .get(index)
-                    .is_none_or(|old| bytemuck::bytes_of(instance) != bytemuck::bytes_of(old));
-                if !changed {
-                    continue;
-                }
-                if let Some(range) = self.last_upload.last_mut() {
-                    if coalesced || index - range.end <= MIN_INSTANCE_UPLOAD_GAP {
-                        range.end = index + 1;
-                        continue;
-                    }
-                }
-                self.last_upload.push(index..index + 1);
-                if self.last_upload.len() > MAX_INSTANCE_UPLOAD_RANGES {
-                    let first = self.last_upload[0].start;
-                    self.last_upload.clear();
-                    self.last_upload.push(first..index + 1);
-                    coalesced = true;
-                }
-            }
+            instance_upload_ranges(&self.instances, &self.uploaded, &mut self.last_upload);
         }
         for range in &self.last_upload {
             let bytes = bytemuck::cast_slice(&self.instances[range.clone()]);
@@ -1790,6 +1849,10 @@ impl GpuSurface {
         &self.adapter_name
     }
 
+    pub(crate) fn device_queue(&self) -> (Rc<wgpu::Device>, Rc<wgpu::Queue>) {
+        (self.renderer.device.clone(), self.renderer.queue.clone())
+    }
+
     /// Draws and presents `list`. Returns `false` when the surface was not
     /// ready and the frame must be retried.
     pub fn present(&mut self, list: &DisplayList, damage: &Damage) -> bool {
@@ -2078,6 +2141,67 @@ mod tests {
         assert_eq!(&gpu_pixels[..4], &[20, 20, 24, 255]);
         let center = (16 * 96 + 24) * 4;
         assert_eq!(&gpu_pixels[center..center + 4], &[200, 40, 40, 255]);
+    }
+
+    #[test]
+    fn native_texture_uses_the_same_gpu_device_and_obeys_clipping() {
+        let Some(mut gpu) = headless() else { return };
+        let device = gpu.renderer().device();
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("native-viewport-test"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        gpu.renderer().queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[255, 0, 0, 255],
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        let image = NativeImage::new(texture.create_view(&wgpu::TextureViewDescriptor::default()));
+        let mut recorder = SceneRecorder::new();
+        recorder.begin(20, 20, 1.0, Color::rgb(0, 0, 0), ColorScheme::default());
+        recorder.push_clip(rect(4.0, 4.0, 8.0, 8.0));
+        recorder.draw_native_image(rect(0.0, 0.0, 16.0, 16.0), &image);
+        recorder.pop_clip();
+        let list = recorder.finish();
+        let pixels = gpu.render_to_pixels(&list);
+        assert_eq!(
+            &pixels[(8 * 20 + 8) * 4..(8 * 20 + 8) * 4 + 4],
+            &[255, 0, 0, 255]
+        );
+        assert_eq!(
+            &pixels[(2 * 20 + 8) * 4..(2 * 20 + 8) * 4 + 4],
+            &[0, 0, 0, 255]
+        );
+        assert!(gpu
+            .renderer()
+            .shared
+            .borrow()
+            .images
+            .contains_key(&image.id()));
     }
 
     #[test]
@@ -3030,6 +3154,35 @@ mod tests {
         assert_eq!(gpu.renderer().last_upload, [4..5]);
         gpu.render(&frame(Color::rgb(8, 8, 8)));
         assert!(gpu.renderer().last_upload.is_empty());
+    }
+
+    #[test]
+    fn instance_upload_ranges_handle_block_edges_and_appended_instances() {
+        let uploaded = vec![Instance::zeroed(); 130];
+        let mut instances = uploaded.clone();
+        let mut ranges = Vec::new();
+        instance_upload_ranges(&instances, &uploaded, &mut ranges);
+        assert!(ranges.is_empty());
+
+        for index in [63, 64, 129] {
+            instances[index].color[0] = 1;
+        }
+        instances.extend_from_slice(&[Instance::zeroed(); 20]);
+        instance_upload_ranges(&instances, &uploaded, &mut ranges);
+        assert_eq!(ranges, [63..65, 129..150]);
+
+        instances[63].color[0] = 0;
+        instances[64].color[0] = 0;
+        instance_upload_ranges(&instances, &uploaded, &mut ranges);
+        assert_eq!(ranges, [129..150]);
+
+        let uploaded = vec![Instance::zeroed(); 192];
+        let mut instances = uploaded.clone();
+        for index in (0..=160).step_by(20) {
+            instances[index].color[0] = 1;
+        }
+        instance_upload_ranges(&instances, &uploaded, &mut ranges);
+        assert_eq!(ranges, [0..161]);
     }
 
     #[test]

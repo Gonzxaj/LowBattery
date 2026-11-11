@@ -5,7 +5,8 @@ following third-party work.
 
 ## CreamUI (Apache-2.0), modified copy
 
-`third_party/creamui-render/` is a copy of **creamui-render 0.3.0**, part of
+`third_party/creamui-render/` is a copy of **creamui-render 0.3.0** (GitHub `main`, commit
+`a36a4bc`; the rest of CreamUI is used from that commit unmodified), part of
 [CreamUI](https://github.com/sammwyy/creamui) by Sammwy, licensed under the
 Apache License 2.0 (full text in `third_party/creamui-render/LICENSE`).
 
@@ -14,11 +15,11 @@ a window is restored from minimized and from `WindowHandle::show`, so Windows
 repaints the full window instead of leaving it blank or black, and
 `WindowHandle::resize` adopts sizes Wayland applies immediately (no `Resized`
 event), so a resized window isn't drawn stretched. The modified file
-carries a notice at its top. The rest of CreamUI is used unmodified from crates.io.
+carries a notice at its top.
 
 ## CreamUI platform (Apache-2.0), modified copy
 
-`third_party/creamui-platform/` is a copy of **creamui-platform 0.3.0** from the same
+`third_party/creamui-platform/` is a copy of **creamui-platform 0.3.0** (same commit) from the same
 project and license (full text in `third_party/creamui-platform/LICENSE`).
 
 **Changes:** `src/winit.rs` adds `set_app_id`, which sets the Wayland `app_id` and

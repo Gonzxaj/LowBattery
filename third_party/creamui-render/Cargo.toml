@@ -22,7 +22,7 @@ autotests = false
 autobenches = false
 description = "Rendering backend for CreamUI"
 homepage = "https://github.com/sammwyy/creamui"
-readme = "README.md"
+readme = false
 keywords = [
     "gui",
     "ui",
@@ -35,10 +35,7 @@ repository = "https://github.com/sammwyy/creamui"
 
 [features]
 context-menu = ["dep:creamui-widgets"]
-default = [
-    "gpu",
-    "platform-winit",
-]
+default = ["platform-winit"]
 gpu = [
     "dep:wgpu",
     "dep:pollster",
@@ -77,13 +74,7 @@ tray = [
 name = "creamui_render"
 path = "src/lib.rs"
 
-[[example]]
-name = "retained_window"
-path = "examples/retained_window.rs"
 
-[[test]]
-name = "context_menu"
-path = "tests/context_menu.rs"
 
 [dependencies.bytemuck]
 version = "1"

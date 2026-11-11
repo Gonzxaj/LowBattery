@@ -19,10 +19,23 @@ panic = "abort"
 [profile.dev.package."*"]
 opt-level = 2
 
-# shortcut: patched creamui-render 0.3.0 (restore-from-minimize repaint fix, see
-# third_party/README.md); drop when a creamui release ships the upstream fix.
+# creamui from GitHub main (newer than the 0.3.0 release, same version number),
+# with our two patched crates swapped in. See third_party/README.md.
+# shortcut: pinned to an unreleased commit; go back to crates.io once a release
+# includes the fixes we carry (restore repaint, Wayland resize, app_id).
 [patch.crates-io]
+creamui = { git = "https://github.com/sammwyy/creamui", rev = "a36a4bcdbb066702a9b85827133ee8cb788bf1ab" }
+creamui-core = { git = "https://github.com/sammwyy/creamui", rev = "a36a4bcdbb066702a9b85827133ee8cb788bf1ab" }
+creamui-fonts = { git = "https://github.com/sammwyy/creamui", rev = "a36a4bcdbb066702a9b85827133ee8cb788bf1ab" }
+creamui-image = { git = "https://github.com/sammwyy/creamui", rev = "a36a4bcdbb066702a9b85827133ee8cb788bf1ab" }
+creamui-reactive = { git = "https://github.com/sammwyy/creamui", rev = "a36a4bcdbb066702a9b85827133ee8cb788bf1ab" }
+creamui-theme = { git = "https://github.com/sammwyy/creamui", rev = "a36a4bcdbb066702a9b85827133ee8cb788bf1ab" }
+creamui-widgets = { git = "https://github.com/sammwyy/creamui", rev = "a36a4bcdbb066702a9b85827133ee8cb788bf1ab" }
 creamui-render = { path = "third_party/creamui-render" }
-# shortcut: patched creamui-platform 0.3.0 (Wayland app_id via set_app_id, see
-# third_party/README.md); drop when a creamui release can name the app.
+creamui-platform = { path = "third_party/creamui-platform" }
+
+# Inside the creamui repo the crates depend on each other by path; this makes
+# them use our patched copies too.
+[patch."https://github.com/sammwyy/creamui"]
+creamui-render = { path = "third_party/creamui-render" }
 creamui-platform = { path = "third_party/creamui-platform" }

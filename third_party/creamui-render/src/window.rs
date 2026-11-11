@@ -22,12 +22,13 @@ use crate::display_list::{self, DisplayList};
 use crate::gpu::GpuSurface;
 use crate::raster::Rasterizer;
 use crate::recorder::SceneRecorder;
+use crate::shortcuts::{Shortcut, ShortcutScope, Shortcuts};
 #[cfg(target_arch = "wasm32")]
 use crate::web::WebState;
 use creamui_core::runtime::{IntoView, MountedView, Mutation, SharedRuntime, View};
 use creamui_core::{
     BoxedWidget, CursorIcon, Key, KeyInput, Modifiers, Point, Rect, Renderer, Scene, Size,
-    TitlebarMode, TitlebarState, WindowButton, WindowControls, WindowControlsBackend,
+    TitlebarMode, TitlebarState, WheelInput, WindowButton, WindowControls, WindowControlsBackend,
     WindowDragHandle,
 };
 #[cfg(all(feature = "platform-android", target_os = "android"))]
@@ -320,6 +321,18 @@ pub(crate) fn translate_key(key: &PlatformKey) -> Option<Key> {
     match key {
         PlatformKey::Character(s) => s.chars().next().map(Key::Char),
         PlatformKey::Space => Some(Key::Char(' ')),
+        PlatformKey::F1 => Some(Key::Function(1)),
+        PlatformKey::F2 => Some(Key::Function(2)),
+        PlatformKey::F3 => Some(Key::Function(3)),
+        PlatformKey::F4 => Some(Key::Function(4)),
+        PlatformKey::F5 => Some(Key::Function(5)),
+        PlatformKey::F6 => Some(Key::Function(6)),
+        PlatformKey::F7 => Some(Key::Function(7)),
+        PlatformKey::F8 => Some(Key::Function(8)),
+        PlatformKey::F9 => Some(Key::Function(9)),
+        PlatformKey::F10 => Some(Key::Function(10)),
+        PlatformKey::F11 => Some(Key::Function(11)),
+        PlatformKey::F12 => Some(Key::Function(12)),
         PlatformKey::Backspace => Some(Key::Backspace),
         PlatformKey::Delete => Some(Key::Delete),
         PlatformKey::Enter => Some(Key::Enter),
@@ -363,8 +376,8 @@ pub struct WindowOptions {
     pub role: WindowRole,
     /// How a close request from the window manager is handled.
     pub close_behavior: CloseBehavior,
-    /// Which backend renders the window: GPU (`wgpu`, the default with the
-    /// `gpu` feature, falling back to CPU when no adapter is usable) or CPU-only. Can be
+    /// Which backend renders the window: CPU by default, or GPU (`wgpu`,
+    /// falling back to CPU when no adapter is usable). Can be
     /// force-overridden at launch with `CUI_OVERRIDE_RENDER_BACKEND=gpu|cpu`
     /// regardless of what's set here — see [`RenderBackend::resolve`].
     pub backend: RenderBackend,
@@ -820,6 +833,7 @@ struct Pipeline {
     content_blur: bool,
     applied_blur: RefCell<Vec<(i32, i32, i32, i32)>>,
     frame: RefCell<FrameState>,
+    shortcuts: RefCell<Shortcuts>,
     /// Full window, including the bands system bars cover.
     surface: Signal<Size>,
     /// Rectangle `build_ui` lays out into. Smaller than [`Self::surface`]
@@ -1391,6 +1405,7 @@ struct AppCommands {
     proxy: EventLoopProxy<AppEvent>,
     next_job_id: u64,
     background_jobs: HashMap<u64, Box<dyn FnOnce(Box<dyn Any + Send>)>>,
+    background_streams: HashMap<u64, Box<dyn FnMut(Box<dyn Any + Send>)>>,
 }
 
 impl AppHandle {
@@ -1517,6 +1532,43 @@ impl AppHandle {
             let _ = proxy.send_event(AppEvent::BackgroundJob(job_id, result));
         }
     }
+
+    pub fn spawn_stream<T, F, D>(&self, work: F, on_item: D)
+    where
+        T: Send + 'static,
+        F: FnOnce(Box<dyn Fn(T) + Send>) + Send + 'static,
+        D: FnMut(T) + 'static,
+    {
+        let (job_id, proxy) = {
+            let mut commands = self.commands.borrow_mut();
+            let job_id = commands.next_job_id;
+            commands.next_job_id += 1;
+            let mut on_item = on_item;
+            commands.background_streams.insert(
+                job_id,
+                Box::new(move |value| {
+                    on_item(
+                        *value
+                            .downcast::<T>()
+                            .expect("background stream type mismatch"),
+                    );
+                }),
+            );
+            (job_id, commands.proxy.clone())
+        };
+        let worker = move || {
+            let sender = proxy.clone();
+            work(Box::new(move |value| {
+                let _ =
+                    sender.send_event(AppEvent::BackgroundStream(job_id, Some(Box::new(value))));
+            }));
+            let _ = proxy.send_event(AppEvent::BackgroundStream(job_id, None));
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        std::thread::spawn(worker);
+        #[cfg(target_arch = "wasm32")]
+        worker();
+    }
 }
 
 /// Looks up and runs the `on_done` continuation registered by
@@ -1532,6 +1584,21 @@ fn resolve_background_job(
     let callback = commands.borrow_mut().background_jobs.remove(&job_id);
     if let Some(callback) = callback {
         callback(value);
+    }
+}
+
+fn resolve_background_stream(
+    commands: &Rc<RefCell<AppCommands>>,
+    job_id: u64,
+    value: Option<Box<dyn Any + Send>>,
+) {
+    let callback = commands.borrow_mut().background_streams.remove(&job_id);
+    if let (Some(mut callback), Some(value)) = (callback, value) {
+        callback(value);
+        commands
+            .borrow_mut()
+            .background_streams
+            .insert(job_id, callback);
     }
 }
 
@@ -1684,6 +1751,8 @@ pub struct WindowHandle {
     app: AppHandle,
     runtime: Option<SharedRuntime>,
     pipeline: Weak<Pipeline>,
+    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+    gpu_device: Option<(Rc<wgpu::Device>, Rc<wgpu::Queue>)>,
 }
 
 impl WindowHandle {
@@ -1733,6 +1802,30 @@ impl WindowHandle {
         if let Some(pipeline) = self.pipeline.upgrade() {
             pipeline.invalidate_paint();
         }
+    }
+
+    pub fn register_shortcut(
+        &self,
+        shortcut: Shortcut,
+        scope: ShortcutScope,
+        handler: impl Fn() + 'static,
+    ) -> Option<u64> {
+        Some(self.pipeline.upgrade()?.shortcuts.borrow_mut().insert(
+            shortcut,
+            scope,
+            Rc::new(handler),
+        ))
+    }
+
+    pub fn remove_shortcut(&self, id: u64) -> bool {
+        self.pipeline
+            .upgrade()
+            .is_some_and(|pipeline| pipeline.shortcuts.borrow_mut().remove(id))
+    }
+
+    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+    pub fn gpu_device(&self) -> Option<(Rc<wgpu::Device>, Rc<wgpu::Queue>)> {
+        self.gpu_device.clone()
     }
 
     /// Reports pointer presence independently of child widget hover regions.
@@ -2327,6 +2420,7 @@ struct WindowState {
     /// pixels are discarded meanwhile, so the next real size repaints whole.
     zero_sized: bool,
     pointer_pos: Point,
+    last_click: Option<(Instant, Point)>,
     modifiers: PlatformModifiers,
     next_blink: Instant,
     next_animation: Instant,
@@ -2754,26 +2848,46 @@ impl WindowState {
     }
 
     fn scroll_at(&mut self, pointer: Point, delta_y: f32) {
+        self.wheel_at(
+            pointer,
+            WheelInput {
+                delta: Point { x: 0.0, y: delta_y },
+                modifiers: Modifiers::default(),
+            },
+        );
+    }
+
+    fn wheel_at(&mut self, pointer: Point, input: WheelInput) {
         if let Some(runtime) = self.runtime() {
-            let handler = runtime.with(|runtime| {
+            let handlers = runtime.with(|runtime| {
                 let target = runtime.scroll_target(pointer)?;
-                runtime.get(target)?.events.on_scroll.clone()
+                let events = &runtime.get(target)?.events;
+                Some((events.on_wheel.clone(), events.on_scroll.clone()))
             });
-            if let Some(handler) = handler {
-                handler(delta_y);
+            if let Some((wheel, vertical)) = handlers {
+                if let Some(handler) = wheel {
+                    handler(input);
+                } else if let Some(handler) = vertical {
+                    handler(input.delta.y);
+                }
             }
             return;
         }
         let handler = self.scene(|scene| {
             let index = scene.scroll_hit_test(pointer)?;
             Some((
-                scene.on_scroll_at(index)?.clone(),
+                scene.on_wheel_at(index).cloned(),
+                scene.on_scroll_at(index).cloned(),
                 scene.scroll_is_local_at(index),
                 scene.scroll_requires_layout_at(index),
             ))
         });
-        if let Some((handler, local, layout)) = handler {
-            handler(delta_y);
+        if let Some((wheel, vertical, local, layout)) = handler {
+            if let Some(handler) = wheel {
+                handler(input);
+            } else if let Some(handler) = vertical {
+                handler(input.delta.y);
+            }
             if layout {
                 self.pipeline.invalidate_layout();
             } else if local {
@@ -2914,6 +3028,9 @@ impl WindowState {
 
     fn handle_key_input(&mut self, key: KeyInput) {
         self.set_focus_visible(true);
+        if self.dispatch_shortcut(key) {
+            return;
+        }
         match key.key {
             // Page keys scroll the container beneath the pointer even when
             // it has no focused child. This keeps long views usable from a
@@ -2963,6 +3080,50 @@ impl WindowState {
             self.restart_caret();
             handler(key);
             self.pipeline.invalidate_layout();
+        }
+    }
+
+    fn dispatch_shortcut(&self, key: KeyInput) -> bool {
+        let focused = if let Some(runtime) = self.runtime() {
+            runtime.with(|runtime| {
+                let node = runtime.get(runtime.pointer().focused?)?;
+                let rect = node.layout.rect;
+                let offset = node.layout.effective_transform;
+                Some((
+                    node.events.text_input,
+                    Some(Rect {
+                        x: rect.x + offset.x,
+                        y: rect.y + offset.y,
+                        ..rect
+                    }),
+                ))
+            })
+        } else {
+            self.pipeline.focused.get().map(|index| {
+                self.scene(|scene| {
+                    Some((
+                        scene.focus_accepts_text_input(index),
+                        scene.focus_rect_at(index),
+                    ))
+                })
+                .unwrap_or((false, None))
+            })
+        };
+        let (text_input, rect) = focused.unwrap_or((false, None));
+        let target = rect.map_or(self.pointer_pos, |rect| Point {
+            x: rect.x + rect.width / 2.0,
+            y: rect.y + rect.height / 2.0,
+        });
+        let handler = self
+            .pipeline
+            .shortcuts
+            .borrow()
+            .resolve(key, text_input, target);
+        if let Some(handler) = handler {
+            handler();
+            true
+        } else {
+            false
         }
     }
 
@@ -3099,14 +3260,75 @@ impl WindowState {
                     move_callback(self.pointer_pos);
                 }
                 self.set_pointer(Some(self.pointer_pos));
+                if self
+                    .pipeline
+                    .frame
+                    .borrow()
+                    .recorder
+                    .press_origin
+                    .is_some_and(|origin| {
+                        (origin.x - self.pointer_pos.x).hypot(origin.y - self.pointer_pos.y) >= 5.0
+                    })
+                {
+                    self.last_click = None;
+                }
                 if self.runtime().is_some() {
                     self.runtime_pointer_moved();
+                    if let Some(runtime) = self.runtime() {
+                        let pointer = self.pointer_pos;
+                        let handler = runtime.with(|runtime| {
+                            let mut target = runtime.hit_test(pointer);
+                            while let Some(id) = target {
+                                let node = runtime.get(id)?;
+                                if let Some(handler) = &node.events.on_pointer_move {
+                                    let rect = node.layout.rect;
+                                    let offset = node.layout.effective_transform;
+                                    return Some((
+                                        Point {
+                                            x: pointer.x - rect.x - offset.x,
+                                            y: pointer.y - rect.y - offset.y,
+                                        },
+                                        handler.clone(),
+                                    ));
+                                }
+                                target = node.parent;
+                            }
+                            None
+                        });
+                        if let Some((local, handler)) = handler {
+                            handler(
+                                local,
+                                Modifiers {
+                                    ctrl: self.modifiers.ctrl,
+                                    shift: self.modifiers.shift,
+                                    alt: self.modifiers.alt,
+                                    logo: self.modifiers.logo,
+                                },
+                            );
+                        }
+                    }
                     return;
+                }
+                if let Some((local, handler)) =
+                    self.scene(|scene| scene.pointer_move_at(self.pointer_pos))
+                {
+                    handler(
+                        local,
+                        Modifiers {
+                            ctrl: self.modifiers.ctrl,
+                            shift: self.modifiers.shift,
+                            alt: self.modifiers.alt,
+                            logo: self.modifiers.logo,
+                        },
+                    );
                 }
                 if let Some(drag_click) = self.drag_click.as_mut() {
                     let dx = self.pointer_pos.x - drag_click.origin.x;
                     let dy = self.pointer_pos.y - drag_click.origin.y;
                     drag_click.moved |= dx.hypot(dy) >= 4.0;
+                    if drag_click.moved {
+                        self.last_click = None;
+                    }
                 }
                 let pointer = self.pointer_pos;
                 let hovered_cursor = self
@@ -3231,11 +3453,47 @@ impl WindowState {
                     handler();
                     return;
                 }
+                let pointer = self.pointer_pos;
+                let now = Instant::now();
+                let double_click =
+                    self.last_click
+                        .replace((now, pointer))
+                        .is_some_and(|(previous, origin)| {
+                            now.duration_since(previous) < Duration::from_millis(500)
+                                && (origin.x - pointer.x).hypot(origin.y - pointer.y) < 5.0
+                        });
+                if double_click {
+                    let handler = if let Some(runtime) = self.runtime() {
+                        runtime.with(|runtime| {
+                            let mut target = runtime.hit_test(pointer);
+                            while let Some(id) = target {
+                                let node = runtime.get(id)?;
+                                if let Some(handler) = &node.events.on_double_click_at {
+                                    let rect = node.layout.rect;
+                                    let offset = node.layout.effective_transform;
+                                    return Some((
+                                        Point {
+                                            x: pointer.x - rect.x - offset.x,
+                                            y: pointer.y - rect.y - offset.y,
+                                        },
+                                        handler.clone(),
+                                    ));
+                                }
+                                target = node.parent;
+                            }
+                            None
+                        })
+                    } else {
+                        self.scene(|scene| scene.double_click_at(pointer))
+                    };
+                    if let Some((local, handler)) = handler {
+                        handler(local);
+                    }
+                }
                 if self.runtime().is_some() {
                     self.runtime_pointer_pressed();
                     return;
                 }
-                let pointer = self.pointer_pos;
                 let Some((click, click_at, new_focus, drag_start, drag_anchor)) =
                     self.scene(|scene| {
                         let drag_start = scene.drag_hit_test(pointer).and_then(|index| {
@@ -3397,12 +3655,28 @@ impl WindowState {
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let scale = self.pipeline.scale_factor.peek();
-                // Positive `delta_y` reveals content further down.
-                let delta_y: f32 = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => -y * 40.0,
-                    MouseScrollDelta::PixelDelta(pos) => -(pos.y / scale) as f32,
+                let delta = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => Point {
+                        x: -x * 40.0,
+                        y: -y * 40.0,
+                    },
+                    MouseScrollDelta::PixelDelta(pos) => Point {
+                        x: -(pos.x / scale) as f32,
+                        y: -(pos.y / scale) as f32,
+                    },
                 };
-                self.scroll_at(self.pointer_pos, delta_y);
+                self.wheel_at(
+                    self.pointer_pos,
+                    WheelInput {
+                        delta,
+                        modifiers: Modifiers {
+                            ctrl: self.modifiers.ctrl,
+                            shift: self.modifiers.shift,
+                            alt: self.modifiers.alt,
+                            logo: self.modifiers.logo,
+                        },
+                    },
+                );
             }
             WindowEvent::Touch {
                 id,
@@ -3894,6 +4168,11 @@ impl AppHandler {
                 pipeline.invalidate_paint();
             })
         };
+        #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+        let gpu_device = match &presenter {
+            Presenter::Gpu(surface) => Some(surface.device_queue()),
+            _ => None,
+        };
         (spec.on_window_ready)(WindowHandle {
             window: pipeline.window.clone(),
             theme: pipeline.theme.clone(),
@@ -3913,6 +4192,8 @@ impl AppHandler {
             app: self.app.clone(),
             runtime,
             pipeline: Rc::downgrade(&pipeline),
+            #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+            gpu_device,
         });
 
         let now = Instant::now();
@@ -3946,6 +4227,7 @@ impl AppHandler {
             suspended: false,
             zero_sized: false,
             pointer_pos: Point::default(),
+            last_click: None,
             modifiers: PlatformModifiers::default(),
             next_blink: now + CARET_BLINK_INTERVAL,
             next_animation: now,
@@ -3990,6 +4272,7 @@ enum AppEvent {
     #[cfg(all(feature = "tray", target_os = "linux"))]
     TrayMenu(String),
     BackgroundJob(u64, Box<dyn Any + Send>),
+    BackgroundStream(u64, Option<Box<dyn Any + Send>>),
 }
 
 impl ApplicationHandler<AppEvent> for AppHandler {
@@ -4124,6 +4407,9 @@ impl ApplicationHandler<AppEvent> for AppHandler {
             }
             AppEvent::BackgroundJob(job_id, value) => {
                 resolve_background_job(&self.commands, job_id, value);
+            }
+            AppEvent::BackgroundStream(job_id, value) => {
+                resolve_background_stream(&self.commands, job_id, value);
             }
         }
         self.drain_app_commands(event_loop);
@@ -4402,6 +4688,7 @@ fn run_windows(
         proxy: event_loop.create_proxy(),
         next_job_id: 0,
         background_jobs: HashMap::new(),
+        background_streams: HashMap::new(),
     }));
     let app = AppHandle {
         commands: commands.clone(),
@@ -4551,6 +4838,7 @@ fn build_window_spec(
             inspected_content: None,
             adapter: None,
         }),
+        shortcuts: RefCell::new(Shortcuts::new()),
         surface: Signal::new(Size {
             width: options.width as f32,
             height: options.height as f32,
@@ -4806,6 +5094,7 @@ mod tests {
                 suspended: false,
                 zero_sized: false,
                 pointer_pos: Point::default(),
+                last_click: None,
                 modifiers: PlatformModifiers::default(),
                 next_blink: now + CARET_BLINK_INTERVAL,
                 next_animation: now,
@@ -4861,6 +5150,8 @@ mod tests {
                 app,
                 runtime: None,
                 pipeline: Rc::downgrade(pipeline),
+                #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+                gpu_device: None,
             }
         }
 
@@ -4940,6 +5231,7 @@ mod tests {
                 proxy: test_proxy(),
                 next_job_id: 0,
                 background_jobs: HashMap::new(),
+                background_streams: HashMap::new(),
             })),
         }
     }
@@ -7173,15 +7465,248 @@ mod tests {
                 })
             }
         });
-        let app = AppHandle::new();
-        let handle = harness.menu_handle(app, false);
         let baseline_builds = builds.get();
         let baseline_paints = paints.get();
-        handle.request_repaint();
+        harness.state.pipeline.invalidate_paint();
         assert!(!harness.state.pipeline.needs_layout.get());
         harness.send(WindowEvent::RedrawRequested);
         assert_eq!(builds.get(), baseline_builds);
         assert_eq!(paints.get(), baseline_paints + 1);
+    }
+
+    struct WheelWidget(Rc<Cell<Option<WheelInput>>>);
+
+    impl creamui_core::Widget for WheelWidget {
+        fn style(&self) -> creamui_core::Style {
+            creamui_core::Style::new().width(100.0).height(100.0)
+        }
+
+        fn paint(&self, _: &mut dyn creamui_core::Painter, _: Rect) {}
+
+        fn on_wheel(&self) -> Option<Rc<dyn Fn(WheelInput)>> {
+            let received = self.0.clone();
+            Some(Rc::new(move |input| received.set(Some(input))))
+        }
+    }
+
+    #[test]
+    fn wheel_delivers_both_axes_and_modifiers_to_widget() {
+        let received = Rc::new(Cell::new(None));
+        let mut harness = WindowEventHarness::new({
+            let received = received.clone();
+            move |_| Box::new(WheelWidget(received.clone()))
+        });
+        harness.send(WindowEvent::CursorMoved {
+            position: creamui_platform::PhysicalPosition { x: 10.0, y: 10.0 },
+        });
+        harness.send(WindowEvent::ModifiersChanged(PlatformModifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        }));
+        harness.send(WindowEvent::MouseWheel {
+            delta: MouseScrollDelta::LineDelta(1.0, -2.0),
+        });
+        assert_eq!(
+            received.get(),
+            Some(WheelInput {
+                delta: Point { x: -40.0, y: 80.0 },
+                modifiers: Modifiers {
+                    ctrl: true,
+                    shift: true,
+                    ..Default::default()
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn wheel_reaches_retained_runtime_nodes() {
+        let received = Rc::new(Cell::new(None));
+        let mut runtime = Runtime::new();
+        let root = {
+            let mut tx = runtime.transaction();
+            let root = tx.create_node(NodeKind::Container);
+            tx.apply(Mutation::SetLayoutStyle {
+                node: root,
+                style: creamui_core::Style::new().width(100.0).height(100.0).layout,
+            });
+            let received = received.clone();
+            tx.apply(Mutation::SetEventHandlers {
+                node: root,
+                handlers: EventState {
+                    on_wheel: Some(Rc::new(move |input| received.set(Some(input)))),
+                    ..Default::default()
+                },
+            });
+            root
+        };
+        runtime.set_root(Some(root));
+        let mut harness = WindowEventHarness::retained(SharedRuntime::new(runtime));
+        harness.send(WindowEvent::CursorMoved {
+            position: creamui_platform::PhysicalPosition { x: 10.0, y: 10.0 },
+        });
+        harness.send(WindowEvent::MouseWheel {
+            delta: MouseScrollDelta::LineDelta(-1.0, 2.0),
+        });
+        assert_eq!(received.get().unwrap().delta, Point { x: 40.0, y: -80.0 });
+    }
+
+    struct PointerMoveWidget(Rc<Cell<Option<(Point, Modifiers)>>>);
+
+    impl creamui_core::Widget for PointerMoveWidget {
+        fn style(&self) -> creamui_core::Style {
+            creamui_core::Style::new().width(100.0).height(100.0)
+        }
+
+        fn paint(&self, _: &mut dyn creamui_core::Painter, _: Rect) {}
+
+        fn on_pointer_move(&self) -> Option<Rc<dyn Fn(Point, Modifiers)>> {
+            let received = self.0.clone();
+            Some(Rc::new(move |point, modifiers| {
+                received.set(Some((point, modifiers)))
+            }))
+        }
+    }
+
+    #[test]
+    fn pointer_move_reports_local_position_and_modifiers_without_dragging() {
+        let received = Rc::new(Cell::new(None));
+        let mut harness = WindowEventHarness::new({
+            let received = received.clone();
+            move |_| Box::new(PointerMoveWidget(received.clone()))
+        });
+        harness.send(WindowEvent::ModifiersChanged(PlatformModifiers {
+            shift: true,
+            ..Default::default()
+        }));
+        harness.send(WindowEvent::CursorMoved {
+            position: creamui_platform::PhysicalPosition { x: 18.0, y: 23.0 },
+        });
+        assert_eq!(
+            received.get(),
+            Some((
+                Point { x: 18.0, y: 23.0 },
+                Modifiers {
+                    shift: true,
+                    ..Default::default()
+                }
+            ))
+        );
+    }
+
+    struct DoubleClickWidget(Rc<Cell<Option<Point>>>);
+
+    impl creamui_core::Widget for DoubleClickWidget {
+        fn style(&self) -> creamui_core::Style {
+            creamui_core::Style::new().width(100.0).height(100.0)
+        }
+
+        fn paint(&self, _: &mut dyn creamui_core::Painter, _: Rect) {}
+
+        fn on_double_click_at(&self) -> Option<Rc<dyn Fn(Point)>> {
+            let received = self.0.clone();
+            Some(Rc::new(move |point| received.set(Some(point))))
+        }
+    }
+
+    #[test]
+    fn double_click_reaches_widget_and_drag_cancels_click_sequence() {
+        let received = Rc::new(Cell::new(None));
+        let mut harness = WindowEventHarness::new({
+            let received = received.clone();
+            move |_| Box::new(DoubleClickWidget(received.clone()))
+        });
+        let click = |harness: &mut WindowEventHarness, pressed| {
+            harness.send(WindowEvent::MouseInput {
+                pressed,
+                button: MouseButton::Left,
+                serial: None,
+            });
+        };
+        harness.send(WindowEvent::CursorMoved {
+            position: creamui_platform::PhysicalPosition { x: 12.0, y: 14.0 },
+        });
+        click(&mut harness, true);
+        click(&mut harness, false);
+        click(&mut harness, true);
+        assert_eq!(received.get(), Some(Point { x: 12.0, y: 14.0 }));
+        received.set(None);
+        harness.send(WindowEvent::CursorMoved {
+            position: creamui_platform::PhysicalPosition { x: 30.0, y: 14.0 },
+        });
+        click(&mut harness, false);
+        click(&mut harness, true);
+        assert_eq!(received.get(), None);
+    }
+
+    struct ShortcutTextInput(Rc<Cell<usize>>);
+
+    impl creamui_core::Widget for ShortcutTextInput {
+        fn style(&self) -> creamui_core::Style {
+            creamui_core::Style::new().width(100.0).height(100.0)
+        }
+
+        fn paint(&self, _: &mut dyn creamui_core::Painter, _: Rect) {}
+
+        fn focusable(&self) -> bool {
+            true
+        }
+
+        fn accepts_text_input(&self) -> bool {
+            true
+        }
+
+        fn on_key(&self) -> Option<Rc<dyn Fn(KeyInput)>> {
+            let keys = self.0.clone();
+            Some(Rc::new(move |_| keys.set(keys.get() + 1)))
+        }
+    }
+
+    #[test]
+    fn scoped_shortcuts_do_not_steal_keys_from_text_inputs() {
+        let keys = Rc::new(Cell::new(0));
+        let mut harness = WindowEventHarness::new({
+            let keys = keys.clone();
+            move |_| Box::new(ShortcutTextInput(keys.clone()))
+        });
+        harness.state.set_legacy_focus(Some(0));
+        let saved = Rc::new(Cell::new(0));
+        let play = Rc::new(Cell::new(0));
+        let save = Shortcut::new(
+            Key::Char('s'),
+            Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+        );
+        harness.state.pipeline.shortcuts.borrow_mut().insert(
+            save,
+            ShortcutScope::Window,
+            Rc::new({
+                let saved = saved.clone();
+                move || saved.set(saved.get() + 1)
+            }),
+        );
+        harness.state.pipeline.shortcuts.borrow_mut().insert(
+            Shortcut::new(Key::Char(' '), Modifiers::default()),
+            ShortcutScope::WithoutTextInput,
+            Rc::new({
+                let play = play.clone();
+                move || play.set(play.get() + 1)
+            }),
+        );
+        harness.key(KeyInput {
+            key: Key::Char('S'),
+            modifiers: save.modifiers,
+        });
+        harness.key(KeyInput {
+            key: Key::Char(' '),
+            modifiers: Modifiers::default(),
+        });
+        assert_eq!(saved.get(), 1);
+        assert_eq!(play.get(), 0);
+        assert_eq!(keys.get(), 1);
     }
 
     struct SmallHoverWidget {
@@ -7479,6 +8004,7 @@ mod tests {
             proxy: test_proxy(),
             next_job_id: 0,
             background_jobs: HashMap::new(),
+            background_streams: HashMap::new(),
         }));
         let handle = AppHandle {
             commands: commands.clone(),
@@ -7515,6 +8041,49 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn background_stream_delivers_multiple_items_and_releases_callback() {
+        let commands = Rc::new(RefCell::new(AppCommands {
+            system_theme: None,
+            windows: Vec::new(),
+            exit_requested: false,
+            proxy: test_proxy(),
+            next_job_id: 0,
+            background_jobs: HashMap::new(),
+            background_streams: HashMap::new(),
+        }));
+        let handle = AppHandle {
+            commands: commands.clone(),
+        };
+        let received = Rc::new(RefCell::new(Vec::new()));
+        let values = received.clone();
+        let nested = handle.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        handle.spawn_stream(
+            move |emit| {
+                emit(1u32);
+                emit(2);
+                done_tx.send(()).unwrap();
+            },
+            move |value| {
+                values.borrow_mut().push(value);
+                if value == 1 {
+                    nested.spawn_background(|| 3u32, |_| {});
+                }
+            },
+        );
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        resolve_background_stream(&commands, 0, Some(Box::new(1u32)));
+        resolve_background_stream(&commands, 0, Some(Box::new(2u32)));
+        assert_eq!(*received.borrow(), vec![1, 2]);
+        assert_eq!(commands.borrow().background_streams.len(), 1);
+        resolve_background_stream(&commands, 0, None);
+        assert!(commands.borrow().background_streams.is_empty());
+        resolve_background_stream(&commands, 0, Some(Box::new(4u32)));
+        assert_eq!(*received.borrow(), vec![1, 2]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn resolve_background_job_is_a_no_op_for_an_unknown_or_already_resolved_id() {
         let commands = Rc::new(RefCell::new(AppCommands {
             system_theme: None,
@@ -7523,6 +8092,7 @@ mod tests {
             proxy: test_proxy(),
             next_job_id: 0,
             background_jobs: HashMap::new(),
+            background_streams: HashMap::new(),
         }));
         resolve_background_job(&commands, 99, Box::new(0u32));
     }
