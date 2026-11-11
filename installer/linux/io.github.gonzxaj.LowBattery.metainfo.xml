@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metadata: Flathub, Snap Store (adopt-info), GNOME Software, KDE Discover. -->
+<component type="desktop-application">
+  <id>io.github.gonzxaj.LowBattery</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>LowBattery</name>
+  <summary>Battery levels of your wireless peripherals</summary>
+  <summary xml:lang="es">Batería de tus periféricos inalámbricos</summary>
+  <developer id="io.github.gonzxaj">
+    <name>Gonzalo Carranza</name>
+  </developer>
+  <description>
+    <p>
+      LowBattery shows the battery of wireless mice, keyboards, headsets and
+      controllers in one window, a floating widget and the system tray, and
+      warns you once when one runs low. No vendor software, no account, no telemetry.
+    </p>
+    <ul>
+      <li>Logitech (Unifying, Bolt, Lightspeed, Bluetooth) and any device the Linux kernel reports</li>
+      <li>Bluetooth mice and keyboards</li>
+      <li>SteelSeries Aerox, Prime, Rival 3 Wireless and Arctis headsets</li>
+      <li>Razer wireless mice and keyboards</li>
+    </ul>
+    <p xml:lang="es">
+      LowBattery muestra la batería de mouse, teclados, auriculares y controles
+      inalámbricos en una ventana, un widget flotante y la bandeja del sistema, y
+      avisa una vez cuando alguno está por agotarse. Sin software del fabricante,
+      sin cuentas y sin telemetría.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.gonzxaj.LowBattery.desktop</launchable>
+  <url type="homepage">https://github.com/Gonzxaj/LowBattery</url>
+  <url type="bugtracker">https://github.com/Gonzxaj/LowBattery/issues</url>
+  <url type="vcs-browser">https://github.com/Gonzxaj/LowBattery</url>
+  <screenshots>
+    <!-- Flathub requires at least one; commit this PNG before submitting. -->
+    <screenshot type="default">
+      <caption>Devices and their battery level</caption>
+      <image>https://raw.githubusercontent.com/Gonzxaj/LowBattery/main/assets/screenshots/devices.png</image>
+    </screenshot>
+  </screenshots>
+  <categories>
+    <category>System</category>
+    <category>Monitor</category>
+  </categories>
+  <keywords>
+    <keyword>battery</keyword>
+    <keyword>mouse</keyword>
+    <keyword>headset</keyword>
+    <keyword>bluetooth</keyword>
+  </keywords>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.2" date="2026-11-09"/>
+  </releases>
+</component>

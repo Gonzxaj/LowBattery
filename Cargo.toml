@@ -23,3 +23,6 @@ opt-level = 2
 # third_party/README.md); drop when a creamui release ships the upstream fix.
 [patch.crates-io]
 creamui-render = { path = "third_party/creamui-render" }
+# shortcut: patched creamui-platform 0.3.0 (Wayland app_id via set_app_id, see
+# third_party/README.md); drop when a creamui release can name the app.
+creamui-platform = { path = "third_party/creamui-platform" }

@@ -1,12 +1,12 @@
 //! OS integration: tray icon, toast notifications, autostart, single instance.
-//! Real implementations on Windows; inert stubs elsewhere (demo/dev builds).
+//! Real implementations on Windows and Linux; inert stubs elsewhere.
 
 use battery_core::config::Lang;
 use battery_core::monitor::DeviceState;
 use battery_core::Link;
 
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(not(windows), allow(dead_code))] // only the Windows tray emits these
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))] // only real trays emit these
 pub enum TrayAction {
     Open,
     Refresh,
@@ -33,6 +33,16 @@ fn tooltip(states: &[DeviceState]) -> String {
         t.push_str(&line);
     }
     t
+}
+
+fn tray_labels(lang: Lang) -> [&'static str; 5] {
+    [
+        lang.t("Open lowbattery", "Abrir lowbattery"),
+        lang.t("Refresh now", "Actualizar ahora"),
+        lang.t("Show/hide widget", "Mostrar/ocultar widget"),
+        lang.t("View log", "Ver registro (log)"),
+        lang.t("Quit", "Salir"),
+    ]
 }
 
 /// 32x32 RGBA battery glyph filled to `level`.
@@ -244,24 +254,14 @@ mod win {
     }
 
     impl Tray {
-        fn labels(lang: Lang) -> [&'static str; 5] {
-            [
-                lang.t("Open lowbattery", "Abrir lowbattery"),
-                lang.t("Refresh now", "Actualizar ahora"),
-                lang.t("Show/hide widget", "Mostrar/ocultar widget"),
-                lang.t("View log", "Ver registro (log)"),
-                lang.t("Quit", "Salir"),
-            ]
-        }
-
         pub fn set_lang(&self, lang: Lang) {
-            for (item, label) in self.items.iter().zip(Self::labels(lang)) {
+            for (item, label) in self.items.iter().zip(tray_labels(lang)) {
                 item.set_text(label);
             }
         }
 
         pub fn new(lang: Lang) -> Result<Self, String> {
-            let [open, refresh, widget, log, quit] = Self::labels(lang).map(|l| MenuItem::new(l, true, None));
+            let [open, refresh, widget, log, quit] = tray_labels(lang).map(|l| MenuItem::new(l, true, None));
             let menu = Menu::new();
             menu.append_items(&[&open, &refresh, &widget, &log, &PredefinedMenuItem::separator(), &quit])
                 .map_err(|e| e.to_string())?;
@@ -323,15 +323,21 @@ mod win {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+pub use linux::*;
+
+#[cfg(target_os = "linux")]
+mod linux;
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub use stub::*;
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 mod stub {
     use super::*;
 
     pub fn set_autostart(_: bool) -> Result<(), String> {
-        Err("autostart is only implemented on Windows".into())
+        Err("autostart is not implemented on this OS".into())
     }
     pub fn single_instance() -> bool {
         true
@@ -350,7 +356,7 @@ mod stub {
     impl Tray {
         pub fn set_lang(&self, _: Lang) {}
         pub fn new(_: Lang) -> Result<Self, String> {
-            Err("tray is only implemented on Windows".into())
+            Err("tray is not implemented on this OS".into())
         }
         pub fn listen(&self, _: &creamui::AppHandle, _: impl Fn(TrayAction) + 'static) {}
         pub fn update(&self, states: &[DeviceState], threshold: u8) {

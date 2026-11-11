@@ -17,6 +17,12 @@ tauri-winrt-notification = "0.8"
 windows = { version = "0.62", features = ["ApplicationModel", "ApplicationModel_Activation", "Foundation", "Win32_System_WinRT"] }
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Registry", "Win32_System_Threading", "Win32_Security", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_LibraryLoader"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# StatusNotifierItem tray over D-Bus: pure Rust, no GTK.
+ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
+# Same zbus ksni uses; desktop notifications and the autostart portal.
+zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
+
 [build-dependencies]
 # Embeds assets/lowbattery.ico into the exe (windres on mingw, rc.exe on MSVC).
 embed-resource = "3"

@@ -215,7 +215,7 @@ pub use win::Logitech;
 #[cfg(windows)]
 mod win {
     use super::*;
-    use crate::hid::win::{enumerate, open};
+    use crate::hid::native::{enumerate, open};
     use crate::{BatteryProvider, Device};
     use std::collections::BTreeMap;
     use std::sync::Mutex;

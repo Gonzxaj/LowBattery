@@ -1,5 +1,6 @@
 // Modified by Gonzalo Carranza (2026): Pipeline::invalidate_surface and its calls
-// (restore from minimized, WindowHandle::show) - see third_party/README.md.
+// (restore from minimized, WindowHandle::show), and WindowHandle::resize adopting
+// sizes the platform applies at once (Wayland) - see third_party/README.md.
 //! Window creation and the reactive render loop.
 //!
 //! [`run`] opens one window; [`AppBuilder`] opens several, all sharing one
@@ -1785,6 +1786,23 @@ impl WindowHandle {
     pub fn resize(&self, width: u32, height: u32) {
         if let Some(window) = self.window.borrow().as_ref() {
             window.request_inner_size(LogicalSize::new(width as f64, height as f64));
+            // Wayland applies a client-requested size at once and sends no
+            // `Resized`: adopt the new size here, or frames keep the old
+            // surface size and get stretched into the new window.
+            if let Some(pipeline) = self.pipeline.upgrade() {
+                let physical = window.inner_size();
+                let scale = pipeline.scale_factor.peek();
+                let size = Size {
+                    width: (physical.width as f64 / scale) as f32,
+                    height: (physical.height as f64 / scale) as f32,
+                };
+                if size.width > 0.0 && size.height > 0.0 && pipeline.surface.peek() != size {
+                    pipeline.surface.set(size);
+                    pipeline.sync_frame();
+                    pipeline.invalidate_layout();
+                    pipeline.invalidate_surface();
+                }
+            }
         }
     }
 

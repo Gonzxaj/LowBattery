@@ -37,8 +37,9 @@ pub fn read_matching<T>(
     }
 }
 
-#[cfg(windows)]
-pub mod win {
+/// hidapi backend: windows-native on Windows, hidraw on Linux.
+#[cfg(any(windows, target_os = "linux"))]
+pub mod native {
     use super::HidIo;
     use hidapi::{DeviceInfo, HidApi, HidDevice};
     use std::cell::RefCell;
@@ -76,8 +77,20 @@ pub mod win {
         API.with(|cell| {
             let slot = cell.borrow();
             let api = slot.as_ref()?;
-            api.open_path(&c).map(Dev).map_err(|e| log::debug!("open {path}: {e}")).ok()
+            api.open_path(&c).map(Dev).map_err(|e| warn_open(path, &e.to_string())).ok()
         })
+    }
+
+    fn warn_open(path: &str, e: &str) {
+        thread_local! {
+            static WARNED: RefCell<std::collections::HashSet<String>> = RefCell::default();
+        }
+        // Linux hidraw nodes are root-only until the packaged udev rule grants access.
+        if cfg!(target_os = "linux") && e.contains("Permission denied") && WARNED.with(|w| w.borrow_mut().insert(path.to_string())) {
+            log::warn!("no permission to open {path}: install the udev rule 70-lowbattery.rules (see README, Linux)");
+        } else {
+            log::debug!("open {path}: {e}");
+        }
     }
 
     pub struct Dev(HidDevice);

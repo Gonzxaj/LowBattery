@@ -129,13 +129,13 @@ pub fn query(io: &dyn HidIo, m: &Model) -> Option<BatteryStatus> {
     .flatten()
 }
 
-#[cfg(windows)]
-pub use win::SteelSeries;
+#[cfg(any(windows, target_os = "linux"))]
+pub use native::SteelSeries;
 
-#[cfg(windows)]
-mod win {
+#[cfg(any(windows, target_os = "linux"))]
+mod native {
     use super::*;
-    use crate::hid::win::{enumerate, open};
+    use crate::hid::native::{enumerate, open};
     use crate::{BatteryProvider, Device};
 
     #[derive(Default)]

@@ -1,0 +1,42 @@
+# Snap Store (Canonical). Build:  snapcraft   (or: snapcraft remote-build)
+# Publish: snapcraft register lowbattery && snapcraft upload --release=stable lowbattery_*.snap
+name: lowbattery
+title: LowBattery
+base: core24
+adopt-info: lowbattery # version, summary and description from the metainfo
+grade: stable
+confinement: strict
+license: MIT
+platforms:
+  amd64:
+  arm64:
+
+apps:
+  lowbattery:
+    command: bin/lowbattery
+    desktop: usr/share/applications/io.github.gonzxaj.LowBattery.desktop
+    common-id: io.github.gonzxaj.LowBattery
+    # snapd launches this when $SNAP_USER_DATA/.config/autostart/lowbattery.desktop
+    # exists; the app writes that file from "Start at login" (os/linux.rs AUTOSTART_FILE).
+    autostart: lowbattery.desktop
+    # wayland, x11, desktop (notifications), desktop-legacy and the GNOME runtime libs.
+    extensions: [gnome]
+    plugs:
+      - hardware-observe # /sys/class/power_supply: Logitech, Bluetooth, standard HID
+      - unity7 # StatusNotifierItem tray on hosts that route it through unity7
+    # Strict snaps have no plug for /dev/hidraw*, so SteelSeries and Razer
+    # (raw HID) only work in the .deb / tarball / Flatpak builds.
+
+parts:
+  lowbattery:
+    plugin: rust
+    source: .
+    rust-path: [crates/app]
+    build-packages: [pkg-config]
+    parse-info: [usr/share/metainfo/io.github.gonzxaj.LowBattery.metainfo.xml]
+    override-build: |
+      craftctl default
+      ID=io.github.gonzxaj.LowBattery
+      install -Dm644 installer/linux/$ID.desktop -t $CRAFT_PART_INSTALL/usr/share/applications
+      install -Dm644 installer/linux/$ID.metainfo.xml -t $CRAFT_PART_INSTALL/usr/share/metainfo
+      install -Dm644 assets/emblem-tile.png $CRAFT_PART_INSTALL/usr/share/icons/hicolor/256x256/apps/$ID.png

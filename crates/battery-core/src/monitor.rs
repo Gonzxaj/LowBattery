@@ -18,14 +18,23 @@ pub enum Command {
     SetInterval(Duration),
 }
 
+/// Turns what no provider claimed into battery-less cards (see `diag::generic_devices`).
+pub type Fallback = fn(&[Device]) -> Vec<Device>;
+
 pub struct Monitor {
     providers: Vec<Box<dyn BatteryProvider>>,
+    fallback: Option<Fallback>,
     states: BTreeMap<String, DeviceState>,
 }
 
 impl Monitor {
     pub fn new(providers: Vec<Box<dyn BatteryProvider>>) -> Self {
-        Self { providers, states: BTreeMap::new() }
+        Self { providers, fallback: None, states: BTreeMap::new() }
+    }
+
+    pub fn with_fallback(mut self, fallback: Fallback) -> Self {
+        self.fallback = Some(fallback);
+        self
     }
 
     /// One full cycle: discover + read every device, sequentially.
@@ -40,6 +49,10 @@ impl Monitor {
                 let status = provider.read_battery(&device);
                 readings.push((device, status));
             }
+        }
+        if let Some(fallback) = self.fallback {
+            let found: Vec<Device> = readings.iter().map(|(d, _)| d.clone()).collect();
+            readings.extend(fallback(&found).into_iter().map(|d| (d, BatteryStatus::PRESENT)));
         }
         for (device, status) in readings {
             seen.insert(device.id.clone());
@@ -188,6 +201,18 @@ mod tests {
         assert_eq!(a.check(&mk(22, Charge::Discharging), 20).len(), 0); // hysteresis
         assert_eq!(a.check(&mk(19, Charge::Charging), 20).len(), 0);
         assert_eq!(a.check(&mk(18, Charge::Discharging), 20).len(), 1);
+    }
+
+    #[test]
+    fn fallback_adds_unclaimed_devices_as_present() {
+        let script = vec![Some(BatteryStatus::connected(55, Charge::Discharging))];
+        let mut m = Monitor::new(vec![Box::new(Scripted(Mutex::new(script)))]).with_fallback(|found| {
+            assert_eq!(found.len(), 1, "fallback sees what providers found");
+            vec![Device { id: "g".into(), provider: "generic", ..dev() }]
+        });
+        let states = m.poll();
+        let g = states.iter().find(|s| s.device.id == "g").unwrap();
+        assert_eq!(g.status, BatteryStatus::PRESENT);
     }
 
     #[test]

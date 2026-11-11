@@ -1,0 +1,14 @@
+# LowBattery: lets the logged-in user (uaccess) open the hidraw nodes of the
+# vendors it queries directly. Logitech, Bluetooth and standard HID batteries
+# are read from /sys/class/power_supply and need no rule.
+# Must sort before 73-seat-late.rules, which applies the uaccess tag.
+# KERNELS matches the HID node (BUS:VID:PID.N), so USB and Bluetooth both work.
+
+# SteelSeries
+KERNEL=="hidraw*", KERNELS=="*:1038:*", TAG+="uaccess"
+# Razer
+KERNEL=="hidraw*", KERNELS=="*:1532:*", TAG+="uaccess"
+# Keyboards with the FF1C:0092 battery channel (Telink/Evision firmware:
+# FEKER, VGN, Rainy...). udev can't match a HID collection, so each VID
+# using that firmware needs its own line here.
+KERNEL=="hidraw*", KERNELS=="*:320F:*", TAG+="uaccess"

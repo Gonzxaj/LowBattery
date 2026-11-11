@@ -13,3 +13,11 @@
 *.mp4
 
 /docs
+# Flatpak / Snap build outputs
+/build-flatpak
+/.flatpak-builder
+/installer/flatpak/cargo-sources.json
+/parts
+/stage
+/prime
+*.snap

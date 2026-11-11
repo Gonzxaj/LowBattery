@@ -118,7 +118,7 @@ mod win {
         fn discover(&self) -> Vec<Device> {
             let mut caps = self.caps.lock().unwrap();
             let mut out: Vec<Device> = Vec::new();
-            for d in crate::hid::win::enumerate() {
+            for d in crate::hid::native::enumerate() {
                 if crate::diag::VENDORS.contains(&d.vendor_id()) {
                     continue;
                 }
@@ -148,7 +148,7 @@ mod win {
                 });
             }
             // Forget unplugged paths so the cache can't grow forever.
-            let present: std::collections::HashSet<String> = crate::hid::win::enumerate().iter().map(|d| d.path().to_string_lossy().into_owned()).collect();
+            let present: std::collections::HashSet<String> = crate::hid::native::enumerate().iter().map(|d| d.path().to_string_lossy().into_owned()).collect();
             caps.retain(|p, _| present.contains(p));
             out
         }

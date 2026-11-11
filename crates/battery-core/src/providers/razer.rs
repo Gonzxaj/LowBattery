@@ -101,13 +101,13 @@ pub fn read(io: &dyn crate::hid::HidIo, txn: u8) -> Option<BatteryStatus> {
     Some(BatteryStatus::connected(level, charge))
 }
 
-#[cfg(windows)]
-pub use win::Razer;
+#[cfg(any(windows, target_os = "linux"))]
+pub use native::Razer;
 
-#[cfg(windows)]
-mod win {
+#[cfg(any(windows, target_os = "linux"))]
+mod native {
     use super::*;
-    use crate::hid::win::{enumerate, open};
+    use crate::hid::native::{enumerate, open};
     use crate::{BatteryProvider, Device};
     use std::collections::BTreeMap;
     use std::sync::Mutex;

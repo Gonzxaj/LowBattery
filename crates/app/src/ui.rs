@@ -283,7 +283,9 @@ fn devices(app: &App, p: &Palette, cfg: &Config, width: f32) -> BoxedWidget {
                 )),
         ));
     }
-    for s in states.iter() {
+    // Battery-less generic cards go last.
+    let generic = |s: &&DeviceState| s.device.provider == battery_core::diag::GENERIC;
+    for s in states.iter().filter(|s| !generic(s)).chain(states.iter().filter(generic)) {
         col = col.child(device_card(app, p, cfg, s, width));
     }
     Box::new(col)
@@ -344,6 +346,9 @@ fn device_card(app: &App, p: &Palette, cfg: &Config, s: &DeviceState, width: f32
     let card_bg = if low { p.card.mix(p.low, 0.06) } else { p.card };
     let inner = width - 32.0;
     let l = cfg.lang;
+    // Cheap receivers with no battery channel: the card only says they're there.
+    let generic = s.device.provider == battery_core::diag::GENERIC;
+    let bright = live || (generic && s.status.link == Link::Connected);
 
     let badge = Flex::row()
         .size(40.0, 40.0)
@@ -356,7 +361,7 @@ fn device_card(app: &App, p: &Palette, cfg: &Config, s: &DeviceState, width: f32
     let title = Flex::column()
         .grow(1.0)
         .gap(3.0)
-        .child(Box::new(Text::new(s.device.name.clone()).font_size(15.0).bold(true).color(if live { p.text } else { p.muted })))
+        .child(Box::new(Text::new(s.device.name.clone()).font_size(15.0).bold(true).color(if bright { p.text } else { p.muted })))
         .child(text(format!("{} · {}", s.device.vendor, kind_label(l, s.device.kind)), 12.0, p.muted));
 
     let figure: BoxedWidget = match level {
@@ -367,6 +372,7 @@ fn device_card(app: &App, p: &Palette, cfg: &Config, s: &DeviceState, width: f32
                 .child(Box::new(Text::new(l.to_string()).font_size(30.0).bold(true).color(tone)))
                 .child(Box::new(Flex::column().padding("0 0 5px 0").child(text("%", 13.0, p.muted)))),
         ),
+        None if generic => Box::new(Flex::row()),
         None => text("—", 26.0, p.muted),
     };
 
@@ -378,22 +384,34 @@ fn device_card(app: &App, p: &Palette, cfg: &Config, s: &DeviceState, width: f32
         (Link::Disconnected, _, _) => (p.muted, l.t("Disconnected", "Desconectado")),
     };
     let when = match (live, s.last_level) {
+        _ if generic => String::new(),
         (false, Some(v)) => format!("· {} {v}% · {}", l.t("last", "último"), ago(l, s.last_read)),
         _ => format!("· {}", ago(l, s.last_read)),
     };
 
     // Fixed row heights: text in flex rows is otherwise measured at min-content
     // width (wrapped per word) and inflates the card with empty space.
-    let footer = Flex::row()
+    let mut footer = Flex::row()
         .full_width()
         .height(26.0)
         .align(Align::Center)
         .gap(7.0)
         .child(dot(state_color))
-        .child(text(state, 12.0, if live { p.text } else { p.muted }))
+        .child(text(state, 12.0, if bright { p.text } else { p.muted }))
         .child(text(when, 12.0, p.muted))
-        .child(spacer())
-        .child(widget_pill(app, p, l, s.device.id.clone(), !cfg.widget.hidden.contains(&s.device.id)));
+        .child(spacer());
+    if !generic {
+        footer = footer.child(widget_pill(app, p, l, s.device.id.clone(), !cfg.widget.hidden.contains(&s.device.id)));
+    }
+    let (middle, middle_h): (BoxedWidget, f32) = if generic {
+        let note = l.t(
+            "Generic receiver: it reports no battery, only that it's connected.",
+            "Receptor genérico: no informa la batería, solo que está conectado.",
+        );
+        (text(note, 12.0, p.muted), 14.0)
+    } else {
+        (cells(inner, level, tone, p.line), 8.0)
+    };
 
     Box::new(
         Flex::column()
@@ -401,7 +419,7 @@ fn device_card(app: &App, p: &Palette, cfg: &Config, s: &DeviceState, width: f32
             .shrink(0.0)
             // shortcut: explicit height (sum of parts) because creamui 0.3 over-measures
             // this column; drop it once its layout reports the real content height.
-            .height(16.0 + 42.0 + 14.0 + 8.0 + 14.0 + 26.0 + 16.0)
+            .height(16.0 + 42.0 + 14.0 + middle_h + 14.0 + 26.0 + 16.0)
             .padding(16.0)
             .gap(14.0)
             .background(card_bg)
@@ -410,7 +428,7 @@ fn device_card(app: &App, p: &Palette, cfg: &Config, s: &DeviceState, width: f32
             .child(Box::new(
                 Flex::row().full_width().height(42.0).align(Align::Center).gap(12.0).child(Box::new(badge)).child(Box::new(title)).child(figure),
             ))
-            .child(cells(inner, level, tone, p.line))
+            .child(middle)
             .child(Box::new(footer)),
     )
 }
@@ -524,12 +542,12 @@ fn settings(app: &App, p: &Palette, cfg: &Config, _width: f32) -> BoxedWidget {
                     row(
                         p,
                         l.t("Notifications", "Notificaciones"),
-                        l.t("Windows notification once per discharge", "Aviso de Windows una vez por descarga").into(),
+                        if cfg!(windows) { l.t("Windows notification once per discharge", "Aviso de Windows una vez por descarga") } else { l.t("Desktop notification once per discharge", "Aviso del escritorio una vez por descarga") }.into(),
                         switch(app, cfg.notify, |c| c.notify = !c.notify),
                     ),
                     row(
                         p,
-                        l.t("Start with Windows", "Iniciar con Windows"),
+                        if cfg!(windows) { l.t("Start with Windows", "Iniciar con Windows") } else { l.t("Start at login", "Iniciar con la sesión") },
                         l.t("Starts minimized to the tray", "Arranca minimizado en la bandeja").into(),
                         switch(app, cfg.autostart, |c| c.autostart = !c.autostart),
                     ),
@@ -584,7 +602,12 @@ pub fn widget_height(rows: usize) -> u32 {
 
 pub fn widget_rows(app: &App) -> Vec<DeviceState> {
     let cfg = app.config.get();
-    app.devices.get().into_iter().filter(|s| !cfg.widget.hidden.contains(&s.device.id)).collect()
+    app.devices
+        .get()
+        .into_iter()
+        // Battery-less generic cards have nothing to show in the widget.
+        .filter(|s| s.device.provider != battery_core::diag::GENERIC && !cfg.widget.hidden.contains(&s.device.id))
+        .collect()
 }
 
 pub fn widget(app: &App, view: Size) -> BoxedWidget {
@@ -611,7 +634,8 @@ pub fn widget(app: &App, view: Size) -> BoxedWidget {
                 .height(WIDGET_ROW)
                 .gap(8.0)
                 .align(Align::Center)
-                .child(Box::new(Flex::row().grow(1.0).child(text(ellipsize(&s.device.name, 17), 12.0, if live { p.text } else { p.muted }))))
+                .child(Box::new(crate::icons::device_icon(s.device.kind, if live { p.text } else { p.muted }, 14.0)))
+                .child(Box::new(Flex::row().grow(1.0).child(text(ellipsize(&s.device.name, 16), 12.0, if live { p.text } else { p.muted }))))
                 .child(bar(44.0, 4.0, level, if charging { p.accent } else { color }, p.line))
                 .child(Box::new(
                     Flex::row()

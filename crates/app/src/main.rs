@@ -1,5 +1,6 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod icons;
 mod logfile;
 mod os;
 mod ui;
@@ -115,19 +116,33 @@ impl App {
         let cfg = self.config.get();
         let ready = self.main_win.clone();
         let app = self.clone();
+        let quit = self.clone();
         handle.append_window(
             WindowOptions {
                 title: "lowbattery".into(),
                 width: 460,
                 height: 640,
                 theme: ui::Palette::get(cfg.dark).theme(cfg.dark),
-                // Closing hides to the tray; the process lives on.
-                close_behavior: CloseBehavior::Hide,
+                // Windows hides to the tray. Wayland can't hide or unminimize a
+                // window (winit's set_visible is a no-op there), so Linux closes
+                // it for real and the tray's "Open" builds a new one.
+                close_behavior: if cfg!(windows) { CloseBehavior::Hide } else { CloseBehavior::Close },
                 ..Default::default()
             },
             ui::Palette::get(cfg.dark).bg,
             move |w| {
                 os::set_window_icons();
+                // No tray to come back from: closing the window quits.
+                let quit = quit.clone();
+                w.on_close_requested(move || {
+                    if quit.tray.borrow().is_none() {
+                        log::info!("main window closed without a tray; quitting");
+                        if let Some(h) = quit.handle.borrow().as_ref() {
+                            h.exit();
+                        }
+                    }
+                    true
+                });
                 *ready.borrow_mut() = Some(w)
             },
             move |size| ui::main_window(&app, size),
@@ -241,6 +256,8 @@ fn main() {
         provider_list.iter().map(|p| p.name()).collect::<Vec<_>>()
     );
     let monitor = Monitor::new(provider_list);
+    // Demo stays fully simulated: no real "connected, no battery" cards.
+    let monitor = if demo { monitor } else { monitor.with_fallback(battery_core::diag::generic_devices) };
 
     let app = App {
         config: Signal::new(config),
@@ -256,6 +273,10 @@ fn main() {
         widget_win: Rc::default(),
         tray: Rc::default(),
     };
+
+    // Lets GNOME/KDE docks match our windows to the .desktop file (name, icon).
+    #[cfg(target_os = "linux")]
+    creamui::platform::set_app_id(os::APP_ID);
 
     AppBuilder::new()
         .keep_running()

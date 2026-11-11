@@ -1,11 +1,13 @@
 # lowbattery
 
-Monitor de batería de periféricos inalámbricos para Windows 10/11, escrito en Rust con UI nativa [CreamUI](https://github.com/sammwyy/creamui). Corre en un solo proceso, no instala servicios, no hace telemetría y no necesita permisos de administrador ni el software del fabricante.
+Monitor de batería de periféricos inalámbricos para Windows 10/11 y Linux, escrito en Rust con UI nativa [CreamUI](https://github.com/sammwyy/creamui). Corre en un solo proceso, no instala servicios, no hace telemetría y no necesita permisos de administrador ni el software del fabricante.
 
 - **Bluetooth estándar:** lee el mismo nivel que muestra Ajustes de Windows.
 - **Logitech HID++ 2.0:** receptores Unifying, Bolt y Lightspeed, y conexión directa.
 - **SteelSeries:** Aerox, Prime, Rival 3 Wireless, Arctis 7/7P/7+/Nova 5/Nova 7/Nova Pro Wireless.
 - **Razer:** mouse y teclados inalámbricos y sus dongles, sin tabla de modelos.
+- **Teclados con canal de batería `FF1C:0092`, de cualquier marca:** firmware Telink/Evision que venden FEKER, VGN, Rainy y otras. Se reconocen por ese canal, no por marca, tanto por 2.4G como por cable, con nivel y carga. Hay una sola tarjeta por teclado, use el cable o el receptor.
+- **Receptores 2.4G genéricos sin batería** (por ejemplo YICHIP): aparecen como conectados, con una nota de que no informan la batería, y no se muestran en el widget.
 - **Cualquier marca:** dispositivos HID que declaran el uso estándar "Battery Strength".
 - **Tray:** el ícono muestra el nivel más bajo y el tooltip lista todos los dispositivos. Avisa con un toast de Windows cuando un dispositivo llega a batería baja.
 - **Widget flotante:** sin bordes, con opacidad configurable, opción de siempre visible y selección de qué dispositivos mostrar.
@@ -59,6 +61,29 @@ Diferencias cuando la app corre empaquetada:
 - `--demo`: usa dispositivos simulados, sin hardware.
 - `--debug`: registro detallado.
 - Configuración: `%APPDATA%\LowBattery\config.json` (empaquetada: ver arriba).
+
+## Linux
+
+```sh
+./build.sh linux   # dist/lowbattery_<ver>_amd64.deb y dist/lowbattery-<ver>-linux-amd64.tar.gz
+```
+
+- **`.deb` (Ubuntu, Debian, Mint, Pop!_OS):** `sudo apt install ./dist/lowbattery_*_amd64.deb`. Instala también la regla udev.
+- **`.tar.gz` (cualquier distro):** descomprimir y correr `sudo ./install.sh`, que instala en `/usr/local`. Para desinstalar: `sudo ./install.sh --uninstall`.
+- **Requisitos:** glibc 2.35 o superior (Ubuntu 22.04+, Debian 12+, Fedora 36+) y X11 o Wayland.
+
+Qué cambia respecto de Windows:
+- **Logitech, Bluetooth y HID estándar:** se leen de `/sys/class/power_supply`, que publica el kernel (drivers `hid-logitech-hidpp` y `hid-input`). No necesita permisos.
+- **SteelSeries, Razer y teclados `FF1C`:** se leen por `/dev/hidraw*`, que es solo de root hasta instalar `installer/linux/70-lowbattery.rules`. Los paquetes la instalan. Si falta, el log muestra `no permission to open /dev/hidrawN`.
+- **Tray:** usa StatusNotifierItem. Anda en KDE, XFCE, Cinnamon y en el GNOME de Ubuntu. En GNOME sin modificar hace falta la extensión *AppIndicator*; sin tray, la ventana principal queda visible.
+- **Wayland:** el protocolo no permite que una app elija la posición de su ventana ni la ponga siempre visible, así que esas opciones del widget solo funcionan en X11.
+- **Config y log:** `~/.config/LowBattery/`.
+
+### Snap Store y Flathub
+
+- **Snap:** `snap/snapcraft.yaml`. Se compila con `snapcraft` y se publica con `snapcraft register lowbattery` y `snapcraft upload --release=stable`. El confinamiento strict no da acceso a hidraw, así que en el snap solo funcionan Logitech, Bluetooth y HID estándar.
+- **Flathub:** `installer/flatpak/io.github.gonzxaj.LowBattery.yml`. Primero correr `installer/flatpak/gen-sources.sh` (genera `cargo-sources.json`) y después `flatpak-builder --user --install build-flatpak installer/flatpak/io.github.gonzxaj.LowBattery.yml`. Para publicar se abre un PR en `flathub/flathub` con el manifest (con source `git` y tag) y `cargo-sources.json`. SteelSeries y Razer igual necesitan la regla udev instalada en el sistema.
+- **Metadatos compartidos:** `installer/linux/` tiene el `.desktop`, el metainfo de AppStream (Flathub exige al menos una captura: `assets/screenshots/devices.png`), el ícono y la regla udev.
 
 ## Registro y periféricos que no aparecen
 

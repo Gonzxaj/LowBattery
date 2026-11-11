@@ -1,0 +1,2537 @@
+use crate::{
+    BackendKind, BlurRegion, CompositorControls, CompositorIntegrationMode,
+    CompositorIntegrationRequest, ControlFlow, CursorIcon, DecorationNegotiation, DragIcon, Key,
+    KeyEvent, LogicalPosition, LogicalSize, Modifiers, MouseButton, MouseScrollDelta,
+    PhysicalPosition, PhysicalSize, PlatformBackend, PlatformWindow, PopupOptions, ResizeDirection,
+    WindowAttributes, WindowDecorations, WindowEvent, WindowId, WindowLevel, WindowRole,
+};
+use raw_window_handle::{
+    DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, RawDisplayHandle,
+    RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle, WindowHandle,
+};
+use smithay_client_toolkit::{
+    compositor::{CompositorHandler, CompositorState, Surface, SurfaceData},
+    data_device_manager::{
+        data_device::{DataDevice, DataDeviceData, DataDeviceHandler},
+        data_offer::{DataOfferHandler, DragOffer},
+        data_source::{DataSourceHandler, DragSource},
+        DataDeviceManagerState, WritePipe,
+    },
+    globals::GlobalData,
+    output::{Mode, OutputHandler, OutputState},
+    reexports::{
+        client::{
+            globals::registry_queue_init,
+            protocol::{
+                wl_data_device, wl_data_device_manager::DndAction, wl_data_source, wl_display,
+                wl_keyboard, wl_output, wl_pointer, wl_region, wl_seat, wl_shm, wl_surface,
+            },
+            Connection, Dispatch, Proxy, QueueHandle, WEnum,
+        },
+        csd_frame::WindowState,
+        protocols::{
+            wp::cursor_shape::v1::client::{
+                wp_cursor_shape_device_v1::{Shape, WpCursorShapeDeviceV1},
+                wp_cursor_shape_manager_v1::WpCursorShapeManagerV1,
+            },
+            xdg::shell::client::{xdg_surface, xdg_toplevel::ResizeEdge},
+        },
+    },
+    registry::{ProvidesRegistryState, RegistryState},
+    seat::pointer::cursor_shape::CursorShapeManager,
+    shell::{
+        xdg::{
+            popup::{Popup, PopupConfigure, PopupHandler},
+            window::{
+                DecorationMode, Window as XdgWindow, WindowConfigure,
+                WindowDecorations as XdgDecorations, WindowHandler,
+            },
+            XdgPositioner, XdgShell, XdgSurface,
+        },
+        WaylandSurface,
+    },
+    shm::{slot::SlotPool, Shm, ShmHandler},
+};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    ffi::c_void,
+    marker::PhantomData,
+    os::fd::AsRawFd,
+    ptr::NonNull,
+    sync::{
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        Arc, Mutex,
+    },
+    time::{Duration, Instant},
+};
+use wayland_protocols_wlr::layer_shell::v1::client::{
+    zwlr_layer_shell_v1::{Layer, ZwlrLayerShellV1},
+    zwlr_layer_surface_v1::{Anchor, KeyboardInteractivity, ZwlrLayerSurfaceV1},
+};
+use xkbcommon::xkb;
+
+mod blur;
+mod integration;
+mod shortcuts;
+
+const USER_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(8);
+
+pub trait ApplicationHandler<T: 'static> {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop<'_>);
+    fn suspended(&mut self, _event_loop: &ActiveEventLoop<'_>) {}
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop<'_>,
+        window_id: WindowId,
+        event: WindowEvent,
+    );
+    fn user_event(&mut self, event_loop: &ActiveEventLoop<'_>, event: T);
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop<'_>);
+}
+
+#[derive(Default)]
+struct LoopState {
+    exit: AtomicBool,
+    control_flow: Mutex<ControlFlow>,
+}
+
+pub struct EventLoop<T: 'static> {
+    events: Arc<Mutex<Vec<T>>>,
+    state: Arc<LoopState>,
+}
+
+pub struct EventLoopBuilder<T: 'static> {
+    marker: PhantomData<T>,
+}
+
+pub struct EventLoopProxy<T: 'static> {
+    events: Arc<Mutex<Vec<T>>>,
+}
+
+impl<T: 'static> EventLoop<T> {
+    pub fn with_user_event() -> EventLoopBuilder<T> {
+        EventLoopBuilder {
+            marker: PhantomData,
+        }
+    }
+
+    pub fn create_proxy(&self) -> EventLoopProxy<T> {
+        EventLoopProxy {
+            events: self.events.clone(),
+        }
+    }
+
+    pub fn set_control_flow(&self, control_flow: ControlFlow) {
+        *self
+            .state
+            .control_flow
+            .lock()
+            .expect("control flow lock poisoned") = control_flow;
+    }
+
+    pub fn run_app<H: ApplicationHandler<T>>(self, handler: &mut H) -> Result<(), String> {
+        let connection = Connection::connect_to_env().map_err(|error| error.to_string())?;
+        self.run_app_on_connection(handler, connection)
+    }
+
+    fn run_app_on_connection<H: ApplicationHandler<T>>(
+        self,
+        handler: &mut H,
+        connection: Connection,
+    ) -> Result<(), String> {
+        let (globals, mut event_queue) =
+            registry_queue_init::<DispatchState>(&connection).map_err(|error| error.to_string())?;
+        let queue_handle = event_queue.handle();
+        let compositor =
+            CompositorState::bind(&globals, &queue_handle).map_err(|error| error.to_string())?;
+        let xdg_shell =
+            XdgShell::bind(&globals, &queue_handle).map_err(|error| error.to_string())?;
+        let cursor_shape_manager = CursorShapeManager::bind(&globals, &queue_handle).ok();
+        let layer_shell = globals.bind(&queue_handle, 1..=5, ()).ok();
+        let blur = blur::BlurBackend::bind(&globals, &queue_handle);
+        let integration = integration::IntegrationBackend::bind(&globals, &queue_handle);
+        let seat: Option<wl_seat::WlSeat> = globals.bind(&queue_handle, 1..=9, ()).ok();
+        let data_device_manager = DataDeviceManagerState::bind(&globals, &queue_handle).ok();
+        let data_device = data_device_manager
+            .as_ref()
+            .zip(seat.as_ref())
+            .map(|(manager, seat)| manager.get_data_device(&queue_handle, seat));
+        let shm = Shm::bind(&globals, &queue_handle).map_err(|error| error.to_string())?;
+        // Big enough for most drag icons without a mid-drag pool grow;
+        // `SlotPool` reuses freed slots across drags either way.
+        let icon_pool = SlotPool::new(256 * 256 * 4, &shm).map_err(|error| error.to_string())?;
+        let runtime = Runtime::new(
+            compositor,
+            xdg_shell,
+            connection.clone(),
+            seat,
+            cursor_shape_manager,
+            layer_shell,
+            blur,
+            integration,
+            data_device_manager,
+            data_device,
+            icon_pool,
+        );
+        let output_state = OutputState::new(&globals, &queue_handle);
+        runtime.borrow_mut().shortcuts =
+            shortcuts::ShortcutInhibition::bind(&globals, &queue_handle);
+        let mut dispatch = DispatchState {
+            runtime: runtime.clone(),
+            shm,
+            registry: RegistryState::new(&globals),
+            outputs: output_state,
+        };
+        let active = ActiveEventLoop {
+            runtime: &runtime,
+            queue_handle: &queue_handle,
+            state: &self.state,
+        };
+        handler.resumed(&active);
+
+        let mut user_events = Vec::new();
+        let mut window_events = Vec::new();
+        while !self.state.exit.load(Ordering::Acquire) {
+            handler.about_to_wait(&active);
+            std::mem::swap(
+                &mut user_events,
+                &mut self.events.lock().expect("user event queue lock poisoned"),
+            );
+            for event in user_events.drain(..) {
+                handler.user_event(&active, event);
+            }
+            runtime.borrow_mut().close_requested();
+            runtime.borrow_mut().apply_window_state_requests();
+            runtime.borrow_mut().apply_cursor_requests();
+            runtime.borrow_mut().apply_interactive_requests();
+            runtime.borrow_mut().apply_drag_requests(&queue_handle);
+            runtime.borrow_mut().apply_blur_requests(&queue_handle);
+            runtime.borrow_mut().apply_shortcut_requests(&queue_handle);
+            runtime
+                .borrow_mut()
+                .apply_integration_requests(&queue_handle);
+            {
+                let mut runtime = runtime.borrow_mut();
+                let completed = std::mem::take(
+                    &mut *runtime
+                        .dropped_files
+                        .lock()
+                        .expect("drop queue lock poisoned"),
+                );
+                runtime.events.extend(
+                    completed
+                        .into_iter()
+                        .filter(|result| !result.paths.is_empty())
+                        .map(|result| {
+                            (
+                                result.window_id,
+                                WindowEvent::FilesDroppedAt {
+                                    paths: result.paths,
+                                    position: result.position,
+                                },
+                            )
+                        }),
+                );
+            }
+            dispatch_redraws(&runtime);
+            let timeout = timeout_for(&self.state);
+            dispatch_with_timeout(&connection, &mut event_queue, timeout, &mut dispatch)?;
+            std::mem::swap(&mut window_events, &mut runtime.borrow_mut().events);
+            for (window_id, event) in window_events.drain(..) {
+                handler.window_event(&active, window_id, event);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<T: 'static> EventLoopBuilder<T> {
+    #[cfg(target_os = "linux")]
+    pub fn with_any_thread(&mut self, _any_thread: bool) {}
+
+    pub fn build(self) -> Result<EventLoop<T>, String> {
+        Ok(EventLoop {
+            events: Arc::new(Mutex::new(Vec::new())),
+            state: Arc::new(LoopState::default()),
+        })
+    }
+}
+
+impl<T: 'static> Clone for EventLoopProxy<T> {
+    fn clone(&self) -> Self {
+        Self {
+            events: self.events.clone(),
+        }
+    }
+}
+
+impl<T: 'static> EventLoopProxy<T> {
+    pub fn send_event(&self, event: T) -> Result<(), String> {
+        self.events
+            .lock()
+            .map_err(|_| "user event queue lock poisoned".to_owned())?
+            .push(event);
+        Ok(())
+    }
+}
+
+pub struct ActiveEventLoop<'a> {
+    runtime: &'a RcRuntime,
+    queue_handle: &'a QueueHandle<DispatchState>,
+    state: &'a Arc<LoopState>,
+}
+
+impl ActiveEventLoop<'_> {
+    pub fn create_window(
+        &self,
+        attributes: WindowAttributes,
+    ) -> Result<Arc<dyn PlatformWindow>, String> {
+        let id = WindowId::next();
+        let mut runtime = self.runtime.borrow_mut();
+        if runtime.layer_shell.is_some()
+            && matches!(
+                attributes.role,
+                WindowRole::Desktop
+                    | WindowRole::Overlay
+                    | WindowRole::TopPanel
+                    | WindowRole::BottomPanel
+                    | WindowRole::LeftPanel
+                    | WindowRole::RightPanel
+            )
+        {
+            return create_layer_window(&mut runtime, self.queue_handle, id, attributes);
+        }
+        let surface = runtime.compositor.create_surface(self.queue_handle);
+        let decorations = if attributes.decorations {
+            XdgDecorations::RequestServer
+        } else {
+            XdgDecorations::None
+        };
+        let window = runtime
+            .xdg_shell
+            .create_window(surface, decorations, self.queue_handle);
+        window.set_title(attributes.title);
+        if let Some(app_id) = std::env::current_exe()
+            .ok()
+            .and_then(|path| application_id(&path))
+        {
+            window.set_app_id(app_id);
+        }
+        let (minimum, maximum) = window_size_limits(attributes.size, attributes.resizable);
+        window.set_min_size(Some(minimum));
+        window.set_max_size(maximum);
+        window.commit();
+        let handle = Arc::new(Window::new(
+            id,
+            window.wl_surface().clone(),
+            runtime.connection.clone(),
+            runtime.input_serial.clone(),
+            runtime.close_requests.clone(),
+            runtime.window_state_requests.clone(),
+            runtime.cursor_requests.clone(),
+            runtime.drag_requests.clone(),
+            runtime.interactive_requests.clone(),
+            runtime.blur_requests.clone(),
+            runtime.integration_requests.clone(),
+            runtime.output_refresh.clone(),
+            runtime.shortcut_queue(),
+            attributes.size,
+            false,
+        ));
+        *handle.decorations.lock().expect("decoration lock poisoned") =
+            DecorationNegotiation::new(attributes.decorations);
+        runtime.windows.insert(
+            id,
+            NativeWindow::Toplevel {
+                window,
+                handle: handle.clone(),
+            },
+        );
+        Ok(handle)
+    }
+
+    pub fn create_popup(
+        &self,
+        attributes: WindowAttributes,
+        popup_options: PopupOptions,
+    ) -> Result<Arc<dyn PlatformWindow>, String> {
+        let id = WindowId::next();
+        let mut runtime = self.runtime.borrow_mut();
+        runtime.close_requested();
+        let parent = runtime
+            .windows
+            .get(&popup_options.parent)
+            .ok_or_else(|| "popup parent no longer exists".to_owned())?
+            .popup_parent();
+        let geometry = super::PopupPositioner::from_popup(&popup_options, attributes.size);
+        let grab = popup_options
+            .input_serial
+            .zip(runtime.seat.as_ref())
+            .map(|(serial, seat)| (seat, serial));
+        let popup = match parent {
+            PopupParent::Xdg(parent) => super::create_popup(
+                &parent,
+                geometry,
+                self.queue_handle,
+                &runtime.compositor,
+                &runtime.xdg_shell,
+                grab,
+            )
+            .map_err(|error| error.to_string())?,
+            PopupParent::Layer(parent) => create_layer_popup(
+                &parent,
+                geometry,
+                self.queue_handle,
+                &runtime.compositor,
+                &runtime.xdg_shell,
+                grab,
+            )
+            .map_err(|error| error.to_string())?,
+        };
+        let handle = Arc::new(Window::new(
+            id,
+            popup.wl_surface().clone(),
+            runtime.connection.clone(),
+            runtime.input_serial.clone(),
+            runtime.close_requests.clone(),
+            runtime.window_state_requests.clone(),
+            runtime.cursor_requests.clone(),
+            runtime.drag_requests.clone(),
+            runtime.interactive_requests.clone(),
+            runtime.blur_requests.clone(),
+            runtime.integration_requests.clone(),
+            runtime.output_refresh.clone(),
+            runtime.shortcut_queue(),
+            attributes.size,
+            false,
+        ));
+        handle.is_popup.store(true, Ordering::Release);
+        runtime.windows.insert(
+            id,
+            NativeWindow::Popup {
+                popup,
+                geometry,
+                handle: handle.clone(),
+            },
+        );
+        Ok(handle)
+    }
+
+    pub fn exit(&self) {
+        self.state.exit.store(true, Ordering::Release);
+    }
+
+    pub fn set_control_flow(&self, control_flow: ControlFlow) {
+        *self
+            .state
+            .control_flow
+            .lock()
+            .expect("control flow lock poisoned") = control_flow;
+    }
+}
+
+impl PlatformBackend for ActiveEventLoop<'_> {
+    fn kind(&self) -> BackendKind {
+        BackendKind::Wayland
+    }
+
+    fn create_window(
+        &self,
+        attributes: WindowAttributes,
+    ) -> Result<Arc<dyn PlatformWindow>, String> {
+        Self::create_window(self, attributes)
+    }
+
+    fn create_popup(
+        &self,
+        attributes: WindowAttributes,
+        popup: PopupOptions,
+    ) -> Result<Arc<dyn PlatformWindow>, String> {
+        Self::create_popup(self, attributes, popup)
+    }
+}
+
+type RcRuntime = std::rc::Rc<RefCell<Runtime>>;
+type ShortcutRequests = Arc<Mutex<Vec<(WindowId, bool)>>>;
+
+struct Runtime {
+    compositor: CompositorState,
+    xdg_shell: XdgShell,
+    seat: Option<wl_seat::WlSeat>,
+    pointer: Option<wl_pointer::WlPointer>,
+    keyboard: Option<wl_keyboard::WlKeyboard>,
+    xkb_context: xkb::Context,
+    xkb_state: Option<xkb::State>,
+    cursor_shape_manager: Option<CursorShapeManager>,
+    layer_shell: Option<ZwlrLayerShellV1>,
+    blur: Option<blur::BlurBackend>,
+    blur_requests: Arc<Mutex<Vec<BlurRequest>>>,
+    integration: Option<integration::IntegrationBackend>,
+    integration_requests: Arc<Mutex<Vec<IntegrationRequest>>>,
+    shortcuts: Option<shortcuts::ShortcutInhibition>,
+    shortcut_requests: ShortcutRequests,
+    cursor_shape_device: Option<WpCursorShapeDeviceV1>,
+    cursor_serial: Option<u32>,
+    pointer_focus: Option<WindowId>,
+    last_pointer_target: Option<WindowId>,
+    pointer_over_passthrough: bool,
+    keyboard_focus: Option<WindowId>,
+    close_requests: Arc<Mutex<Vec<WindowId>>>,
+    window_state_requests: Arc<Mutex<HashMap<WindowId, WindowStateRequest>>>,
+    cursor_requests: Arc<Mutex<Vec<(WindowId, CursorIcon)>>>,
+    windows: HashMap<WindowId, NativeWindow>,
+    output_refresh: Arc<Mutex<HashMap<wl_output::WlOutput, Duration>>>,
+    events: Vec<(WindowId, WindowEvent)>,
+    data_device_manager: Option<DataDeviceManagerState>,
+    data_device: Option<DataDevice>,
+    /// Dropping a [`DragSource`] cancels it, so this stays alive until the
+    /// compositor reports the drag cancelled or finished.
+    active_drag: Option<DragSource>,
+    drag_origin: Option<WindowId>,
+    drag_position: PhysicalPosition,
+    drag_payload: HashMap<String, Vec<u8>>,
+    dropped_files: Arc<Mutex<Vec<FileDropResult>>>,
+    /// Window currently under the drag pointer, if any.
+    drag_target: Option<WindowId>,
+    drag_requests: Arc<Mutex<Vec<DragRequest>>>,
+    interactive_requests: Arc<Mutex<Vec<InteractiveRequest>>>,
+    icon_pool: SlotPool,
+    connection: Connection,
+    input_serial: Arc<Mutex<Option<crate::InputSerial>>>,
+}
+
+struct FileDropResult {
+    window_id: WindowId,
+    paths: Vec<std::path::PathBuf>,
+    position: PhysicalPosition,
+}
+
+/// Queued by [`Window::start_drag`], drained by [`Runtime::apply_drag_requests`].
+struct DragRequest {
+    window_id: WindowId,
+    serial: u32,
+    mime_types: Vec<String>,
+    data: Vec<(String, Vec<u8>)>,
+    icon: Option<DragIcon>,
+}
+
+struct InteractiveRequest {
+    window_id: WindowId,
+    serial: u32,
+    /// `None` means move; otherwise resize the specified edges.
+    resize: Option<ResizeDirection>,
+}
+
+#[derive(Default)]
+struct WindowStateRequest {
+    popup_size: Option<LogicalSize>,
+    minimum: Option<Option<(u32, u32)>>,
+    title: Option<String>,
+    maximized: Option<bool>,
+    minimize: bool,
+}
+
+fn window_size_limits(size: LogicalSize, resizable: bool) -> ((u32, u32), Option<(u32, u32)>) {
+    if resizable {
+        // The initial size is not the minimum size of a resizable window.
+        ((1, 1), None)
+    } else {
+        let fixed = (
+            size.width.ceil().max(1.0) as u32,
+            size.height.ceil().max(1.0) as u32,
+        );
+        (fixed, Some(fixed))
+    }
+}
+
+fn panel_dimensions(role: WindowRole, size: LogicalSize) -> (u32, u32, i32) {
+    match role {
+        WindowRole::TopPanel | WindowRole::BottomPanel => {
+            let height = size.height.ceil().max(1.0).min(i32::MAX as f64) as u32;
+            (0, height, height as i32)
+        }
+        WindowRole::LeftPanel | WindowRole::RightPanel => {
+            let width = size.width.ceil().max(1.0).min(i32::MAX as f64) as u32;
+            (width, 0, width as i32)
+        }
+        _ => unreachable!("panel geometry requires a panel role"),
+    }
+}
+
+fn resize_edge(direction: ResizeDirection) -> ResizeEdge {
+    match direction {
+        ResizeDirection::East => ResizeEdge::Right,
+        ResizeDirection::West => ResizeEdge::Left,
+        ResizeDirection::North => ResizeEdge::Top,
+        ResizeDirection::South => ResizeEdge::Bottom,
+        ResizeDirection::NorthWest => ResizeEdge::TopLeft,
+        ResizeDirection::NorthEast => ResizeEdge::TopRight,
+        ResizeDirection::SouthWest => ResizeEdge::BottomLeft,
+        ResizeDirection::SouthEast => ResizeEdge::BottomRight,
+    }
+}
+
+/// Queued by [`Window::set_blur_region`], drained by [`Runtime::apply_blur_requests`].
+struct BlurRequest {
+    window_id: WindowId,
+    #[cfg_attr(
+        not(any(feature = "blur-kwin", feature = "blur-blair")),
+        allow(dead_code)
+    )]
+    region: Option<BlurRegion>,
+}
+
+struct IntegrationRequest {
+    window_id: WindowId,
+    request: Option<CompositorIntegrationRequest>,
+}
+
+impl Runtime {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        compositor: CompositorState,
+        xdg_shell: XdgShell,
+        connection: Connection,
+        seat: Option<wl_seat::WlSeat>,
+        cursor_shape_manager: Option<CursorShapeManager>,
+        layer_shell: Option<ZwlrLayerShellV1>,
+        blur: Option<blur::BlurBackend>,
+        integration: Option<integration::IntegrationBackend>,
+        data_device_manager: Option<DataDeviceManagerState>,
+        data_device: Option<DataDevice>,
+        icon_pool: SlotPool,
+    ) -> RcRuntime {
+        std::rc::Rc::new(RefCell::new(Self {
+            compositor,
+            xdg_shell,
+            connection,
+            input_serial: Arc::new(Mutex::new(None)),
+            seat,
+            pointer: None,
+            keyboard: None,
+            xkb_context: xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
+            xkb_state: None,
+            cursor_shape_manager,
+            layer_shell,
+            blur,
+            blur_requests: Arc::new(Mutex::new(Vec::new())),
+            integration,
+            integration_requests: Arc::new(Mutex::new(Vec::new())),
+            shortcuts: None,
+            shortcut_requests: Arc::new(Mutex::new(Vec::new())),
+            cursor_shape_device: None,
+            cursor_serial: None,
+            pointer_focus: None,
+            last_pointer_target: None,
+            pointer_over_passthrough: false,
+            keyboard_focus: None,
+            close_requests: Arc::new(Mutex::new(Vec::new())),
+            window_state_requests: Arc::new(Mutex::new(HashMap::new())),
+            cursor_requests: Arc::new(Mutex::new(Vec::new())),
+            windows: HashMap::new(),
+            output_refresh: Arc::new(Mutex::new(HashMap::new())),
+            events: Vec::new(),
+            data_device_manager,
+            data_device,
+            active_drag: None,
+            drag_origin: None,
+            drag_position: PhysicalPosition { x: 0.0, y: 0.0 },
+            drag_payload: HashMap::new(),
+            dropped_files: Arc::new(Mutex::new(Vec::new())),
+            drag_target: None,
+            drag_requests: Arc::new(Mutex::new(Vec::new())),
+            interactive_requests: Arc::new(Mutex::new(Vec::new())),
+            icon_pool,
+        }))
+    }
+
+    fn finish_drag(&mut self, source: &wl_data_source::WlDataSource) {
+        if !self
+            .active_drag
+            .as_ref()
+            .is_some_and(|active| active.inner() == source)
+        {
+            return;
+        }
+        self.active_drag = None;
+        self.drag_payload.clear();
+        if let Some(origin) = self.drag_origin.take() {
+            self.events.push((origin, WindowEvent::DragSourceFinished));
+        }
+    }
+
+    fn id_for_surface(&self, surface: &wl_surface::WlSurface) -> Option<WindowId> {
+        self.windows
+            .iter()
+            .find_map(|(id, window)| (window.surface() == surface).then_some(*id))
+    }
+
+    fn pointer_target(&self) -> Option<WindowId> {
+        if self.pointer_over_passthrough {
+            self.last_pointer_target
+        } else {
+            self.pointer_focus
+        }
+    }
+
+    fn close_requested(&mut self) {
+        let requests = std::mem::take(
+            &mut *self
+                .close_requests
+                .lock()
+                .expect("window close request lock poisoned"),
+        );
+        for id in requests {
+            if let Some(backend) = self.shortcuts.as_mut() {
+                backend.forget(id);
+            }
+            // Layer-shell surfaces do not necessarily unmap merely because
+            // their last Rust proxy is dropped. Explicitly destroy them so a
+            // panel replaced at another edge cannot remain mapped.
+            if let Some(NativeWindow::Layer {
+                layer_surface,
+                handle,
+            }) = self.windows.remove(&id)
+            {
+                layer_surface.destroy();
+                handle.surface.destroy();
+            }
+            if let Some(backend) = self.blur.as_mut() {
+                backend.forget(id);
+            }
+            if let Some(backend) = self.integration.as_mut() {
+                backend.forget(id);
+            }
+            if self.pointer_focus == Some(id) {
+                self.pointer_focus = None;
+            }
+            if self.keyboard_focus == Some(id) {
+                self.keyboard_focus = None;
+            }
+        }
+    }
+
+    fn apply_window_state_requests(&mut self) {
+        let requests = std::mem::take(
+            &mut *self
+                .window_state_requests
+                .lock()
+                .expect("window state request lock poisoned"),
+        );
+        for (id, request) in requests {
+            if let Some(size) = request.popup_size {
+                if let Some(NativeWindow::Popup {
+                    popup, geometry, ..
+                }) = self.windows.get_mut(&id)
+                {
+                    if popup.xdg_popup().version() >= 3 {
+                        match XdgPositioner::new(&self.xdg_shell) {
+                            Ok(positioner) => {
+                                geometry.size = size;
+                                geometry.apply(&positioner);
+                                popup.reposition(&positioner, 0);
+                                positioner.destroy();
+                            }
+                            Err(error) => log::warn!(
+                                "creamui-platform: could not resize popup {id:?}: {error}"
+                            ),
+                        }
+                    } else {
+                        log::warn!(
+                            "creamui-platform: popup {id:?} requires xdg-shell v3 to resize"
+                        );
+                    }
+                }
+                continue;
+            }
+            let Some(NativeWindow::Toplevel { window, .. }) = self.windows.get(&id) else {
+                log::debug!("creamui-platform: ignoring state request for non-toplevel {id:?}");
+                continue;
+            };
+            if let Some(minimum) = request.minimum {
+                window.set_min_size(minimum);
+                window.commit();
+            }
+            if let Some(title) = request.title {
+                window.set_title(title);
+            }
+            if let Some(maximized) = request.maximized {
+                log::debug!("creamui-platform: setting {id:?} maximized={maximized}");
+                if maximized {
+                    window.set_maximized();
+                } else {
+                    window.unset_maximized();
+                }
+            }
+            if request.minimize {
+                log::debug!("creamui-platform: minimizing {id:?}");
+                window.set_minimized();
+            }
+        }
+    }
+
+    fn apply_cursor_requests(&mut self) {
+        let requests = std::mem::take(
+            &mut *self
+                .cursor_requests
+                .lock()
+                .expect("cursor request lock poisoned"),
+        );
+        let (Some(device), Some(serial), Some(focused)) = (
+            self.cursor_shape_device.as_ref(),
+            self.cursor_serial,
+            self.pointer_focus,
+        ) else {
+            return;
+        };
+        for (window_id, icon) in requests {
+            if window_id == focused {
+                device.set_shape(serial, cursor_shape(icon));
+            }
+        }
+    }
+
+    fn apply_interactive_requests(&mut self) {
+        let requests = std::mem::take(
+            &mut *self
+                .interactive_requests
+                .lock()
+                .expect("interactive request lock poisoned"),
+        );
+        let Some(seat) = self.seat.as_ref() else {
+            return;
+        };
+        for request in requests {
+            let Some(NativeWindow::Toplevel { window, .. }) = self.windows.get(&request.window_id)
+            else {
+                continue;
+            };
+            if let Some(direction) = request.resize {
+                window.resize(seat, request.serial, resize_edge(direction));
+            } else {
+                window.move_(seat, request.serial);
+            }
+        }
+    }
+
+    /// Starts a real Wayland drag for each queued [`DragRequest`]. No icon
+    /// surface yet — a drag with no icon is valid Wayland, just plain.
+    fn apply_drag_requests(&mut self, qh: &QueueHandle<DispatchState>) {
+        let requests = std::mem::take(
+            &mut *self
+                .drag_requests
+                .lock()
+                .expect("drag request lock poisoned"),
+        );
+        if requests.is_empty() {
+            return;
+        }
+        if self.data_device_manager.is_none() || self.data_device.is_none() {
+            for request in requests {
+                self.events
+                    .push((request.window_id, WindowEvent::DragSourceFinished));
+            }
+            eprintln!("wayland: native drag requires a data device");
+            return;
+        }
+        for request in requests {
+            let Some(origin) = self
+                .windows
+                .get(&request.window_id)
+                .map(|window| window.surface().clone())
+            else {
+                continue;
+            };
+            // Built before borrowing `manager`/`device` below — it needs
+            // `&mut self` for the icon pool.
+            let icon = request
+                .icon
+                .as_ref()
+                .and_then(|icon| self.create_icon_surface(qh, icon));
+            let manager = self.data_device_manager.as_ref().expect("checked above");
+            let device = self.data_device.as_ref().expect("checked above");
+            let source = manager.create_drag_and_drop_source(
+                qh,
+                request.mime_types.iter().cloned(),
+                DndAction::Copy,
+            );
+            source.start_drag(device, &origin, icon.as_ref(), request.serial);
+            self.drag_payload = request.data.into_iter().collect();
+            self.active_drag = Some(source);
+            self.drag_origin = Some(request.window_id);
+        }
+    }
+
+    /// Applies each queued [`BlurRequest`] through whichever [`blur::BlurBackend`]
+    /// bound at startup. A no-op when the compositor advertises neither.
+    fn apply_blur_requests(&mut self, qh: &QueueHandle<DispatchState>) {
+        let requests = std::mem::take(
+            &mut *self
+                .blur_requests
+                .lock()
+                .expect("blur request lock poisoned"),
+        );
+        let Some(backend) = self.blur.as_mut() else {
+            return;
+        };
+        backend.apply(&self.compositor, &self.windows, &requests, qh);
+    }
+
+    fn apply_integration_requests(&mut self, qh: &QueueHandle<DispatchState>) {
+        let requests = std::mem::take(
+            &mut *self
+                .integration_requests
+                .lock()
+                .expect("integration request lock poisoned"),
+        );
+        for request in &requests {
+            let Some(native) = self.windows.get(&request.window_id) else {
+                continue;
+            };
+            let titlebar = request.request == Some(CompositorIntegrationRequest::Titlebar);
+            let was_titlebar = native
+                .handle()
+                .titlebar_fallback
+                .swap(titlebar, Ordering::AcqRel);
+            native
+                .handle()
+                .decorations
+                .lock()
+                .expect("decoration lock poisoned")
+                .set_titlebar(titlebar);
+            if titlebar && self.integration.is_none() {
+                log::debug!("creamui-platform: no overlay integration, using client decorations");
+                native.request_decoration_mode(DecorationMode::Client);
+            } else if was_titlebar && !titlebar {
+                native.request_decoration_mode(DecorationMode::Server);
+            }
+        }
+        if let Some(backend) = self.integration.as_mut() {
+            backend.apply(&self.windows, &requests, qh);
+        }
+    }
+
+    fn apply_shortcut_requests(&mut self, qh: &QueueHandle<DispatchState>) {
+        let requests = std::mem::take(
+            &mut *self
+                .shortcut_requests
+                .lock()
+                .expect("shortcut request lock"),
+        );
+        if let Some(backend) = self.shortcuts.as_mut() {
+            backend.apply(&self.windows, self.seat.as_ref(), requests, qh);
+        }
+    }
+
+    fn shortcut_queue(&self) -> Option<ShortcutRequests> {
+        self.shortcuts
+            .as_ref()
+            .zip(self.seat.as_ref())
+            .map(|_| self.shortcut_requests.clone())
+    }
+
+    /// Renders `icon` into a fresh `wl_surface` to hand to `start_drag`.
+    fn create_icon_surface(
+        &mut self,
+        qh: &QueueHandle<DispatchState>,
+        icon: &DragIcon,
+    ) -> Option<wl_surface::WlSurface> {
+        let (width, height) = (icon.width as i32, icon.height as i32);
+        let stride = width * 4;
+        let (buffer, canvas) = self
+            .icon_pool
+            .create_buffer(width, height, stride, wl_shm::Format::Argb8888)
+            .ok()?;
+        // Argb8888 is defined as a little-endian 32-bit word bit-packed
+        // A:R:G:B — regardless of host endianness, that's B,G,R,A in memory.
+        for (dst, src) in canvas.chunks_exact_mut(4).zip(icon.pixels.chunks_exact(4)) {
+            dst.copy_from_slice(&[src[2], src[1], src[0], src[3]]);
+        }
+        let surface = self.compositor.create_surface(qh);
+        buffer.attach_to(&surface).ok()?;
+        surface.damage_buffer(0, 0, width, height);
+        surface.commit();
+        Some(surface)
+    }
+}
+
+fn create_layer_window(
+    runtime: &mut Runtime,
+    queue_handle: &QueueHandle<DispatchState>,
+    id: WindowId,
+    attributes: WindowAttributes,
+) -> Result<Arc<dyn PlatformWindow>, String> {
+    let layer_shell = runtime
+        .layer_shell
+        .as_ref()
+        .ok_or_else(|| "the compositor does not support the layer-shell protocol".to_owned())?;
+    let surface = runtime.compositor.create_surface(queue_handle);
+    let desktop = attributes.role == WindowRole::Desktop;
+    let overlay = attributes.role == WindowRole::Overlay;
+    let layer_surface = layer_shell.get_layer_surface(
+        &surface,
+        None,
+        if desktop { Layer::Bottom } else { Layer::Top },
+        if desktop {
+            // KWin (layershellv1window.cpp) maps this namespace to
+            // NET::Desktop, which excludes the window from "Show
+            // Desktop"/minimize-all. Any other string is treated as a
+            // plain Normal window and gets minimized like everything else.
+            "desktop".to_owned()
+        } else {
+            // Likewise "dock" maps to NET::Dock, keeping the bar/overlay
+            // windows visible when Show Desktop is triggered.
+            "dock".to_owned()
+        },
+        queue_handle,
+        (),
+    );
+    if desktop || overlay {
+        layer_surface.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right);
+        layer_surface.set_size(0, 0);
+        layer_surface.set_exclusive_zone(-1);
+        layer_surface.set_keyboard_interactivity(KeyboardInteractivity::None);
+        if overlay {
+            let input_region = runtime
+                .compositor
+                .wl_compositor()
+                .create_region(queue_handle, ());
+            input_region.add(0, 0, 0, 0);
+            surface.set_input_region(Some(&input_region));
+            input_region.destroy();
+        }
+    } else {
+        let anchor = match attributes.role {
+            WindowRole::TopPanel => Anchor::Top | Anchor::Left | Anchor::Right,
+            WindowRole::BottomPanel => Anchor::Bottom | Anchor::Left | Anchor::Right,
+            WindowRole::LeftPanel => Anchor::Left | Anchor::Top | Anchor::Bottom,
+            WindowRole::RightPanel => Anchor::Right | Anchor::Top | Anchor::Bottom,
+            _ => unreachable!("only panel roles reach the panel setup"),
+        };
+        let (width, height, exclusive_zone) = panel_dimensions(attributes.role, attributes.size);
+        layer_surface.set_anchor(anchor);
+        layer_surface.set_size(width, height);
+        layer_surface.set_exclusive_zone(exclusive_zone);
+        layer_surface.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
+    }
+    surface.commit();
+    let handle = Arc::new(Window::new(
+        id,
+        surface,
+        runtime.connection.clone(),
+        runtime.input_serial.clone(),
+        runtime.close_requests.clone(),
+        runtime.window_state_requests.clone(),
+        runtime.cursor_requests.clone(),
+        runtime.drag_requests.clone(),
+        runtime.interactive_requests.clone(),
+        runtime.blur_requests.clone(),
+        runtime.integration_requests.clone(),
+        runtime.output_refresh.clone(),
+        runtime.shortcut_queue(),
+        attributes.size,
+        overlay,
+    ));
+    runtime.windows.insert(
+        id,
+        NativeWindow::Layer {
+            layer_surface: layer_surface.clone(),
+            handle: handle.clone(),
+        },
+    );
+    if matches!(
+        attributes.role,
+        WindowRole::TopPanel
+            | WindowRole::BottomPanel
+            | WindowRole::LeftPanel
+            | WindowRole::RightPanel
+    ) {
+        *handle
+            .panel_surface
+            .lock()
+            .expect("panel surface lock poisoned") = Some((attributes.role, layer_surface));
+    }
+    Ok(handle)
+}
+
+enum NativeWindow {
+    Toplevel {
+        window: XdgWindow,
+        handle: Arc<Window>,
+    },
+    Popup {
+        popup: Popup,
+        geometry: super::PopupPositioner,
+        handle: Arc<Window>,
+    },
+    Layer {
+        layer_surface: ZwlrLayerSurfaceV1,
+        handle: Arc<Window>,
+    },
+}
+
+enum PopupParent {
+    Xdg(xdg_surface::XdgSurface),
+    Layer(ZwlrLayerSurfaceV1),
+}
+
+impl NativeWindow {
+    fn surface(&self) -> &wl_surface::WlSurface {
+        match self {
+            Self::Toplevel { window, .. } => window.wl_surface(),
+            Self::Popup { popup, .. } => popup.wl_surface(),
+            Self::Layer { handle, .. } => &handle.surface,
+        }
+    }
+
+    fn popup_parent(&self) -> PopupParent {
+        match self {
+            Self::Toplevel { window, .. } => PopupParent::Xdg(window.xdg_surface().clone()),
+            Self::Popup { popup, .. } => PopupParent::Xdg(popup.xdg_surface().clone()),
+            Self::Layer { layer_surface, .. } => PopupParent::Layer(layer_surface.clone()),
+        }
+    }
+
+    fn handle(&self) -> &Arc<Window> {
+        match self {
+            Self::Toplevel { handle, .. } | Self::Popup { handle, .. } => handle,
+            Self::Layer { handle, .. } => handle,
+        }
+    }
+
+    /// Only toplevels have an xdg-decoration to negotiate.
+    fn request_decoration_mode(&self, mode: DecorationMode) {
+        if let Self::Toplevel { window, .. } = self {
+            window.request_decoration_mode(Some(mode));
+        }
+    }
+
+    #[cfg_attr(not(feature = "window-integration-blair"), allow(dead_code))]
+    fn request_client_decorations(&self) {
+        self.request_decoration_mode(DecorationMode::Client);
+    }
+}
+
+fn create_layer_popup(
+    parent: &ZwlrLayerSurfaceV1,
+    geometry: super::PopupPositioner,
+    queue_handle: &QueueHandle<DispatchState>,
+    compositor: &CompositorState,
+    xdg_shell: &XdgShell,
+    grab: Option<(&wl_seat::WlSeat, crate::InputSerial)>,
+) -> Result<Popup, smithay_client_toolkit::error::GlobalError> {
+    let positioner = XdgPositioner::new(xdg_shell)?;
+    geometry.apply(&positioner);
+    let surface = Surface::new(compositor, queue_handle)?;
+    let popup = Popup::from_surface(None, &positioner, queue_handle, surface, xdg_shell)?;
+    parent.get_popup(popup.xdg_popup());
+    if let Some((seat, serial)) = grab {
+        super::grab_popup(popup.xdg_popup(), seat, serial);
+    }
+    popup.wl_surface().commit();
+    Ok(popup)
+}
+
+struct DispatchState {
+    runtime: RcRuntime,
+    shm: Shm,
+    registry: RegistryState,
+    outputs: OutputState,
+}
+
+impl ShmHandler for DispatchState {
+    fn shm_state(&mut self) -> &mut Shm {
+        &mut self.shm
+    }
+}
+
+smithay_client_toolkit::delegate_shm!(DispatchState);
+
+impl ProvidesRegistryState for DispatchState {
+    fn registry(&mut self) -> &mut RegistryState {
+        &mut self.registry
+    }
+
+    smithay_client_toolkit::registry_handlers![OutputState];
+}
+
+impl OutputHandler for DispatchState {
+    fn output_state(&mut self) -> &mut OutputState {
+        &mut self.outputs
+    }
+
+    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, output: wl_output::WlOutput) {
+        self.update_refresh(output);
+    }
+
+    fn update_output(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        output: wl_output::WlOutput,
+    ) {
+        self.update_refresh(output);
+    }
+
+    fn output_destroyed(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        output: wl_output::WlOutput,
+    ) {
+        self.runtime
+            .borrow()
+            .output_refresh
+            .lock()
+            .expect("output refresh lock poisoned")
+            .remove(&output);
+    }
+}
+
+impl DispatchState {
+    fn update_refresh(&mut self, output: wl_output::WlOutput) {
+        let interval = self
+            .outputs
+            .info(&output)
+            .and_then(|info| current_refresh_interval(&info.modes));
+        let runtime = self.runtime.borrow();
+        let mut refresh = runtime
+            .output_refresh
+            .lock()
+            .expect("output refresh lock poisoned");
+        if let Some(interval) = interval {
+            refresh.insert(output, interval);
+        } else {
+            refresh.remove(&output);
+        }
+    }
+}
+
+fn application_id(executable: &std::path::Path) -> Option<String> {
+    let name = executable.file_name()?.to_string_lossy();
+    Some(name.strip_suffix(" (deleted)").unwrap_or(&name).to_owned())
+}
+
+fn current_refresh_interval(modes: &[Mode]) -> Option<Duration> {
+    modes
+        .iter()
+        .find(|mode| mode.current && mode.refresh_rate > 0)
+        .map(|mode| Duration::from_secs_f64(1000.0 / mode.refresh_rate as f64))
+}
+
+impl CompositorHandler for DispatchState {
+    fn scale_factor_changed(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: i32,
+    ) {
+    }
+
+    fn transform_changed(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: wl_output::Transform,
+    ) {
+    }
+
+    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {}
+
+    fn surface_enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: &wl_output::WlOutput,
+    ) {
+    }
+
+    fn surface_leave(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: &wl_output::WlOutput,
+    ) {
+    }
+}
+
+smithay_client_toolkit::delegate_registry!(DispatchState);
+smithay_client_toolkit::delegate_output!(DispatchState);
+smithay_client_toolkit::delegate_compositor!(DispatchState);
+
+impl Dispatch<wl_region::WlRegion, ()> for DispatchState {
+    fn event(
+        _: &mut Self,
+        _: &wl_region::WlRegion,
+        _: wl_region::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZwlrLayerShellV1, ()> for DispatchState {
+    fn event(
+        _: &mut Self,
+        _: &ZwlrLayerShellV1,
+        _: <ZwlrLayerShellV1 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZwlrLayerSurfaceV1, ()> for DispatchState {
+    fn event(
+        state: &mut Self,
+        layer_surface: &ZwlrLayerSurfaceV1,
+        event: <ZwlrLayerSurfaceV1 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let mut runtime = state.runtime.borrow_mut();
+        let id = runtime
+            .windows
+            .iter()
+            .find_map(|(id, window)| match window {
+                NativeWindow::Layer {
+                    layer_surface: current,
+                    ..
+                } if current == layer_surface => Some(*id),
+                _ => None,
+            });
+        let Some(id) = id else { return };
+        match event {
+            wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Event::Configure {
+                serial,
+                width,
+                height,
+            } => {
+                layer_surface.ack_configure(serial);
+                let size = PhysicalSize { width, height };
+                if let Some(window) = runtime.windows.get(&id) {
+                    window.handle().set_inner_size(size);
+                    window.handle().set_ready();
+                }
+                runtime.events.push((id, WindowEvent::Resized(size)));
+            }
+            wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Event::Closed => {
+                runtime.events.push((id, WindowEvent::CloseRequested));
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<WpCursorShapeManagerV1, GlobalData> for DispatchState {
+    fn event(
+        _: &mut Self,
+        _: &WpCursorShapeManagerV1,
+        _: <WpCursorShapeManagerV1 as Proxy>::Event,
+        _: &GlobalData,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<WpCursorShapeDeviceV1, GlobalData> for DispatchState {
+    fn event(
+        _: &mut Self,
+        _: &WpCursorShapeDeviceV1,
+        _: <WpCursorShapeDeviceV1 as Proxy>::Event,
+        _: &GlobalData,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<wl_seat::WlSeat, ()> for DispatchState {
+    fn event(
+        state: &mut Self,
+        seat: &wl_seat::WlSeat,
+        event: wl_seat::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if let wl_seat::Event::Capabilities {
+            capabilities: WEnum::Value(capabilities),
+        } = event
+        {
+            let mut runtime = state.runtime.borrow_mut();
+            if capabilities.contains(wl_seat::Capability::Pointer) && runtime.pointer.is_none() {
+                let pointer = seat.get_pointer(qh, ());
+                runtime.cursor_shape_device = runtime
+                    .cursor_shape_manager
+                    .as_ref()
+                    .map(|manager| manager.get_shape_device(&pointer, qh));
+                runtime.pointer = Some(pointer);
+            }
+            if capabilities.contains(wl_seat::Capability::Keyboard) && runtime.keyboard.is_none() {
+                runtime.keyboard = Some(seat.get_keyboard(qh, ()));
+            }
+        }
+    }
+}
+
+impl Dispatch<wl_pointer::WlPointer, ()> for DispatchState {
+    fn event(
+        state: &mut Self,
+        _: &wl_pointer::WlPointer,
+        event: wl_pointer::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let mut runtime = state.runtime.borrow_mut();
+        match event {
+            wl_pointer::Event::Enter {
+                serial,
+                surface,
+                surface_x,
+                surface_y,
+                ..
+            } => {
+                if let Some(id) = runtime.id_for_surface(&surface) {
+                    let passthrough = runtime
+                        .windows
+                        .get(&id)
+                        .is_some_and(|window| window.handle().pointer_passthrough());
+                    runtime.pointer_over_passthrough = passthrough;
+                    if passthrough {
+                        if let Some(target) = runtime.last_pointer_target {
+                            runtime.events.push((
+                                target,
+                                WindowEvent::CursorMoved {
+                                    position: PhysicalPosition {
+                                        x: surface_x,
+                                        y: surface_y,
+                                    },
+                                },
+                            ));
+                        }
+                    } else {
+                        runtime.pointer_focus = Some(id);
+                        runtime.last_pointer_target = Some(id);
+                        runtime.cursor_serial = Some(serial);
+                        runtime.events.push((
+                            id,
+                            WindowEvent::CursorMoved {
+                                position: PhysicalPosition {
+                                    x: surface_x,
+                                    y: surface_y,
+                                },
+                            },
+                        ));
+                    }
+                }
+            }
+            wl_pointer::Event::Motion {
+                surface_x,
+                surface_y,
+                ..
+            } => {
+                if let Some(id) = runtime.pointer_target() {
+                    runtime.events.push((
+                        id,
+                        WindowEvent::CursorMoved {
+                            position: PhysicalPosition {
+                                x: surface_x,
+                                y: surface_y,
+                            },
+                        },
+                    ));
+                }
+            }
+            wl_pointer::Event::Leave { surface, .. } => {
+                if let Some(id) = runtime.id_for_surface(&surface) {
+                    let passthrough = runtime
+                        .windows
+                        .get(&id)
+                        .is_some_and(|window| window.handle().pointer_passthrough());
+                    if passthrough {
+                        runtime.pointer_over_passthrough = false;
+                    } else if runtime.pointer_focus == Some(id) {
+                        runtime.pointer_focus = None;
+                        runtime.cursor_serial = None;
+                        runtime.events.push((id, WindowEvent::CursorLeft));
+                    }
+                }
+            }
+            wl_pointer::Event::Button {
+                serial,
+                button,
+                state: WEnum::Value(button_state),
+                ..
+            } => {
+                if button_state == wl_pointer::ButtonState::Pressed {
+                    *runtime
+                        .input_serial
+                        .lock()
+                        .expect("input serial lock poisoned") = Some(crate::InputSerial(serial));
+                }
+                if let Some(id) = runtime.pointer_target() {
+                    runtime.events.push((
+                        id,
+                        WindowEvent::MouseInput {
+                            pressed: button_state == wl_pointer::ButtonState::Pressed,
+                            button: pointer_button(button),
+                            serial: Some(crate::InputSerial(serial)),
+                        },
+                    ));
+                }
+            }
+            wl_pointer::Event::Axis { axis, value, .. } => {
+                let Some(delta) = (match axis {
+                    WEnum::Value(axis) => wayland_axis_delta(axis, value),
+                    _ => None,
+                }) else {
+                    return;
+                };
+                if let Some(id) = runtime.pointer_target() {
+                    runtime.events.push((id, WindowEvent::MouseWheel { delta }));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<wl_keyboard::WlKeyboard, ()> for DispatchState {
+    fn event(
+        state: &mut Self,
+        _: &wl_keyboard::WlKeyboard,
+        event: wl_keyboard::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let mut runtime = state.runtime.borrow_mut();
+        match event {
+            wl_keyboard::Event::Keymap {
+                format: WEnum::Value(wl_keyboard::KeymapFormat::XkbV1),
+                fd,
+                size,
+            } => {
+                // This fd is meant to be mmap'd: its read offset is shared
+                // with the compositor's own fd for the same open file
+                // description, which is left sitting at EOF after the
+                // compositor wrote the keymap — seek back to the start
+                // before reading. `size` bytes also excludes any page
+                // padding after the NUL-terminated keymap text that
+                // `Keymap::new_from_file`'s EOF-based read would otherwise
+                // hand to `CString::new`, breaking it.
+                use std::io::{Read, Seek, SeekFrom};
+                let mut bytes = vec![0u8; size as usize];
+                let mut file = std::fs::File::from(fd);
+                if file.seek(SeekFrom::Start(0)).is_ok() && file.read_exact(&mut bytes).is_ok() {
+                    while bytes.last() == Some(&0) {
+                        bytes.pop();
+                    }
+                    if let Ok(text) = String::from_utf8(bytes) {
+                        runtime.xkb_state = xkb::Keymap::new_from_string(
+                            &runtime.xkb_context,
+                            text,
+                            xkb::KEYMAP_FORMAT_TEXT_V1,
+                            xkb::COMPILE_NO_FLAGS,
+                        )
+                        .map(|keymap| xkb::State::new(&keymap));
+                    }
+                }
+            }
+            wl_keyboard::Event::Enter { surface, .. } => {
+                if let Some(id) = runtime.id_for_surface(&surface) {
+                    runtime.keyboard_focus = Some(id);
+                    runtime.events.push((id, WindowEvent::Focused(true)));
+                }
+            }
+            wl_keyboard::Event::Leave { surface, .. } => {
+                if let Some(id) = runtime.id_for_surface(&surface) {
+                    if runtime.keyboard_focus == Some(id) {
+                        runtime.keyboard_focus = None;
+                    }
+                    runtime.events.push((id, WindowEvent::Focused(false)));
+                }
+            }
+            wl_keyboard::Event::Key {
+                serial,
+                key,
+                state: WEnum::Value(key_state),
+                ..
+            } => {
+                if key_state == wl_keyboard::KeyState::Pressed {
+                    *runtime
+                        .input_serial
+                        .lock()
+                        .expect("input serial lock poisoned") = Some(crate::InputSerial(serial));
+                }
+                if let Some(id) = runtime.keyboard_focus {
+                    let key = keyboard_key(key, runtime.xkb_state.as_ref());
+                    runtime.events.push((
+                        id,
+                        WindowEvent::KeyboardInput(KeyEvent {
+                            key,
+                            pressed: key_state == wl_keyboard::KeyState::Pressed,
+                            synthetic: false,
+                        }),
+                    ));
+                }
+            }
+            wl_keyboard::Event::Modifiers {
+                mods_depressed,
+                mods_latched,
+                mods_locked,
+                group,
+                ..
+            } => {
+                let keyboard_focus = runtime.keyboard_focus;
+                if let Some(state) = runtime.xkb_state.as_mut() {
+                    state.update_mask(mods_depressed, mods_latched, mods_locked, 0, 0, group);
+                    let modifiers = Modifiers {
+                        ctrl: state
+                            .mod_name_is_active(xkb::MOD_NAME_CTRL, xkb::STATE_MODS_EFFECTIVE),
+                        shift: state
+                            .mod_name_is_active(xkb::MOD_NAME_SHIFT, xkb::STATE_MODS_EFFECTIVE),
+                        alt: state.mod_name_is_active(xkb::MOD_NAME_ALT, xkb::STATE_MODS_EFFECTIVE),
+                        logo: state
+                            .mod_name_is_active(xkb::MOD_NAME_LOGO, xkb::STATE_MODS_EFFECTIVE),
+                    };
+                    if let Some(id) = keyboard_focus {
+                        runtime
+                            .events
+                            .push((id, WindowEvent::ModifiersChanged(modifiers)));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl DataDeviceHandler for DispatchState {
+    fn enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        data_device: &wl_data_device::WlDataDevice,
+        x: f64,
+        y: f64,
+        wl_surface: &wl_surface::WlSurface,
+    ) {
+        // Advertise that we take plain `file://` payload.
+        if let Some(offer) = data_device
+            .data::<DataDeviceData>()
+            .and_then(|data| data.drag_offer())
+        {
+            if offer.with_mime_types(|types| types.iter().any(|mime| mime == "text/uri-list")) {
+                offer.accept_mime_type(offer.serial, Some("text/uri-list".into()));
+                offer.set_actions(DndAction::Copy, DndAction::Copy);
+            }
+        }
+        let mut runtime = self.runtime.borrow_mut();
+        let Some(id) = runtime.id_for_surface(wl_surface) else {
+            return;
+        };
+        runtime.drag_target = Some(id);
+        runtime.drag_position = PhysicalPosition { x, y };
+        runtime.events.push((
+            id,
+            WindowEvent::DragEntered {
+                position: PhysicalPosition { x, y },
+            },
+        ));
+    }
+    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_device::WlDataDevice) {
+        let mut runtime = self.runtime.borrow_mut();
+        if let Some(id) = runtime.drag_target.take() {
+            runtime.events.push((id, WindowEvent::DragLeft));
+        }
+    }
+    fn motion(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        data_device: &wl_data_device::WlDataDevice,
+        x: f64,
+        y: f64,
+    ) {
+        // Keep accepting `text/uri-list` while the pointer moves.
+        if let Some(offer) = data_device
+            .data::<DataDeviceData>()
+            .and_then(|data| data.drag_offer())
+        {
+            if offer.with_mime_types(|types| types.iter().any(|mime| mime == "text/uri-list")) {
+                offer.accept_mime_type(offer.serial, Some("text/uri-list".into()));
+            }
+        }
+        let mut runtime = self.runtime.borrow_mut();
+        runtime.drag_position = PhysicalPosition { x, y };
+        if let Some(id) = runtime.drag_target {
+            runtime.events.push((
+                id,
+                WindowEvent::DragMoved {
+                    position: PhysicalPosition { x, y },
+                },
+            ));
+        }
+    }
+    fn selection(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_data_device::WlDataDevice,
+    ) {
+    }
+    fn drop_performed(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        data_device: &wl_data_device::WlDataDevice,
+    ) {
+        // Pull `text/uri-list` payloads off the offer and turn them into
+        // a `FilesDropped` event for the drop target window.
+        if let Some(offer) = data_device
+            .data::<DataDeviceData>()
+            .and_then(|data| data.drag_offer())
+        {
+            let runtime = self.runtime.borrow();
+            let target = runtime.drag_target;
+            let position = runtime.drag_position;
+            let completed = runtime.dropped_files.clone();
+            drop(runtime);
+            match (target, offer.receive("text/uri-list".to_string())) {
+                (Some(id), Ok(mut pipe)) => {
+                    std::thread::spawn(move || {
+                        let mut payload = String::new();
+                        match std::io::Read::read_to_string(&mut pipe, &mut payload) {
+                            Ok(_) => {
+                                let paths = parse_uri_list(&payload);
+                                completed.lock().expect("drop queue lock poisoned").push(
+                                    FileDropResult {
+                                        window_id: id,
+                                        paths,
+                                        position,
+                                    },
+                                );
+                                offer.finish();
+                            }
+                            Err(error) => {
+                                eprintln!("wayland: failed to read dropped files: {error}")
+                            }
+                        }
+                        offer.destroy();
+                    });
+                }
+                (_, Err(error)) => {
+                    eprintln!("wayland: failed to receive dropped files: {error}");
+                    offer.destroy();
+                }
+                _ => offer.destroy(),
+            }
+        }
+        let mut runtime = self.runtime.borrow_mut();
+        if let Some(id) = runtime.drag_target.take() {
+            runtime.events.push((id, WindowEvent::DragDropped));
+        }
+    }
+}
+
+impl DataOfferHandler for DispatchState {
+    fn source_actions(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &mut DragOffer,
+        _: DndAction,
+    ) {
+    }
+    fn selected_action(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &mut DragOffer,
+        _: DndAction,
+    ) {
+    }
+}
+
+impl DataSourceHandler for DispatchState {
+    fn accept_mime(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_data_source::WlDataSource,
+        _: Option<String>,
+    ) {
+    }
+    fn send_request(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        source: &wl_data_source::WlDataSource,
+        mime: String,
+        mut pipe: WritePipe,
+    ) {
+        let runtime = self.runtime.borrow();
+        if !runtime
+            .active_drag
+            .as_ref()
+            .is_some_and(|active| active.inner() == source)
+        {
+            return;
+        }
+        let payload = runtime.drag_payload.get(&mime).cloned();
+        drop(runtime);
+        if let Some(payload) = payload {
+            std::thread::spawn(move || {
+                if let Err(error) = std::io::Write::write_all(&mut pipe, &payload) {
+                    eprintln!("wayland: failed to send drag payload: {error}");
+                }
+            });
+        }
+    }
+    fn cancelled(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        source: &wl_data_source::WlDataSource,
+    ) {
+        self.runtime.borrow_mut().finish_drag(source);
+    }
+    fn dnd_dropped(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_data_source::WlDataSource,
+    ) {
+    }
+    fn dnd_finished(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        source: &wl_data_source::WlDataSource,
+    ) {
+        self.runtime.borrow_mut().finish_drag(source);
+    }
+    fn action(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_data_source::WlDataSource,
+        _: DndAction,
+    ) {
+    }
+}
+
+impl WindowHandler for DispatchState {
+    fn request_close(&mut self, _: &Connection, _: &QueueHandle<Self>, window: &XdgWindow) {
+        let mut runtime = self.runtime.borrow_mut();
+        if let Some(id) = runtime.id_for_surface(window.wl_surface()) {
+            runtime.events.push((id, WindowEvent::CloseRequested));
+        }
+    }
+
+    fn configure(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        window: &XdgWindow,
+        configure: WindowConfigure,
+        _: u32,
+    ) {
+        let mut runtime = self.runtime.borrow_mut();
+        let Some(id) = runtime.id_for_surface(window.wl_surface()) else {
+            return;
+        };
+        let size = PhysicalSize {
+            width: configure.new_size.0.map_or_else(
+                || runtime.windows[&id].handle().inner_size().width,
+                |size| size.get(),
+            ),
+            height: configure.new_size.1.map_or_else(
+                || runtime.windows[&id].handle().inner_size().height,
+                |size| size.get(),
+            ),
+        };
+        if let Some(native) = runtime.windows.get(&id) {
+            native.handle().set_inner_size(size);
+            native.handle().set_ready();
+        }
+        let decorations = {
+            let mut negotiation = runtime.windows[&id]
+                .handle()
+                .decorations
+                .lock()
+                .expect("decoration lock poisoned");
+            negotiation.set_maximized(configure.state.contains(WindowState::MAXIMIZED));
+            negotiation.configure(configure.decoration_mode == DecorationMode::Server)
+        };
+        runtime
+            .events
+            .push((id, WindowEvent::DecorationsChanged(decorations)));
+        runtime.events.push((id, WindowEvent::Resized(size)));
+        runtime.events.push((
+            id,
+            WindowEvent::Focused(configure.state.contains(WindowState::ACTIVATED)),
+        ));
+    }
+}
+
+impl PopupHandler for DispatchState {
+    fn configure(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        popup: &Popup,
+        configure: PopupConfigure,
+    ) {
+        let mut runtime = self.runtime.borrow_mut();
+        if let Some(id) = runtime.id_for_surface(popup.wl_surface()) {
+            let size = PhysicalSize {
+                width: configure.width.max(1) as u32,
+                height: configure.height.max(1) as u32,
+            };
+            if let Some(native) = runtime.windows.get(&id) {
+                native.handle().set_inner_size(size);
+                native.handle().set_ready();
+            }
+            runtime.events.push((id, WindowEvent::Resized(size)));
+            runtime.events.push((id, WindowEvent::RedrawRequested));
+        }
+    }
+
+    fn done(&mut self, _: &Connection, _: &QueueHandle<Self>, popup: &Popup) {
+        let mut runtime = self.runtime.borrow_mut();
+        if let Some(id) = runtime.id_for_surface(popup.wl_surface()) {
+            runtime.events.push((id, WindowEvent::Focused(false)));
+            runtime.events.push((id, WindowEvent::PopupDone));
+        }
+    }
+}
+
+smithay_client_toolkit::delegate_xdg_shell!(DispatchState);
+smithay_client_toolkit::delegate_xdg_window!(DispatchState);
+smithay_client_toolkit::delegate_xdg_popup!(DispatchState);
+smithay_client_toolkit::delegate_data_device!(DispatchState);
+
+pub struct Window {
+    id: WindowId,
+    surface: wl_surface::WlSurface,
+    display: wl_display::WlDisplay,
+    input_serial: Arc<Mutex<Option<crate::InputSerial>>>,
+    scale_factor: AtomicU32,
+    inner_size: Mutex<PhysicalSize>,
+    ready: AtomicBool,
+    decorations: Mutex<DecorationNegotiation>,
+    /// Set while an application titlebar is requested; overlay rejection
+    /// then falls back to client-side decorations.
+    titlebar_fallback: AtomicBool,
+    requested_redraw: AtomicBool,
+    visible: AtomicBool,
+    close_requests: Arc<Mutex<Vec<WindowId>>>,
+    window_state_requests: Arc<Mutex<HashMap<WindowId, WindowStateRequest>>>,
+    cursor_requests: Arc<Mutex<Vec<(WindowId, CursorIcon)>>>,
+    drag_requests: Arc<Mutex<Vec<DragRequest>>>,
+    interactive_requests: Arc<Mutex<Vec<InteractiveRequest>>>,
+    blur_requests: Arc<Mutex<Vec<BlurRequest>>>,
+    integration_requests: Arc<Mutex<Vec<IntegrationRequest>>>,
+    output_refresh: Arc<Mutex<HashMap<wl_output::WlOutput, Duration>>>,
+    pointer_passthrough: bool,
+    panel_surface: Mutex<Option<(WindowRole, ZwlrLayerSurfaceV1)>>,
+    is_popup: AtomicBool,
+    shortcut_requests: Option<ShortcutRequests>,
+    _connection: Connection,
+}
+
+impl Window {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        id: WindowId,
+        surface: wl_surface::WlSurface,
+        connection: Connection,
+        input_serial: Arc<Mutex<Option<crate::InputSerial>>>,
+        close_requests: Arc<Mutex<Vec<WindowId>>>,
+        window_state_requests: Arc<Mutex<HashMap<WindowId, WindowStateRequest>>>,
+        cursor_requests: Arc<Mutex<Vec<(WindowId, CursorIcon)>>>,
+        drag_requests: Arc<Mutex<Vec<DragRequest>>>,
+        interactive_requests: Arc<Mutex<Vec<InteractiveRequest>>>,
+        blur_requests: Arc<Mutex<Vec<BlurRequest>>>,
+        integration_requests: Arc<Mutex<Vec<IntegrationRequest>>>,
+        output_refresh: Arc<Mutex<HashMap<wl_output::WlOutput, Duration>>>,
+        shortcut_requests: Option<ShortcutRequests>,
+        size: LogicalSize,
+        pointer_passthrough: bool,
+    ) -> Self {
+        Self {
+            id,
+            surface,
+            display: connection.display(),
+            input_serial,
+            _connection: connection,
+            scale_factor: AtomicU32::new(1),
+            inner_size: Mutex::new(PhysicalSize {
+                width: size.width.ceil().max(1.0) as u32,
+                height: size.height.ceil().max(1.0) as u32,
+            }),
+            ready: AtomicBool::new(false),
+            decorations: Mutex::new(DecorationNegotiation::new(false)),
+            titlebar_fallback: AtomicBool::new(false),
+            requested_redraw: AtomicBool::new(true),
+            visible: AtomicBool::new(false),
+            close_requests,
+            window_state_requests,
+            cursor_requests,
+            drag_requests,
+            interactive_requests,
+            blur_requests,
+            integration_requests,
+            output_refresh,
+            pointer_passthrough,
+            panel_surface: Mutex::new(None),
+            is_popup: AtomicBool::new(false),
+            shortcut_requests,
+        }
+    }
+
+    fn set_inner_size(&self, size: PhysicalSize) {
+        *self.inner_size.lock().expect("window size lock poisoned") = size;
+    }
+
+    fn inner_size(&self) -> PhysicalSize {
+        *self.inner_size.lock().expect("window size lock poisoned")
+    }
+
+    fn set_ready(&self) {
+        self.ready.store(true, Ordering::Release);
+    }
+
+    fn pointer_passthrough(&self) -> bool {
+        self.pointer_passthrough
+    }
+
+    #[cfg_attr(not(feature = "window-integration-blair"), allow(dead_code))]
+    fn wants_titlebar_fallback(&self) -> bool {
+        self.titlebar_fallback.load(Ordering::Acquire)
+    }
+
+    #[cfg_attr(not(feature = "window-integration-blair"), allow(dead_code))]
+    fn configure_integration(
+        &self,
+        mode: CompositorIntegrationMode,
+        controls: CompositorControls,
+    ) -> WindowDecorations {
+        self.decorations
+            .lock()
+            .expect("decoration lock poisoned")
+            .integrate(mode, controls)
+    }
+}
+
+impl HasWindowHandle for Window {
+    fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
+        let surface = proxy_pointer(&self.surface)?;
+        Ok(unsafe {
+            WindowHandle::borrow_raw(RawWindowHandle::Wayland(WaylandWindowHandle::new(surface)))
+        })
+    }
+}
+
+impl HasDisplayHandle for Window {
+    fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
+        let display = proxy_pointer(&self.display)?;
+        Ok(unsafe {
+            DisplayHandle::borrow_raw(RawDisplayHandle::Wayland(WaylandDisplayHandle::new(
+                display,
+            )))
+        })
+    }
+}
+
+impl PlatformWindow for Window {
+    fn input_serial(&self) -> Option<crate::InputSerial> {
+        *self
+            .input_serial
+            .lock()
+            .expect("input serial lock poisoned")
+    }
+
+    fn supports_native_popups(&self) -> bool {
+        true
+    }
+    fn set_title(&self, title: &str) {
+        self.window_state_requests
+            .lock()
+            .expect("window state request lock poisoned")
+            .entry(self.id)
+            .or_default()
+            .title = Some(title.into());
+    }
+    fn window_decorations(&self) -> WindowDecorations {
+        self.decorations
+            .lock()
+            .expect("decoration lock poisoned")
+            .effective()
+    }
+    fn id(&self) -> WindowId {
+        self.id
+    }
+
+    fn request_redraw(&self) {
+        self.requested_redraw.store(true, Ordering::Release);
+    }
+
+    fn refresh_interval(&self) -> Option<Duration> {
+        let surface_data = self.surface.data::<SurfaceData>()?;
+        let output_refresh = self
+            .output_refresh
+            .lock()
+            .expect("output refresh lock poisoned");
+        surface_data
+            .outputs()
+            .filter_map(|output| output_refresh.get(&output).copied())
+            .min()
+    }
+
+    fn close(&self) {
+        self.close_requests
+            .lock()
+            .expect("window close request lock poisoned")
+            .push(self.id);
+    }
+
+    fn request_inner_size(&self, size: LogicalSize) {
+        if self.is_popup.load(Ordering::Acquire) {
+            self.window_state_requests
+                .lock()
+                .expect("window state request lock poisoned")
+                .entry(self.id)
+                .or_default()
+                .popup_size = Some(size);
+            self.request_redraw();
+            return;
+        }
+        if let Some((role, surface)) = self
+            .panel_surface
+            .lock()
+            .expect("panel surface lock poisoned")
+            .as_ref()
+        {
+            let (width, height, exclusive_zone) = panel_dimensions(*role, size);
+            surface.set_size(width, height);
+            surface.set_exclusive_zone(exclusive_zone);
+            self.surface.commit();
+            return;
+        }
+        self.set_inner_size(PhysicalSize {
+            width: size.width.ceil().max(1.0) as u32,
+            height: size.height.ceil().max(1.0) as u32,
+        });
+        self.request_redraw();
+    }
+
+    fn set_min_inner_size(&self, size: Option<LogicalSize>) {
+        self.window_state_requests
+            .lock()
+            .expect("window state request lock poisoned")
+            .entry(self.id)
+            .or_default()
+            .minimum = Some(size.map(|size| {
+            (
+                size.width.ceil().max(1.0) as u32,
+                size.height.ceil().max(1.0) as u32,
+            )
+        }));
+    }
+    fn set_outer_position(&self, _: LogicalPosition) {}
+    fn outer_position(&self) -> Option<PhysicalPosition> {
+        None
+    }
+    fn monitor_size(&self) -> Option<PhysicalSize> {
+        None
+    }
+    fn scale_factor(&self) -> f64 {
+        self.scale_factor.load(Ordering::Acquire) as f64
+    }
+    fn inner_size(&self) -> PhysicalSize {
+        self.inner_size()
+    }
+    fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
+    fn set_visible(&self, visible: bool) {
+        self.visible.store(visible, Ordering::Release);
+    }
+    fn set_minimized(&self, minimized: bool) {
+        if !minimized {
+            log::debug!("creamui-platform: xdg-shell cannot restore a minimized window");
+            return;
+        }
+        self.window_state_requests
+            .lock()
+            .expect("window state request lock poisoned")
+            .entry(self.id)
+            .or_default()
+            .minimize = true;
+    }
+    fn set_maximized(&self, maximized: bool) {
+        self.window_state_requests
+            .lock()
+            .expect("window state request lock poisoned")
+            .entry(self.id)
+            .or_default()
+            .maximized = Some(maximized);
+    }
+    fn set_window_level(&self, _: WindowLevel) {}
+    fn drag_window(&self) -> Result<(), String> {
+        Err("Wayland interactive move requires an input serial".to_owned())
+    }
+    fn drag_window_with_serial(&self, serial: crate::InputSerial) -> Result<(), String> {
+        self.interactive_requests
+            .lock()
+            .expect("interactive request lock poisoned")
+            .push(InteractiveRequest {
+                window_id: self.id,
+                serial: serial.0,
+                resize: None,
+            });
+        Ok(())
+    }
+    fn drag_resize_window(&self, _: ResizeDirection) -> Result<(), String> {
+        Err("Wayland interactive resize requires an input serial".to_owned())
+    }
+    fn drag_resize_window_with_serial(
+        &self,
+        direction: ResizeDirection,
+        serial: crate::InputSerial,
+    ) -> Result<(), String> {
+        self.interactive_requests
+            .lock()
+            .expect("interactive request lock poisoned")
+            .push(InteractiveRequest {
+                window_id: self.id,
+                serial: serial.0,
+                resize: Some(direction),
+            });
+        Ok(())
+    }
+    fn set_cursor(&self, icon: CursorIcon) {
+        let mut requests = self
+            .cursor_requests
+            .lock()
+            .expect("cursor request lock poisoned");
+        requests.retain(|(window_id, _)| *window_id != self.id);
+        requests.push((self.id, icon));
+    }
+    fn focus(&self) {}
+    fn set_blur_region(&self, region: Option<BlurRegion>) {
+        let mut requests = self
+            .blur_requests
+            .lock()
+            .expect("blur request lock poisoned");
+        requests.retain(|request| request.window_id != self.id);
+        requests.push(BlurRequest {
+            window_id: self.id,
+            region,
+        });
+    }
+
+    fn set_shortcuts_inhibited(&self, inhibited: bool) -> Result<(), String> {
+        let requests = self
+            .shortcut_requests
+            .as_ref()
+            .ok_or_else(|| "Compositor does not support shortcut inhibition".to_owned())?;
+        requests
+            .lock()
+            .map_err(|_| "Shortcut request lock poisoned".to_owned())?
+            .push((self.id, inhibited));
+        self.request_redraw();
+        Ok(())
+    }
+    fn set_compositor_integration(&self, request: Option<CompositorIntegrationRequest>) {
+        let mut requests = self
+            .integration_requests
+            .lock()
+            .expect("integration request lock poisoned");
+        requests.retain(|pending| pending.window_id != self.id);
+        requests.push(IntegrationRequest {
+            window_id: self.id,
+            request,
+        });
+    }
+    fn start_drag(
+        &self,
+        serial: crate::InputSerial,
+        mime_types: &[String],
+        icon: Option<DragIcon>,
+    ) -> Result<(), String> {
+        self.drag_requests
+            .lock()
+            .map_err(|_| "drag request lock poisoned".to_owned())?
+            .push(DragRequest {
+                window_id: self.id,
+                serial: serial.0,
+                mime_types: mime_types.to_vec(),
+                data: Vec::new(),
+                icon,
+            });
+        Ok(())
+    }
+    fn start_drag_with_data(
+        &self,
+        serial: crate::InputSerial,
+        data: &[(String, Vec<u8>)],
+        icon: Option<DragIcon>,
+    ) -> Result<(), String> {
+        self.drag_requests
+            .lock()
+            .map_err(|_| "drag request lock poisoned".to_owned())?
+            .push(DragRequest {
+                window_id: self.id,
+                serial: serial.0,
+                mime_types: data.iter().map(|(mime, _)| mime.clone()).collect(),
+                data: data.to_vec(),
+                icon,
+            });
+        Ok(())
+    }
+}
+
+fn dispatch_redraws(runtime: &RcRuntime) {
+    let mut runtime = runtime.borrow_mut();
+    let redraws: Vec<_> = runtime
+        .windows
+        .iter()
+        .filter_map(|(id, window)| {
+            window
+                .handle()
+                .requested_redraw
+                .swap(false, Ordering::AcqRel)
+                .then_some(*id)
+        })
+        .collect();
+    runtime.events.extend(
+        redraws
+            .into_iter()
+            .map(|id| (id, WindowEvent::RedrawRequested)),
+    );
+}
+
+fn timeout_for(state: &LoopState) -> Duration {
+    match *state
+        .control_flow
+        .lock()
+        .expect("control flow lock poisoned")
+    {
+        ControlFlow::Wait => USER_EVENT_POLL_INTERVAL,
+        ControlFlow::WaitUntil(instant) => instant
+            .saturating_duration_since(Instant::now())
+            .min(USER_EVENT_POLL_INTERVAL),
+    }
+}
+
+fn proxy_pointer<P: Proxy>(proxy: &P) -> Result<NonNull<c_void>, HandleError> {
+    NonNull::new(proxy.id().as_ptr().cast()).ok_or(HandleError::Unavailable)
+}
+
+fn pointer_button(button: u32) -> MouseButton {
+    match button {
+        0x110 => MouseButton::Left,
+        0x111 => MouseButton::Right,
+        0x112 => MouseButton::Middle,
+        value => MouseButton::Other(value.min(u16::MAX as u32) as u16),
+    }
+}
+
+fn wayland_axis_delta(axis: wl_pointer::Axis, value: f64) -> Option<MouseScrollDelta> {
+    // Wayland's axis convention is positive for down/right, while
+    // MouseScrollDelta follows winit's positive-up/left convention. Keep
+    // backend events consistent before the renderer converts them into a
+    // positive scroll-view offset.
+    match axis {
+        wl_pointer::Axis::VerticalScroll => Some(MouseScrollDelta::PixelDelta(PhysicalPosition {
+            x: 0.0,
+            y: -value,
+        })),
+        wl_pointer::Axis::HorizontalScroll => {
+            Some(MouseScrollDelta::PixelDelta(PhysicalPosition {
+                x: -value,
+                y: 0.0,
+            }))
+        }
+        _ => None,
+    }
+}
+
+fn cursor_shape(icon: CursorIcon) -> Shape {
+    match icon {
+        CursorIcon::Default => Shape::Default,
+        CursorIcon::Text => Shape::Text,
+        CursorIcon::Pointer => Shape::Pointer,
+        CursorIcon::NotAllowed => Shape::NotAllowed,
+        CursorIcon::ResizeHorizontal => Shape::EwResize,
+        CursorIcon::ResizeVertical => Shape::NsResize,
+        CursorIcon::ResizeNwse => Shape::NwseResize,
+        CursorIcon::ResizeNesw => Shape::NeswResize,
+    }
+}
+
+fn keyboard_key(key: u32, xkb_state: Option<&xkb::State>) -> Key {
+    // Structural keys always win: xkb's own UTF-8 mapping for e.g.
+    // Backspace/Tab/Enter is a control character rather than empty, which
+    // would otherwise smuggle it in as literal inserted text below.
+    let structural = match key {
+        29 | 97 => Some(Key::Control),
+        42 | 54 => Some(Key::Shift),
+        56 | 100 => Some(Key::Alt),
+        125 | 126 => Some(Key::Super),
+        113 => Some(Key::Media("XF86AudioMute".into())),
+        114 => Some(Key::Media("XF86AudioLowerVolume".into())),
+        115 => Some(Key::Media("XF86AudioRaiseVolume".into())),
+        163 => Some(Key::Media("XF86AudioNext".into())),
+        164 => Some(Key::Media("XF86AudioPlay".into())),
+        165 => Some(Key::Media("XF86AudioPrev".into())),
+        166 => Some(Key::Media("XF86AudioStop".into())),
+        224 => Some(Key::Media("XF86MonBrightnessDown".into())),
+        225 => Some(Key::Media("XF86MonBrightnessUp".into())),
+        248 => Some(Key::Media("XF86AudioMicMute".into())),
+        1 => Some(Key::Escape),
+        14 => Some(Key::Backspace),
+        15 => Some(Key::Tab),
+        28 => Some(Key::Enter),
+        57 => Some(Key::Space),
+        102 => Some(Key::Home),
+        103 => Some(Key::Up),
+        104 => Some(Key::PageUp),
+        105 => Some(Key::Left),
+        106 => Some(Key::Right),
+        107 => Some(Key::End),
+        108 => Some(Key::Down),
+        109 => Some(Key::PageDown),
+        110 => Some(Key::Insert),
+        111 => Some(Key::Delete),
+        _ => None,
+    };
+    if let Some(key) = structural {
+        return key;
+    }
+    // `key_get_utf8` replicates XLookupString's Ctrl-stripping (Ctrl+A
+    // becomes 0x01), which is exactly wrong for us: widgets already get
+    // `modifiers.ctrl` separately and expect the plain letter alongside it.
+    // `key_get_one_sym` + `keysym_to_utf8` gives that plain letter (Shift
+    // still applies) without the Ctrl transform.
+    if let Some(character) = xkb_state
+        .map(|state| xkb::keysym_to_utf8(state.key_get_one_sym(xkb::Keycode::new(key + 8))))
+        .filter(|character| !character.is_empty())
+    {
+        return Key::Character(character);
+    }
+    match key {
+        59 => Key::F1,
+        60 => Key::F2,
+        61 => Key::F3,
+        62 => Key::F4,
+        63 => Key::F5,
+        64 => Key::F6,
+        65 => Key::F7,
+        66 => Key::F8,
+        67 => Key::F9,
+        68 => Key::F10,
+        87 => Key::F11,
+        88 => Key::F12,
+        _ => Key::Other,
+    }
+}
+
+fn dispatch_with_timeout(
+    connection: &Connection,
+    queue: &mut smithay_client_toolkit::reexports::client::EventQueue<DispatchState>,
+    timeout: Duration,
+    state: &mut DispatchState,
+) -> Result<(), String> {
+    queue
+        .dispatch_pending(state)
+        .map_err(|error| error.to_string())?;
+    connection.flush().map_err(|error| error.to_string())?;
+    if let Some(guard) = connection.prepare_read() {
+        let mut descriptor = libc::pollfd {
+            fd: connection.backend().poll_fd().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let milliseconds = timeout.as_millis().min(i32::MAX as u128) as i32;
+        let ready = unsafe { libc::poll(&mut descriptor, 1, milliseconds) };
+        if ready < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        if ready > 0 {
+            guard.read().map_err(|error| error.to_string())?;
+        }
+    }
+    queue
+        .dispatch_pending(state)
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// Parses a `text/uri-list` payload into local paths (`file://` only).
+pub(crate) fn parse_uri_list(payload: &str) -> Vec<std::path::PathBuf> {
+    payload
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| line.strip_prefix("file://"))
+        .filter_map(|rest| {
+            // `file://host/path` — only accept empty or localhost hosts.
+            let path = if rest.starts_with('/') {
+                rest.to_owned()
+            } else {
+                let (host, path) = rest.split_once('/')?;
+                if host != "localhost" {
+                    return None;
+                }
+                format!("/{path}")
+            };
+            let decoded = percent_decode(path.as_bytes());
+            if decoded.is_empty() {
+                None
+            } else {
+                use std::os::unix::ffi::OsStringExt;
+                Some(std::path::PathBuf::from(std::ffi::OsString::from_vec(
+                    decoded,
+                )))
+            }
+        })
+        .collect()
+}
+
+fn percent_decode(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) =
+                u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
+            {
+                out.push(hex);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests;

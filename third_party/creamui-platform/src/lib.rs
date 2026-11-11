@@ -1,0 +1,177 @@
+//! Common window-platform types for CreamUI.
+
+#[cfg(all(feature = "android", target_os = "android"))]
+mod android_insets;
+mod types;
+#[cfg(all(feature = "wayland", target_os = "linux"))]
+pub mod wayland;
+#[cfg(target_arch = "wasm32")]
+mod web_insets;
+#[cfg(target_os = "windows")]
+mod windows_titlebar;
+#[cfg(not(all(feature = "wayland", target_os = "linux")))]
+mod winit;
+
+pub use self::types::*;
+#[cfg(all(feature = "wayland", target_os = "linux"))]
+pub use self::wayland::runtime::{
+    ActiveEventLoop, ApplicationHandler, EventLoop, EventLoopBuilder, EventLoopProxy, Window,
+};
+#[cfg(not(all(feature = "wayland", target_os = "linux")))]
+pub use self::winit::{
+    set_app_id, ActiveEventLoop, ApplicationHandler, EventLoop, EventLoopBuilder, EventLoopProxy, Window,
+};
+#[cfg(all(feature = "android", target_os = "android"))]
+pub use ::winit::platform::android::activity::AndroidApp;
+
+/// Fullscreen the native surface and set status/navigation icon contrast.
+///
+/// `light_background` requests dark icons. Desktop and web backends ignore
+/// the call. Returns whether the platform accepted it.
+pub fn sync_system_bars(window: &dyn PlatformWindow, light_background: bool) -> bool {
+    window.sync_system_bars(light_background)
+}
+
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use std::sync::Arc;
+use std::time::Duration;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendKind {
+    Winit,
+    Wayland,
+    X11,
+    Windows,
+}
+
+pub trait PlatformWindow: HasDisplayHandle + HasWindowHandle + Send + Sync {
+    /// The latest pointer or keyboard press received by this native client.
+    fn input_serial(&self) -> Option<InputSerial> {
+        None
+    }
+
+    fn id(&self) -> WindowId;
+    fn request_redraw(&self);
+    /// Called right before a frame is handed to the compositor, so the
+    /// platform can throttle redraws to the display.
+    fn pre_present_notify(&self) {}
+    /// Whether redraws requested after [`PlatformWindow::pre_present_notify`]
+    /// are delivered at most once per display refresh.
+    fn paces_redraws(&self) -> bool {
+        false
+    }
+    /// The refresh period of the display showing this window, when known.
+    fn refresh_interval(&self) -> Option<Duration> {
+        None
+    }
+    fn close(&self);
+    fn set_title(&self, _title: &str) {}
+    fn request_inner_size(&self, size: LogicalSize);
+    fn set_min_inner_size(&self, size: Option<LogicalSize>);
+    fn set_outer_position(&self, position: LogicalPosition);
+    fn outer_position(&self) -> Option<PhysicalPosition>;
+    fn monitor_size(&self) -> Option<PhysicalSize>;
+    fn scale_factor(&self) -> f64;
+    fn inner_size(&self) -> PhysicalSize;
+    /// Logical-pixel bands covered by system UI that overlaps this window.
+    ///
+    /// Desktop client areas return [`SafeArea::ZERO`]. Android combines
+    /// window insets (system bars, display cutout, and the IME) with the
+    /// native content rectangle. The web backend reads
+    /// `env(safe-area-inset-*)`.
+    fn safe_area(&self) -> SafeArea {
+        SafeArea::ZERO
+    }
+    /// Sets native system bar appearance. Platforms without system bars accept the call.
+    fn sync_system_bars(&self, light_background: bool) -> bool {
+        let _ = light_background;
+        true
+    }
+    fn is_ready(&self) -> bool;
+    fn supports_native_popups(&self) -> bool {
+        false
+    }
+    /// Effective decoration negotiation. Undecorated backends return `None`.
+    fn window_decorations(&self) -> WindowDecorations {
+        WindowDecorations::default()
+    }
+    fn set_visible(&self, visible: bool);
+    fn set_minimized(&self, minimized: bool);
+    fn set_maximized(&self, maximized: bool);
+    fn set_window_level(&self, level: WindowLevel);
+    fn drag_window(&self) -> Result<(), String>;
+    /// Starts a compositor move with the serial of the initiating pointer press.
+    fn drag_window_with_serial(&self, serial: InputSerial) -> Result<(), String> {
+        let _ = serial;
+        self.drag_window()
+    }
+    fn drag_resize_window(&self, direction: ResizeDirection) -> Result<(), String>;
+    /// Starts a compositor resize with the serial of the initiating pointer press.
+    fn drag_resize_window_with_serial(
+        &self,
+        direction: ResizeDirection,
+        serial: InputSerial,
+    ) -> Result<(), String> {
+        let _ = serial;
+        self.drag_resize_window(direction)
+    }
+    fn set_cursor(&self, icon: CursorIcon);
+    fn focus(&self);
+    /// Enables or disables the platform text input method for this window.
+    fn set_ime_allowed(&self, allowed: bool) {
+        let _ = allowed;
+    }
+    fn set_shortcuts_inhibited(&self, inhibited: bool) -> Result<(), String> {
+        let _ = inhibited;
+        Err("Shortcut inhibition is unavailable on this platform".into())
+    }
+    /// Requests compositor-side background blur behind `region`, or clears
+    /// it with `None`. Default: unsupported, for backends/compositors with
+    /// no such protocol (the window stays plain-transparent instead).
+    fn set_blur_region(&self, region: Option<BlurRegion>) {
+        let _ = region;
+    }
+    /// Requests an optional compositor integration for this window. Unsupported
+    /// backends and compositors keep their standard decoration negotiation.
+    fn set_compositor_integration(&self, request: Option<CompositorIntegrationRequest>) {
+        let _ = request;
+    }
+    /// Starts a real drag-and-drop grab (e.g. a desktop icon dragged toward
+    /// the dock or an external app), handed off to the compositor from
+    /// `serial` — the input serial of the pointer-button-press that
+    /// started it. `mime_types` are what the drag offers to a drop target.
+    /// Default: unsupported, for backends with no such protocol.
+    fn start_drag(
+        &self,
+        serial: InputSerial,
+        mime_types: &[String],
+        icon: Option<DragIcon>,
+    ) -> Result<(), String> {
+        let _ = (serial, mime_types, icon);
+        Err("drag-and-drop is not supported on this backend".to_owned())
+    }
+    fn start_drag_with_data(
+        &self,
+        serial: InputSerial,
+        data: &[(String, Vec<u8>)],
+        icon: Option<DragIcon>,
+    ) -> Result<(), String> {
+        let _ = (serial, data, icon);
+        Err("drag payloads are not supported on this backend".to_owned())
+    }
+    #[cfg(target_arch = "wasm32")]
+    fn canvas(&self) -> Option<web_sys::HtmlCanvasElement>;
+}
+
+pub trait PlatformBackend {
+    fn kind(&self) -> BackendKind;
+    fn create_window(
+        &self,
+        attributes: WindowAttributes,
+    ) -> Result<Arc<dyn PlatformWindow>, String>;
+    fn create_popup(
+        &self,
+        attributes: WindowAttributes,
+        popup: PopupOptions,
+    ) -> Result<Arc<dyn PlatformWindow>, String>;
+}

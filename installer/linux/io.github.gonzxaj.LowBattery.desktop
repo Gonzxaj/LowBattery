@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=LowBattery
+GenericName=Peripheral battery monitor
+GenericName[es]=Monitor de batería de periféricos
+Comment=Battery levels of wireless mice, keyboards, headsets and controllers
+Comment[es]=Nivel de batería de mouse, teclados, auriculares y controles inalámbricos
+Exec=lowbattery
+Icon=io.github.gonzxaj.LowBattery
+Terminal=false
+Categories=System;Monitor;
+Keywords=battery;mouse;keyboard;headset;bluetooth;logitech;steelseries;razer;
+StartupWMClass=io.github.gonzxaj.LowBattery
+SingleMainWindow=true

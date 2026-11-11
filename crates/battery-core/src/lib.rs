@@ -79,6 +79,8 @@ pub struct BatteryStatus {
 impl BatteryStatus {
     pub const ASLEEP: Self = Self { level: None, charge: Charge::Unknown, link: Link::Asleep };
     pub const GONE: Self = Self { level: None, charge: Charge::Unknown, link: Link::Disconnected };
+    /// Connected, but the device has no way to report its battery.
+    pub const PRESENT: Self = Self { level: None, charge: Charge::Unknown, link: Link::Connected };
 
     pub fn connected(level: u8, charge: Charge) -> Self {
         Self { level: Some(level.min(100)), charge, link: Link::Connected }
