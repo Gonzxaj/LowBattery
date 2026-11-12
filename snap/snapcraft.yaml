@@ -28,12 +28,22 @@ apps:
     # (raw HID) only work in the .deb / tarball / Flatpak builds.
 
 parts:
+  # The rust plugin's rustup snap is not found under the gnome extension on
+  # Launchpad builders, so the toolchain comes from rustup's installer instead.
+  rust-deps:
+    plugin: nil
+    build-packages: [curl]
+    override-build: |
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+
   lowbattery:
+    after: [rust-deps]
     plugin: rust
     source: .
     rust-path: [crates/app]
-    rust-channel: stable
-    build-snaps: [rustup] # core24's rust plugin installs the toolchain through rustup
+    # "none": skip the plugin's `rustup update` in pull (rust-deps isn't built
+    # yet then) and use rust-deps' cargo; the plugin adds ~/.cargo/bin to PATH.
+    rust-channel: "none"
     build-packages: [pkg-config, libwayland-dev]
     parse-info: [usr/share/metainfo/io.github.gonzxaj.LowBattery.metainfo.xml]
     override-build: |
