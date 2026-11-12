@@ -32,7 +32,9 @@ parts:
     plugin: rust
     source: .
     rust-path: [crates/app]
-    build-packages: [pkg-config]
+    rust-channel: stable
+    build-snaps: [rustup] # core24's rust plugin installs the toolchain through rustup
+    build-packages: [pkg-config, libwayland-dev]
     parse-info: [usr/share/metainfo/io.github.gonzxaj.LowBattery.metainfo.xml]
     override-build: |
       craftctl default
