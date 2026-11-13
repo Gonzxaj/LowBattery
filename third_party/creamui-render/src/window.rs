@@ -1,20 +1,5 @@
-// Modified by Gonzalo Carranza (2026): Pipeline::invalidate_surface and its calls
-// (restore from minimized, WindowHandle::show, WindowEvent::Occluded(false) on
-// X11 map), and WindowHandle::resize adopting
-// sizes the platform applies at once (Wayland), WindowOptions::app_id
-// (inherited by popups), WindowHandle::on_moved, and WindowHandle::raw_window_handle /
-// raw_display_handle - see third_party/README.md.
-//! Window creation and the reactive render loop.
-//!
-//! [`run`] opens one window; [`AppBuilder`] opens several, all sharing one
-//! platform event loop and, for GPU windows, one `wgpu` instance. Every
-//! window keeps its own reactive state, so a signal change in one never
-//! touches another's frame.
-//!
-//! Signal writes and input only invalidate a window. On the next
-//! `RedrawRequested` the window rebuilds and lays out its widgets if needed,
-//! records a display list, diffs it against the frame on screen and hands
-//! only the changed regions to its presenter.
+// Modified by Gonzalo Carranza (2026): WindowHandle::on_moved, and
+// WindowHandle::raw_window_handle / raw_display_handle - see third_party/README.md.
 
 use crate::backend::RenderBackend;
 #[cfg(not(target_arch = "wasm32"))]
@@ -863,6 +848,7 @@ struct Pipeline {
     window_controls: WindowControls,
     clear_color: Color,
     focused: Cell<Option<usize>>,
+    modal_focus_return: Cell<Option<creamui_core::FocusId>>,
     /// A legacy widget tree may reveal a text field in response to a click
     /// or shortcut. Focus it after that freshly-built scene is available.
     pending_text_input_focus: Cell<bool>,
@@ -870,6 +856,8 @@ struct Pipeline {
     pending_root: RefCell<Option<BoxedWidget>>,
     needs_layout: Cell<bool>,
     needs_paint: Cell<bool>,
+    /// A programmatic resize is pending; the next redraw rereads the window size.
+    size_requested: Cell<bool>,
     dump_frame_path: Option<String>,
 }
 
@@ -1030,6 +1018,16 @@ impl Pipeline {
         }
     }
 
+    /// winit on Wayland applies the size at once and sends no `Resized`, so
+    /// the next redraw rereads the window size instead of waiting for one.
+    fn request_inner_size(&self, size: LogicalSize) {
+        if let Some(window) = self.window.borrow().as_ref() {
+            window.request_inner_size(size);
+        }
+        self.size_requested.set(true);
+        self.request_redraw();
+    }
+
     /// Rebuilds the widget tree from `build_ui`. Runs inside the window's
     /// reactive effect so it stays subscribed to whatever it reads; layout
     /// and paint wait for the next frame.
@@ -1179,11 +1177,19 @@ impl Pipeline {
                     renderer.paint(recorder, self.focused.get(), self.caret_visible.get())
                 {
                     let previous_index = self.focused.get();
-                    let entering_modal = scene
-                        .as_ref()
-                        .is_none_or(|previous| previous.modal_focus().is_none());
+                    let previous_modal = scene.as_ref().is_some_and(|previous| previous.is_modal());
+                    let entering_modal = !previous_modal && next.is_modal();
+                    let leaving_modal = previous_modal && !next.is_modal();
+                    if entering_modal {
+                        self.modal_focus_return.set(previous_focus);
+                    }
+                    let restore = leaving_modal
+                        .then(|| self.modal_focus_return.replace(None))
+                        .flatten();
                     let focused = if self.pending_text_input_focus.replace(false) {
                         next.first_text_input()
+                    } else if let Some(index) = restore.and_then(|id| next.focus_index(id)) {
+                        Some(index)
                     } else if scene.is_some() {
                         previous_focus.and_then(|id| next.focus_index(id))
                     } else {
@@ -1885,29 +1891,12 @@ impl WindowHandle {
         }
     }
 
-    /// Requests a new logical-pixel window size. The actual resize (and any
-    /// resulting `Resized` event) happens asynchronously, same as a user
-    /// dragging the window border.
+    /// Requests a new logical-pixel window size. Some platforms apply it
+    /// later with a `Resized` event, others (Wayland) at once; the next frame
+    /// is laid out for the new size either way.
     pub fn resize(&self, width: u32, height: u32) {
-        if let Some(window) = self.window.borrow().as_ref() {
-            window.request_inner_size(LogicalSize::new(width as f64, height as f64));
-            // Wayland applies a client-requested size at once and sends no
-            // `Resized`: adopt the new size here, or frames keep the old
-            // surface size and get stretched into the new window.
-            if let Some(pipeline) = self.pipeline.upgrade() {
-                let physical = window.inner_size();
-                let scale = pipeline.scale_factor.peek();
-                let size = Size {
-                    width: (physical.width as f64 / scale) as f32,
-                    height: (physical.height as f64 / scale) as f32,
-                };
-                if size.width > 0.0 && size.height > 0.0 && pipeline.surface.peek() != size {
-                    pipeline.surface.set(size);
-                    pipeline.sync_frame();
-                    pipeline.invalidate_layout();
-                    pipeline.invalidate_surface();
-                }
-            }
+        if let Some(pipeline) = self.pipeline.upgrade() {
+            pipeline.request_inner_size(LogicalSize::new(width as f64, height as f64));
         }
     }
 
@@ -3114,6 +3103,13 @@ impl WindowState {
             self.pipeline.invalidate_paint();
             return;
         }
+        if key.key == Key::Escape {
+            if let Some(dismiss) = self.scene(|scene| scene.modal_dismiss().cloned()) {
+                dismiss();
+                self.pipeline.invalidate_layout();
+                return;
+            }
+        }
         let Some(index) = self.pipeline.focused.get() else {
             return;
         };
@@ -3909,6 +3905,12 @@ impl WindowState {
             self.pipeline.invalidate_layout();
         }
         self.refresh_safe_area();
+        if self.pipeline.size_requested.take() {
+            let viewport = self.viewport_from_window();
+            if viewport.width > 0.0 && viewport.height > 0.0 {
+                self.queue_viewport(viewport);
+            }
+        }
         self.flush_pending_viewport();
         self.pipeline.update();
         let ready = self
@@ -4929,11 +4931,13 @@ fn build_window_spec(
         window_controls,
         clear_color,
         focused: Cell::new(options.focus_first.then_some(0)),
+        modal_focus_return: Cell::new(None),
         pending_text_input_focus: Cell::new(false),
         caret_visible: Cell::new(true),
         pending_root: RefCell::new(None),
         needs_layout: Cell::new(true),
         needs_paint: Cell::new(true),
+        size_requested: Cell::new(false),
         dump_frame_path,
     });
     let effect = create_effect({
@@ -5036,7 +5040,13 @@ mod tests {
         }
         fn request_redraw(&self) {}
         fn close(&self) {}
-        fn request_inner_size(&self, _: LogicalSize) {}
+        // Applies at once without a `Resized`, like winit on Wayland.
+        fn request_inner_size(&self, size: LogicalSize) {
+            *self.size.lock().unwrap() = Some(creamui_platform::PhysicalSize {
+                width: size.width as u32,
+                height: size.height as u32,
+            });
+        }
         fn set_min_inner_size(&self, size: Option<LogicalSize>) {
             self.minimum.lock().unwrap().push(size);
         }
@@ -7925,6 +7935,103 @@ mod tests {
         assert_eq!(hook_sizes.borrow().last().unwrap().width, 160.0);
         let frame = harness.state.pipeline.frame.borrow();
         assert_eq!(frame.presented.as_ref().unwrap().width, 160);
+    }
+
+    #[test]
+    fn restoring_from_zero_size_presents_a_full_frame() {
+        let mut harness = WindowEventHarness::new(|_| {
+            Box::new(SmallHoverRoot {
+                paint_calls: Rc::new(Cell::new(0)),
+            })
+        });
+        harness.send(WindowEvent::RedrawRequested);
+        let size = harness
+            .state
+            .pipeline
+            .frame
+            .borrow()
+            .presented
+            .as_ref()
+            .map(|l| (l.width, l.height));
+        let (width, height) = size.expect("the harness presents a first frame");
+        // A hover leaves a partial last frame, so only a fresh full frame passes below.
+        harness.send(WindowEvent::CursorMoved {
+            position: creamui_platform::PhysicalPosition { x: 10.0, y: 10.0 },
+        });
+        harness.send(WindowEvent::RedrawRequested);
+        {
+            let frame = harness.state.pipeline.frame.borrow();
+            assert!(frame.last_report.damaged_pixels < frame.last_report.frame_pixels);
+        }
+        // Minimize: zero-sized surface, then restore at the same size.
+        harness.send(WindowEvent::Resized(creamui_platform::PhysicalSize {
+            width: 0,
+            height: 0,
+        }));
+        harness.send(WindowEvent::Resized(creamui_platform::PhysicalSize {
+            width,
+            height,
+        }));
+        harness.send(WindowEvent::RedrawRequested);
+        let frame = harness.state.pipeline.frame.borrow();
+        let report = &frame.last_report;
+        assert_eq!(
+            report.damaged_pixels, report.frame_pixels,
+            "an unchanged frame must still repaint whole after a restore: {report:?}"
+        );
+    }
+
+    #[test]
+    fn an_invalidated_surface_presents_a_full_frame() {
+        let mut harness = WindowEventHarness::new(|_| {
+            Box::new(SmallHoverRoot {
+                paint_calls: Rc::new(Cell::new(0)),
+            })
+        });
+        harness.send(WindowEvent::RedrawRequested);
+        harness.send(WindowEvent::CursorMoved {
+            position: creamui_platform::PhysicalPosition { x: 10.0, y: 10.0 },
+        });
+        harness.send(WindowEvent::RedrawRequested);
+        // What `WindowHandle::show()` does after a `hide()` (tray "open").
+        harness.state.pipeline.invalidate_surface();
+        harness.send(WindowEvent::RedrawRequested);
+        let frame = harness.state.pipeline.frame.borrow();
+        let report = &frame.last_report;
+        assert_eq!(
+            report.damaged_pixels, report.frame_pixels,
+            "showing a hidden window must repaint it whole: {report:?}"
+        );
+    }
+
+    #[test]
+    fn a_programmatic_resize_without_a_resized_event_lays_out_the_new_size() {
+        let sizes = Rc::new(RefCell::new(Vec::new()));
+        let mut harness = WindowEventHarness::new({
+            let sizes = sizes.clone();
+            move |size| {
+                sizes.borrow_mut().push(size);
+                Box::new(BlankWidget)
+            }
+        });
+        let window = Arc::new(InteractiveTestWindow::default());
+        *harness.state.pipeline.window.borrow_mut() = Some(window);
+        // Wayland: the size applies at once and no `Resized` follows.
+        harness
+            .state
+            .pipeline
+            .request_inner_size(LogicalSize::new(250.0, 84.0));
+        harness.send(WindowEvent::RedrawRequested);
+        assert_eq!(
+            sizes.borrow().last().copied(),
+            Some(Size {
+                width: 250.0,
+                height: 84.0
+            })
+        );
+        let frame = harness.state.pipeline.frame.borrow();
+        let presented = frame.presented.as_ref().unwrap();
+        assert_eq!((presented.width, presented.height), (250, 84));
     }
 
     #[test]

@@ -22,15 +22,16 @@ opt-level = 2
 # creamui from GitHub main (newer than the 0.3.0 release, same version number),
 # with our two patched crates swapped in. See third_party/README.md.
 # shortcut: pinned to an unreleased commit; go back to crates.io once a release
-# includes the fixes we carry (restore repaint, Wayland resize, app_id).
+# includes upstream's restore repaint, Wayland resize and app_id fixes (PRs #4-#6)
+# plus what we still carry (Moved event, native handles).
 [patch.crates-io]
-creamui = { git = "https://github.com/sammwyy/creamui", rev = "a36a4bcdbb066702a9b85827133ee8cb788bf1ab" }
-creamui-core = { git = "https://github.com/sammwyy/creamui", rev = "a36a4bcdbb066702a9b85827133ee8cb788bf1ab" }
-creamui-fonts = { git = "https://github.com/sammwyy/creamui", rev = "a36a4bcdbb066702a9b85827133ee8cb788bf1ab" }
-creamui-image = { git = "https://github.com/sammwyy/creamui", rev = "a36a4bcdbb066702a9b85827133ee8cb788bf1ab" }
-creamui-reactive = { git = "https://github.com/sammwyy/creamui", rev = "a36a4bcdbb066702a9b85827133ee8cb788bf1ab" }
-creamui-theme = { git = "https://github.com/sammwyy/creamui", rev = "a36a4bcdbb066702a9b85827133ee8cb788bf1ab" }
-creamui-widgets = { git = "https://github.com/sammwyy/creamui", rev = "a36a4bcdbb066702a9b85827133ee8cb788bf1ab" }
+creamui = { git = "https://github.com/sammwyy/creamui", rev = "cbc63b9c10d7a68171b6c91af23c7433439b664a" }
+creamui-core = { git = "https://github.com/sammwyy/creamui", rev = "cbc63b9c10d7a68171b6c91af23c7433439b664a" }
+creamui-fonts = { git = "https://github.com/sammwyy/creamui", rev = "cbc63b9c10d7a68171b6c91af23c7433439b664a" }
+creamui-image = { git = "https://github.com/sammwyy/creamui", rev = "cbc63b9c10d7a68171b6c91af23c7433439b664a" }
+creamui-reactive = { git = "https://github.com/sammwyy/creamui", rev = "cbc63b9c10d7a68171b6c91af23c7433439b664a" }
+creamui-theme = { git = "https://github.com/sammwyy/creamui", rev = "cbc63b9c10d7a68171b6c91af23c7433439b664a" }
+creamui-widgets = { git = "https://github.com/sammwyy/creamui", rev = "cbc63b9c10d7a68171b6c91af23c7433439b664a" }
 creamui-render = { path = "third_party/creamui-render" }
 creamui-platform = { path = "third_party/creamui-platform" }
 

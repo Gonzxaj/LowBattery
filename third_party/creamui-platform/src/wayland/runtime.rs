@@ -1,5 +1,3 @@
-// Modified by Gonzalo Carranza (2026): WindowAttributes::app_id, the Wayland
-// app_id / X11 WM_CLASS of a window - see third_party/README.md.
 use crate::{
     BackendKind, BlurRegion, CompositorControls, CompositorIntegrationMode,
     CompositorIntegrationRequest, ControlFlow, CursorIcon, DecorationNegotiation, DragIcon, Key,

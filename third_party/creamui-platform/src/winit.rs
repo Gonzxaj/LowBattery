@@ -1,7 +1,5 @@
-// Modified by Gonzalo Carranza (2026): WindowAttributes::app_id, the Wayland
-// app_id / X11 WM_CLASS of a window, and winit's Moved event forwarded as
-// WindowEvent::Moved, and winit's Occluded event forwarded as WindowEvent::Occluded -
-// see third_party/README.md.
+// Modified by Gonzalo Carranza (2026): winit's Moved event forwarded as
+// WindowEvent::Moved - see third_party/README.md.
 use raw_window_handle::{HandleError, HasDisplayHandle, HasWindowHandle, RawWindowHandle};
 use std::collections::HashMap;
 use std::fmt;

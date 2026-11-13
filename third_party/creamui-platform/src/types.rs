@@ -1,6 +1,4 @@
-// Modified by Gonzalo Carranza (2026): WindowAttributes::app_id, the Wayland
-// app_id / X11 WM_CLASS of a window, WindowEvent::Moved and WindowEvent::Occluded - see
-// third_party/README.md.
+// Modified by Gonzalo Carranza (2026): WindowEvent::Moved - see third_party/README.md.
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
