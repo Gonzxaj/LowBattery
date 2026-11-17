@@ -18,6 +18,7 @@ Battery monitor for wireless peripherals on Windows 10/11 and Linux, written in 
 ./build.sh test        # unit tests (protocols with simulated devices)
 ./build.sh check       # clippy for Windows
 ./build.sh release     # dist/lowbattery.exe
+./build.sh portable    # dist/LowBattery-<ver>-portable.exe (same binary, no install needed)
 ./build.sh installer   # dist/lowbattery-0.1.0.0.msix (Store) and -sideload.msix (signed for testing)
 ```
 
@@ -70,7 +71,7 @@ Differences when the app runs packaged:
 
 - **`.deb` (Ubuntu, Debian, Mint, Pop!_OS):** `sudo apt install ./dist/lowbattery_*_amd64.deb`. Also installs the udev rule.
 - **`.tar.gz` (any distro):** extract and run `sudo ./install.sh`, which installs into `/usr/local`. To uninstall: `sudo ./install.sh --uninstall`.
-- **Requirements:** glibc 2.35 or later (Ubuntu 22.04+, Debian 12+, Fedora 36+) and X11 or Wayland.
+- **Requirements:** glibc 2.28 or later (Ubuntu 20.04+, Debian 10+, RHEL/Rocky/Alma 8+, Fedora 29+) and X11 or Wayland.
 
 What changes compared to Windows:
 - **Logitech, Bluetooth and standard HID:** read from `/sys/class/power_supply`, which the kernel publishes (drivers `hid-logitech-hidpp` and `hid-input`). No permissions needed.

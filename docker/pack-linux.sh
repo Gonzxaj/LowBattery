@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs inside lowbattery-build after `cargo build --release`. Produces:
+# Runs inside lowbattery-build after `cargo zigbuild --release` (see build.sh). Produces:
 #   dist/lowbattery_<ver>_<arch>.deb              Debian/Ubuntu; installs the udev rule
 #   dist/lowbattery-<ver>-linux-<arch>.tar.gz     any distro: same tree + install.sh
 # Maintainer for the .deb comes from DEB_MAINTAINER ("Name <email>").
@@ -8,9 +8,9 @@ cd /src
 ID=io.github.gonzxaj.LowBattery
 VER=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
 ARCH=$(dpkg --print-architecture)
-BIN=target/release/lowbattery
+BIN=target/x86_64-unknown-linux-gnu/release/lowbattery
 : "${DEB_MAINTAINER:=Gonzxaj <gonzxaj@users.noreply.github.com>}"
-# Lowest glibc the binary links against = the build image's; older distros can't run it.
+# Lowest glibc the binary needs (set by the zigbuild target in build.sh).
 GLIBC=$(objdump -T "$BIN" | grep -o 'GLIBC_[0-9.]*' | cut -d_ -f2 | sort -uV | tail -1)
 
 STAGE=$(mktemp -d)
@@ -38,7 +38,7 @@ Package: lowbattery
 Version: $VER
 Architecture: $ARCH
 Maintainer: $DEB_MAINTAINER
-Depends: libc6 (>= $GLIBC), libgcc-s1
+Depends: libc6 (>= $GLIBC)
 Recommends: xdg-utils
 Section: utils
 Priority: optional
