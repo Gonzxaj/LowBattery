@@ -29,17 +29,6 @@ and X11 `WM_CLASS` of new windows so Linux docks match them to the app's `.deskt
 file. `src/types.rs` and `src/winit.rs` also forward winit's window-moved event
 (`WindowEvent::Moved`), which `creamui-render` exposes as `WindowHandle::on_moved`. The modified files carry a notice at their top.
 
-## Device protocol references
-
-- **rivalcfg** (<https://github.com/flozz/rivalcfg>), WTFPL: battery commands
-  for SteelSeries mice.
-- **HeadsetControl** (GPL-3.0), **Solaar** and the Linux kernel `hid-logitech-hidpp`
-  driver (GPL-2.0), **OpenRazer** (GPL-2.0): consulted only as documentation of
-  device protocols (report layouts, command bytes). No code from them is included.
-- **MyFinder Device Battery** (<https://github.com/wushuai0802/myfinder-device-battery>),
-  AGPL-3.0: its protocol notes for the Telink/VGN `320F:5088` battery query were
-  consulted as documentation and verified on a real receiver. No code is included.
-
 ## Rust crates
 
 Compiled into the Windows build (generated with `cargo metadata` for

@@ -13,6 +13,63 @@ pub trait HidIo {
     fn get_feature(&self, buf: &mut [u8]) -> io::Result<usize>;
 }
 
+/// Zero-pad an output report (report id first) to `len` total bytes.
+pub fn pad_report(data: &[u8], len: usize) -> Vec<u8> {
+    let mut v = data.to_vec();
+    v.resize(len.max(v.len()), 0);
+    v
+}
+
+/// Write `req` (report id first) and read until `accept` matches. Some stacks
+/// require the output report to have its exact descriptor length, which hidapi
+/// does not expose; `pads` are extra total sizes retried when the bare request
+/// gets no answer. Write errors on a wrong size just move to the next pad.
+pub fn query<T>(
+    io: &dyn HidIo,
+    req: &[u8],
+    pads: &[usize],
+    timeout_ms: u64,
+    mut accept: impl FnMut(&[u8]) -> Option<T>,
+) -> io::Result<Option<T>> {
+    for size in std::iter::once(req.len()).chain(pads.iter().copied()) {
+        let out = pad_report(req, size);
+        if io.write(&out).is_err() {
+            continue;
+        }
+        if let Some(v) = read_matching(io, timeout_ms, &mut accept)? {
+            return Ok(Some(v));
+        }
+    }
+    Ok(None)
+}
+
+/// Send a feature report (`req[0]` = report id) then poll feature reads until
+/// `accept` takes one or `reads` attempts pass, sleeping `delay_ms` between
+/// reads. Devices need a moment to prepare the answer; dongles relay over
+/// the air. Returns the first accepted value.
+pub fn feature_exchange<T>(
+    io: &dyn HidIo,
+    req: &[u8],
+    reads: usize,
+    delay_ms: u64,
+    size: usize,
+    mut accept: impl FnMut(&[u8]) -> Option<T>,
+) -> Option<T> {
+    io.send_feature(req).ok()?;
+    let mut buf = vec![0u8; size];
+    for _ in 0..reads {
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        buf[0] = req[0];
+        let Ok(n) = io.get_feature(&mut buf) else { return None };
+        if n > 0 {
+            if let Some(v) = accept(&buf[..n]) {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
 /// Read until `accept` returns Some or the deadline passes. Unrelated
 /// reports (mouse motion, other software's replies) are skipped.
 pub fn read_matching<T>(

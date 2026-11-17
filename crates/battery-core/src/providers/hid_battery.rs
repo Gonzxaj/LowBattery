@@ -119,7 +119,7 @@ mod win {
             let mut caps = self.caps.lock().unwrap();
             let mut out: Vec<Device> = Vec::new();
             for d in crate::hid::native::enumerate() {
-                if crate::diag::VENDORS.contains(&d.vendor_id()) {
+                if crate::diag::claimed(d.vendor_id(), d.product_id()) {
                     continue;
                 }
                 let path = d.path().to_string_lossy().into_owned();

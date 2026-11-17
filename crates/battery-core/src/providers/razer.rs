@@ -2,7 +2,11 @@
 //! feature report. Protocol facts per OpenRazer (GPL-2; no code taken).
 //! Model-agnostic: any Razer HID collection that answers the battery query
 //! with a valid reply becomes a device, so new models work without a table.
-//! Razer headsets use other protocols and are not covered.
+//! BlackShark headsets and the Barracuda X use other protocols; they live in
+//! `headsets` and share this provider ("razer").
+
+#[path = "razer_headset.rs"]
+pub mod headsets;
 
 use crate::{BatteryStatus, Charge};
 
@@ -116,6 +120,8 @@ mod native {
     pub struct Razer {
         /// pid -> device seen this run (so a sleeping mouse stays as "asleep").
         known: Mutex<BTreeMap<u16, Device>>,
+        /// BlackShark / Barracuda headset state (cache + known devices).
+        headsets: headsets::Headsets,
     }
 
     impl BatteryProvider for Razer {
@@ -171,10 +177,15 @@ mod native {
                 }
             }
             known.retain(|pid, _| infos.iter().any(|d| d.product_id() == *pid));
+            out.extend(headsets::discover(&self.headsets));
             out
         }
 
         fn read_battery(&self, device: &Device) -> BatteryStatus {
+            // Headset locators are "hs\t<pid-hex>".
+            if let Some(pid) = device.locator.strip_prefix("hs\t").and_then(|v| u16::from_str_radix(v, 16).ok()) {
+                return headsets::read(&self.headsets, pid);
+            }
             let Some((path, txn)) = device.locator.split_once('\t') else { return BatteryStatus::GONE };
             let (Some(io), Ok(txn)) = (open(path), txn.parse::<u8>()) else { return BatteryStatus::GONE };
             read(&io, txn).unwrap_or(BatteryStatus::ASLEEP)

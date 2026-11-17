@@ -14,7 +14,7 @@ pub fn diagnostics() -> Value {
         let hid: Vec<Value> = crate::hid::native::enumerate()
             .into_iter()
             .filter(|d| {
-                use crate::providers::ff1c_keyboard::{USAGE, USAGE_PAGE};
+                use crate::providers::keyboards::{USAGE, USAGE_PAGE};
                 VENDORS.contains(&d.vendor_id()) || (d.usage_page(), d.usage()) == (USAGE_PAGE, USAGE)
             })
             .map(|d| {
@@ -34,8 +34,50 @@ pub fn diagnostics() -> Value {
     json!({ "hid": [], "bluetooth": [] })
 }
 
-/// Vendors with a dedicated provider.
+/// Vendors with a dedicated provider covering the whole VID.
 pub const VENDORS: [u16; 3] = [crate::providers::logitech::VID, crate::providers::steelseries::VID, crate::providers::razer::VID];
+
+/// True when a dedicated provider speaks for this USB id: a whole vendor
+/// (logitech/steelseries/razer) or a listed model on a shared VID (Sony pads,
+/// HP/Kingston HyperX, Corsair, Cooler Master). The generic fallbacks and the
+/// unsupported-device report skip claimed ids so nothing shows twice.
+pub fn claimed(vid: u16, pid: u16) -> bool {
+    VENDORS.contains(&vid)
+        || (vid == crate::providers::playstation::VID && crate::providers::playstation::PIDS.contains(&pid))
+        || (vid == crate::providers::coolermaster::VID && crate::providers::coolermaster::PIDS.contains(&pid))
+        || crate::providers::hyperx::supported(vid, pid)
+        || (vid == crate::providers::corsair::VID && crate::providers::corsair::supported(vid, pid))
+        || crate::providers::jabra::supported(vid, pid)
+        || crate::providers::jbl::supported(vid, pid)
+        || crate::providers::fractal::supported(vid, pid)
+        || crate::providers::sony_inzone::supported(vid, pid)
+        || crate::providers::glorious::supported(vid, pid)
+        || crate::providers::kysona::supported(vid, pid)
+        || crate::providers::pulsar::supported(vid, pid)
+        || crate::providers::atk_bitmouse::supported(vid, pid)
+        || crate::providers::lamzu::supported(vid, pid)
+        || crate::providers::keychron::supported(vid, pid)
+        || crate::providers::keychron::nape_supported(vid, pid)
+        || crate::providers::mchose::mchose_supported(vid, pid)
+        || crate::providers::mchose::g3_supported(vid, pid)
+        || crate::providers::nordic::supported(vid, pid)
+        || crate::providers::dareu::supported(vid, pid)
+        || crate::providers::areson::supported(vid, pid)
+        || crate::providers::flydigi::supported(vid, pid)
+        || crate::providers::sonix::supported(vid, pid)
+        || crate::providers::royal_kludge::supported(vid, pid)
+        || crate::providers::rongyuan::supported(vid, pid)
+        || crate::providers::endgame::supported(vid, pid)
+        || crate::providers::gamesir::nova_supported(vid, pid)
+        || crate::providers::gamesir::cyclone_supported(vid, pid)
+        || (vid == crate::providers::zowie::VID)
+        || crate::providers::rapoo::supported(vid, pid)
+        || crate::providers::aula::supported(vid, pid)
+        || crate::providers::fantech::supported(vid, pid)
+        || crate::providers::rog::supported(vid, pid)
+        || crate::providers::razer::headsets::supported(vid, pid)
+        || crate::providers::other_mice::supported(vid, pid)
+}
 
 /// USB `vid_xxxx&pid_xxxx` key of a Windows HID path, lower-case.
 pub fn usb_key(path: &str) -> Option<String> {
@@ -117,8 +159,13 @@ pub fn generic_devices(shown: &[Device]) -> Vec<Device> {
 /// A device some provider speaks to, only silent right now (asleep, out of
 /// range): it must not turn into a "no battery info" card.
 fn has_protocol(c: &Candidate) -> bool {
-    let vid = c.key.strip_prefix("vid_").and_then(|k| u16::from_str_radix(k.get(..4)?, 16).ok());
-    vid.is_some_and(|v| VENDORS.contains(&v)) || c.cols.iter().any(|col| col.ends_with("ff1c/0092"))
+    let parsed = c
+        .key
+        .strip_prefix("vid_")
+        .and_then(|ids| ids.split_once("&pid_"))
+        .and_then(|(v, p)| Some((u16::from_str_radix(v, 16).ok()?, u16::from_str_radix(p, 16).ok()?)));
+    let Some((vid, pid)) = parsed else { return false };
+    claimed(vid, pid) || c.cols.iter().any(|col| col.ends_with("ff1c/0092") || col.ends_with("ffff/0002"))
 }
 
 /// shortcut: judged by the product string; wired gear named like this would show too.

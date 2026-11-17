@@ -3,9 +3,22 @@
 Battery monitor for wireless peripherals on Windows 10/11 and Linux, written in Rust with a native [CreamUI](https://github.com/sammwyy/creamui) UI. It runs as a single process, installs no services, sends no telemetry, and needs neither administrator rights nor the vendor's software.
 
 - **Standard Bluetooth:** reads the same level that Windows Settings shows.
-- **Logitech HID++ 2.0:** Unifying, Bolt and Lightspeed receivers, and direct connection.
+- **Logitech HID++ 2.0:** Unifying, Bolt and Lightspeed receivers, and direct connection. Also the G435 LIGHTSPEED headset on the 0ADF dongle (the 0ACB one is not supported).
 - **SteelSeries:** Aerox, Prime, Rival 3 Wireless, Arctis 7/7P/7+/Nova 5/Nova 7/Nova Pro Wireless.
 - **Razer:** wireless mice and keyboards and their dongles, with no model table.
+- **HyperX:** Cloud II/II Core/III/III S Wireless, Cloud Alpha/Alpha 2 Wireless, Cloud Flight and Cloud Stinger Core Wireless headsets.
+- **Corsair:** Void/HS70/HS80 family and Bragi devices (Virtuoso, Void V2, HS80 MAX, Slipstream receivers), including devices paired behind a receiver.
+- **Cooler Master:** MM712 and MM731 wireless mice, by cable or shared dongle.
+- **PlayStation:** DualShock 4, DualSense and DualSense Edge over USB, Bluetooth or the wireless adapter.
+- **Jabra:** headsets behind Link 380/390 dongles (Evolve and similar), with the headset name read once per pairing.
+- **JBL Quantum:** 520/650/850/950 and X variants, by 2.4 GHz dongle or USB cable.
+- **Fractal Design Scape:** by dongle or USB-C cable, one card for both.
+- **Sony INZONE:** H9 II, H5 and Buds (per-bud and case levels on the dongle).
+- **Gaming mice:** Glorious (Model O/D series), G-Wolves, Hitscan Hyperlight, WLMouse YING (XVI protocol); Kysona, Pulsar, ATK/VXE, Redragon, HECATE (17-byte protocol); Pulsar X2 V3 family (Sonix64); ATK/VXE BITMOUSE dongle; LAMZU; Keychron mice incl. the Nape Link-KM; MCHOSE and MCHOSE G3 V2; Royal Kludge MG6 Pro; Endgame Gear 4K dongle (OP1w/XM2w); ZOWIE EC-CW/DW/U2; Rapoo VT series; DAREU EM901X; Redragon M913/M915 (Areson); Fantech Helios Go XD5; Motospeed X6; Delux M900 Pro / M800 Pro; Attack Shark X-series; AJAZZ/AULA mice (AJ179, AJ-series, AJ139); Incott G23 V2/G24; Wraith W1.
+- **ASUS ROG:** Azoth, Falchion, Strix Scope, Chakram, Gladius, Harpe, Keris, Pugio, Spatha, Strix Carry/Impact (Omni receiver + direct), ROG Pelta headset.
+- **Razer headsets:** BlackShark V3/V3 Pro/V3 X, V2 HyperSpeed, V2 Pro (2023), Barracuda X (2022) — vendor protocols, separate from the standard Razer feature report.
+- **Keyboards:** AULA F75/F87/F99 and MCHOSE receivers; SONiX-dongle AJAZZ/AULA boards; Rongyuan receivers (Attack Shark, Ajazz, MSI).
+- **Controllers:** Flydigi Vader 5 Pro; GameSir Nova and Cyclone 2.
 - **Keyboards with the `FF1C:0092` battery channel, any brand:** Telink/Evision firmware sold by FEKER, VGN, Rainy and others. They are recognized by that channel, not by brand, over both 2.4G and cable, with level and charging state. There is a single card per keyboard, whether it uses the cable or the receiver.
 - **Generic 2.4G receivers without battery** (for example YICHIP): they show as connected, with a note that they do not report battery, and they are not shown in the widget.
 - **Any brand:** HID devices that declare the standard "Battery Strength" usage.

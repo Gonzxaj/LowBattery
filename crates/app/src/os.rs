@@ -404,7 +404,7 @@ mod tests {
     #[test]
     fn device_lines_show_charge_and_skip_batteryless() {
         let states = [
-            state("Keyboard", "ff1c-keyboard", BatteryStatus::connected(99, Charge::Charging)),
+            state("Keyboard", "keyboards", BatteryStatus::connected(99, Charge::Charging)),
             state("Headset", "steelseries", BatteryStatus::connected(51, Charge::Discharging)),
             state("Mouse", "razer", BatteryStatus::ASLEEP),
             state("2.4G Receiver", battery_core::diag::GENERIC, BatteryStatus::PRESENT),

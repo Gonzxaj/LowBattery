@@ -209,37 +209,306 @@ pub fn voltage_to_percent(mv: u16) -> Option<u8> {
     Some(0)
 }
 
-#[cfg(windows)]
-pub use win::Logitech;
+/// Logitech G435 LIGHTSPEED headset on the newer 046D:0ADF dongle. It does
+/// not speak HID++: its vendor collection (FF00:0001, unnumbered 64-byte
+/// reports) carries CRC-16 framed messages, and "PA" commands inside them
+/// reach the headset's radio SoC. The battery is read with the OTA
+/// GET_BATTERY command (millivolts). The older 046D:0ACB dongle uses a
+/// different transport and is not handled here.
+///
+/// Session, as captured by portyporty: open (84 01), session init (85 01,
+/// OTA IOCTL_READ_MAX_LEN), REMOTE_GET_MODE / REMOTE_SET_MODE 01 /
+/// REMOTE_GET_MODE so the query is forwarded to the headset rather than
+/// answered by the dongle, GET_BATTERY, close (85 02). SET_MODE 01 only
+/// selects where the dongle routes the command; it is not a user setting and
+/// does not persist. The fixed waits between steps come from the original
+/// capture (about 1.2 s in total). Unlike the 0ACB dongle, a read does not
+/// interrupt audio or microphone, so the headset is read on every poll.
+/// Protocol: github.com/portyporty/g435-battery-percentage (MIT), ported in
+/// github.com/deddroid/logitech-g435-battery; reimplemented here.
+pub mod g435 {
+    use crate::hid::{read_matching, HidIo};
+    use crate::{BatteryStatus, Charge, Link};
 
-#[cfg(windows)]
-mod win {
+    pub const PID: u16 = 0x0ADF;
+
+    const TIMEOUT_OPEN_MS: u64 = 50;
+    const TIMEOUT_INIT_MS: u64 = 450;
+    const TIMEOUT_PA_MS: u64 = 120;
+    const TIMEOUT_BATTERY_MS: u64 = 250;
+    const TIMEOUT_CLOSE_MS: u64 = 50;
+
+    const CAT_OTA: u8 = 0x06;
+    const CAT_WIRELESS: u8 = 0x0E;
+    const GET_MODE: u8 = 0xE0;
+    const SET_MODE: u8 = 0xE1;
+
+    /// Session init from the capture (OTA_CMD_IOCTL_READ_MAX_LEN, sequence 1).
+    const SESSION_INIT: [u8; 19] = [
+        0x50, 0x41, 0x06, 0x01, 0x0D, 0x00, 0x25, 0x34, 0x12, 0x5A, 0x5A, 0x01, 0x00, 0x00, 0x00, 0xF0, 0x00, 0x00, 0x00,
+    ];
+
+    pub fn supported(vid: u16, pid: u16) -> bool {
+        vid == super::VID && pid == PID
+    }
+
+    /// CRC-16/XMODEM (poly 0x1021, init 0).
+    pub fn crc16(data: &[u8]) -> u16 {
+        let mut crc = 0u16;
+        for &b in data {
+            crc ^= (b as u16) << 8;
+            for _ in 0..8 {
+                crc = if crc & 0x8000 != 0 { (crc << 1) ^ 0x1021 } else { crc << 1 };
+            }
+        }
+        crc
+    }
+
+    /// 64-byte frame: <cmd> <body length> <crc lo> <crc hi> <body...>, zero-padded.
+    /// The CRC covers the whole frame with the CRC field zeroed.
+    pub fn frame(cmd: u8, body: &[u8]) -> [u8; 64] {
+        let mut f = [0u8; 64];
+        f[0] = cmd;
+        f[1] = body.len() as u8;
+        for (i, &b) in body.iter().take(60).enumerate() {
+            f[4 + i] = b;
+        }
+        let crc = crc16(&f);
+        f[2] = crc as u8;
+        f[3] = (crc >> 8) as u8;
+        f
+    }
+
+    /// "PA" command for the headset's radio SoC:
+    /// 50 41 <category> <seq> <length field> <payload...>.
+    pub fn pa(category: u8, seq: u8, len: u8, payload: &[u8]) -> Vec<u8> {
+        let mut cmd = vec![0x50, 0x41, category, seq, len];
+        cmd.extend_from_slice(payload);
+        cmd
+    }
+
+    /// Battery voltage from the GET_BATTERY reply (pattern
+    /// 00 07 00 06 <seq> 00 <mV lo> <mV hi>). None when absent or not a
+    /// plausible Li-Po voltage.
+    pub fn parse_millivolts(data: &[u8]) -> Option<i32> {
+        for i in 0..data.len().saturating_sub(7) {
+            if data[i] == 0x00 && data[i + 1] == 0x07 && data[i + 2] == 0x00 && data[i + 3] == 0x06 && data[i + 5] == 0x00 {
+                let mv = data[i + 6] as i32 | ((data[i + 7] as i32) << 8);
+                if (2500..=4500).contains(&mv) {
+                    return Some(mv);
+                }
+            }
+        }
+        None
+    }
+
+    /// Voltage -> % for the G435 Li-Po cell, piecewise-linear.
+    pub fn percent(mv: i32) -> u8 {
+        const V: [i32; 16] = [4200, 4150, 4100, 4050, 4000, 3950, 3900, 3850, 3800, 3750, 3700, 3650, 3600, 3550, 3500, 3400];
+        const P: [i32; 16] = [100, 95, 90, 85, 80, 75, 70, 62, 55, 45, 35, 25, 15, 10, 5, 0];
+        if mv >= V[0] {
+            return 100;
+        }
+        for i in 1..16 {
+            if mv >= V[i] {
+                let span = V[i - 1] - V[i];
+                let t = if span > 0 { (mv - V[i]) as f64 / span as f64 } else { 0.0 };
+                return (P[i] as f64 + t * (P[i - 1] - P[i]) as f64).round().clamp(0.0, 100.0) as u8;
+            }
+        }
+        0
+    }
+
+    /// Writes one frame (report id 0) and drains the input reports that
+    /// arrive within `wait_ms`. Returns false only when the write fails.
+    fn transact(io: &dyn HidIo, cmd: u8, body: &[u8], wait_ms: u64) -> bool {
+        let f = frame(cmd, body);
+        let mut out = vec![0u8; 65];
+        out[1..].copy_from_slice(&f);
+        if io.write(&out).is_err() {
+            return false;
+        }
+        let _ = read_matching(io, wait_ms, |_: &[u8]| -> Option<i32> { None });
+        true
+    }
+
+    /// Same, but returns the first battery millivolts seen in the replies.
+    fn transact_mv(io: &dyn HidIo, cmd: u8, body: &[u8], wait_ms: u64) -> Option<i32> {
+        let f = frame(cmd, body);
+        let mut out = vec![0u8; 65];
+        out[1..].copy_from_slice(&f);
+        io.write(&out).ok()?;
+        read_matching(io, wait_ms, parse_millivolts).ok().flatten()
+    }
+
+    /// Full session; always closes (85 02) once it was opened. Intermediate
+    /// step failures are ignored like upstream: only the final battery reply
+    /// matters.
+    fn read_millivolts(io: &dyn HidIo) -> Option<i32> {
+        if !transact(io, 0x84, &[0x01], TIMEOUT_OPEN_MS) {
+            return None;
+        }
+        let inner = {
+            transact(io, 0x85, &[0x01], TIMEOUT_OPEN_MS);
+            transact(io, 0x80, &SESSION_INIT, TIMEOUT_INIT_MS);
+            let mut seq = 2u8;
+            let mut pa_cmd = |cat: u8, len: u8, payload: &[u8]| {
+                let c = pa(cat, seq, len, payload);
+                seq = seq % 127 + 1;
+                c
+            };
+            transact(io, 0x80, &pa_cmd(CAT_WIRELESS, 1, &[GET_MODE]), TIMEOUT_PA_MS);
+            transact(io, 0x80, &pa_cmd(CAT_WIRELESS, 2, &[SET_MODE, 0x01]), TIMEOUT_PA_MS);
+            transact(io, 0x80, &pa_cmd(CAT_WIRELESS, 1, &[GET_MODE]), TIMEOUT_PA_MS);
+            transact_mv(io, 0x80, &pa_cmd(CAT_OTA, 1, &[0x00, 0x31]), TIMEOUT_BATTERY_MS)
+        };
+        transact(io, 0x85, &[0x02], TIMEOUT_CLOSE_MS);
+        inner
+    }
+
+    /// Dongle present: a millivolt reading means the headset answered;
+    /// silence means it is off or out of range.
+    pub fn poll(io: &dyn HidIo) -> BatteryStatus {
+        match read_millivolts(io) {
+            Some(mv) => BatteryStatus { level: Some(percent(mv)), charge: Charge::Unknown, link: Link::Connected },
+            None => BatteryStatus::ASLEEP,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::providers::fake::FakeHid;
+
+        #[test]
+        fn crc_known_vector() {
+            // CRC-16/XMODEM of "123456789" = 0x31C3.
+            assert_eq!(crc16(b"123456789"), 0x31C3);
+        }
+
+        #[test]
+        fn frame_layout() {
+            let f = frame(0x80, &[1, 2, 3]);
+            assert_eq!(f[0], 0x80);
+            assert_eq!(f[1], 3);
+            assert_eq!(&f[4..7], &[1, 2, 3]);
+            // CRC field is consistent: recomputing over the frame with it
+            // zeroed gives the stored value.
+            let mut z = f;
+            z[2] = 0;
+            z[3] = 0;
+            assert_eq!(crc16(&z), u16::from_le_bytes([f[2], f[3]]));
+        }
+
+        #[test]
+        fn millivolt_pattern() {
+            let mut r = vec![0u8; 65];
+            r[20] = 0x00;
+            r[21] = 0x07;
+            r[22] = 0x00;
+            r[23] = 0x06;
+            r[24] = 0x01;
+            r[25] = 0x00;
+            r[26] = 0xD8; // 3800 mV LE
+            r[27] = 0x0E;
+            assert_eq!(parse_millivolts(&r), Some(3800));
+            assert_eq!(parse_millivolts(&[0u8; 65]), None);
+        }
+
+        #[test]
+        fn percent_curve() {
+            assert_eq!(percent(4200), 100);
+            assert_eq!(percent(3400), 0);
+            let p = percent(3800);
+            assert!(p > 40 && p < 70);
+        }
+
+        /// Dongle answering the full session; battery reply only on the last step.
+        fn session(mv: Option<i32>) -> FakeHid {
+            FakeHid::new(move |req| {
+                // req[0] = report id 0, frame starts at req[1]: cmd, body len, crc, body
+                if req.len() < 5 || req[0] != 0x00 {
+                    return vec![];
+                }
+                let cmd = req[1];
+                let body = &req[5..5 + req[2] as usize];
+                let is_battery = cmd == 0x80 && body.len() >= 5 && &body[..2] == b"PA" && body[2] == CAT_OTA;
+                if is_battery {
+                    return mv
+                        .map(|mv| {
+                            let mut r = vec![0u8; 65];
+                            r[30] = 0x00;
+                            r[31] = 0x07;
+                            r[32] = 0x00;
+                            r[33] = 0x06;
+                            r[34] = 0x01;
+                            r[35] = 0x00;
+                            r[36] = (mv & 0xFF) as u8;
+                            r[37] = ((mv >> 8) & 0xFF) as u8;
+                            vec![r]
+                        })
+                        .unwrap_or_default();
+                }
+                vec![vec![0u8; 65]] // noise
+            })
+        }
+
+        #[test]
+        fn session_reads_battery() {
+            let s = poll(&session(Some(3800)));
+            assert_eq!(s.link, Link::Connected);
+            assert!(s.level.is_some());
+            assert_eq!(s.charge, Charge::Unknown);
+        }
+
+        #[test]
+        fn session_silence_is_asleep() {
+            assert_eq!(poll(&session(None)), BatteryStatus::ASLEEP);
+        }
+    }
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+pub use native::Logitech;
+
+#[cfg(any(windows, target_os = "linux"))]
+mod native {
     use super::*;
     use crate::hid::native::{enumerate, open};
     use crate::{BatteryProvider, Device};
+    #[cfg(windows)]
     use std::collections::BTreeMap;
     use std::sync::Mutex;
 
     /// Receivers expose up to 6 paired devices; anything else is direct (0xFF).
+    #[cfg(windows)]
     const RECEIVER_SLOTS: std::ops::RangeInclusive<u8> = 1..=6;
 
     #[derive(Default)]
     pub struct Logitech {
-        /// Devices seen while their receiver is plugged in: a silent one is asleep, not gone.
+        /// HID++ devices seen while their receiver is plugged in: a silent
+        /// one is asleep, not gone. Windows only: on Linux the kernel's
+        /// power_supply class already reports HID++ batteries.
+        #[cfg(windows)]
         known: Mutex<BTreeMap<String, Device>>,
+        /// G435 dongle seen while plugged in.
+        g435_known: Mutex<Option<Device>>,
     }
 
+    #[cfg(windows)]
     fn is_hidpp_collection(d: &hidapi::DeviceInfo) -> bool {
         d.vendor_id() == VID
             && matches!((d.usage_page(), d.usage()), (0xFF00, 0x0002) | (0xFF43, 0x0202))
     }
 
     /// Unifying, Bolt, Lightspeed and Nano receivers all live in 0xC5xx.
+    #[cfg(windows)]
     fn is_receiver(d: &hidapi::DeviceInfo) -> bool {
         (0xC500..=0xC5FF).contains(&d.product_id())
     }
 
     impl Logitech {
+        #[cfg(windows)]
         fn probe(&self, io: &dyn HidIo, path: &str, pid: u16, index: u8, fallback: &str) -> Option<Device> {
             ping(io, index).ok()?;
             let (fi, kind) = BatteryFeature::PREFERENCE
@@ -263,14 +532,11 @@ mod win {
                 locator: format!("{path}\t{index}\t{fi}\t{}", kind.code()),
             })
         }
-    }
 
-    impl BatteryProvider for Logitech {
-        fn name(&self) -> &'static str {
-            "logitech"
-        }
-
-        fn discover(&self) -> Vec<Device> {
+        /// HID++ devices behind receivers/direct links. Windows only: on
+        /// Linux the kernel's power_supply class reports them already.
+        #[cfg(windows)]
+        fn discover_hidpp(&self) -> Vec<Device> {
             // Devices that answered now, then silent receiver slots shown as asleep.
             let (mut found, mut silent): (Vec<Device>, Vec<Device>) = (Vec::new(), Vec::new());
             let mut known = self.known.lock().unwrap();
@@ -303,6 +569,60 @@ mod win {
                     found.push(d);
                 }
             }
+            found
+        }
+
+        #[cfg(not(windows))]
+        fn discover_hidpp(&self) -> Vec<Device> {
+            Vec::new()
+        }
+
+        /// G435 LIGHTSPEED dongle (046D:0ADF): not HID++, works on every
+        /// platform through hidraw/hidapi.
+        fn discover_g435(&self, out: &mut Vec<Device>) {
+            let infos: Vec<_> = enumerate()
+                .into_iter()
+                .filter(|d| g435::supported(d.vendor_id(), d.product_id()) && d.usage_page() == 0xFF00 && d.usage() == 0x0001)
+                .collect();
+            if infos.is_empty() {
+                self.g435_known.lock().unwrap().take();
+                return;
+            }
+            let found = infos.iter().find_map(|d| {
+                let path = d.path().to_string_lossy().into_owned();
+                let io = open(&path)?;
+                let s = g435::poll(&io);
+                log::debug!("logitech g435 if{}: {s:?}", d.interface_number());
+                Some((path, s))
+            });
+            match found {
+                Some((path, _)) => {
+                    let dev = Device {
+                        id: "logitech:g435".into(),
+                        name: "Logitech G435".into(),
+                        vendor: "Logitech".into(),
+                        model: Some("G435 LIGHTSPEED".into()),
+                        kind: DeviceKind::Headset,
+                        provider: "logitech",
+                        locator: format!("g435\t{path}"),
+                    };
+                    *self.g435_known.lock().unwrap() = Some(dev.clone());
+                    out.push(dev);
+                }
+                None => out.extend(self.g435_known.lock().unwrap().clone()),
+            }
+        }
+    }
+
+    impl BatteryProvider for Logitech {
+        fn name(&self) -> &'static str {
+            "logitech"
+        }
+
+        fn discover(&self) -> Vec<Device> {
+            let mut found = self.discover_hidpp();
+            self.discover_g435(&mut found);
+            // Same device on two links keeps one card.
             let mut seen = std::collections::HashSet::new();
             found.retain(|d| seen.insert(d.id.clone()));
             found
@@ -310,7 +630,15 @@ mod win {
 
         fn read_battery(&self, device: &Device) -> BatteryStatus {
             let mut parts = device.locator.split('\t');
-            let (Some(path), Some(index), Some(fi), Some(kind)) = (parts.next(), parts.next(), parts.next(), parts.next()) else {
+            let Some(first) = parts.next() else { return BatteryStatus::GONE };
+            if first == "g435" {
+                let Some(path) = parts.next() else { return BatteryStatus::GONE };
+                let Some(io) = open(path) else { return BatteryStatus::GONE };
+                return g435::poll(&io);
+            }
+            let (Some(path), Some(index), Some(fi), Some(kind)) =
+                (Some(first), parts.next(), parts.next(), parts.next())
+            else {
                 return BatteryStatus::GONE;
             };
             let (Ok(index), Ok(fi), Some(kind)) =

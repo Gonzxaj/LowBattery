@@ -54,7 +54,7 @@ pub fn best<T>(answers: Vec<(T, BatteryStatus)>) -> Option<(T, BatteryStatus)> {
 }
 
 #[cfg(any(windows, target_os = "linux"))]
-pub use native::Ff1cKeyboard;
+pub use native::Keyboards;
 
 #[cfg(any(windows, target_os = "linux"))]
 mod native {
@@ -73,7 +73,7 @@ mod native {
     /// shortcut: two keyboards with the same VID at once would share a card;
     /// key by serial/model if anyone reports owning two.
     #[derive(Default)]
-    pub struct Ff1cKeyboard {
+    pub struct Keyboards {
         /// VID -> model name learned from the cable link, kept for the receiver.
         models: Mutex<BTreeMap<u16, String>>,
         /// VID -> card seen this run: a receiver that stops answering
@@ -94,9 +94,9 @@ mod native {
         paths: Vec<String>,
     }
 
-    impl BatteryProvider for Ff1cKeyboard {
+    impl BatteryProvider for Keyboards {
         fn name(&self) -> &'static str {
-            "ff1c-keyboard"
+            "keyboards"
         }
 
         fn discover(&self) -> Vec<Device> {
@@ -141,7 +141,7 @@ mod native {
                     model: models.get(&vid).cloned(),
                     name,
                     vendor: link.vendor,
-                    provider: "ff1c-keyboard",
+                    provider: "keyboards",
                     locator: paths.join("\t"),
                 };
                 known.insert(vid, device.clone());
