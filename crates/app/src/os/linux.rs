@@ -102,9 +102,15 @@ pub fn launched_at_startup() -> bool {
 /// X11 only (the app runs there when the widget is kept on top): gives the
 /// window our icon (`_NET_WM_ICON`, used by some taskbars and Alt+Tab) and,
 /// for the floating widget (`tool`), keeps it out of the dock/taskbar and
-/// Alt+Tab (`_NET_WM_STATE_SKIP_TASKBAR` / `_SKIP_PAGER`). Wayland has no
-/// equivalent: docks take the icon from the .desktop file via the app_id.
-pub fn decorate_window(w: &creamui::WindowHandle, tool: bool) {
+/// Alt+Tab (`_NET_WM_STATE_SKIP_TASKBAR` / `_SKIP_PAGER`, plus `_ABOVE` when
+/// `on_top`). Wayland has no equivalent: docks take the icon from the .desktop
+/// file via the app_id.
+///
+/// creamui calls this before the window is first mapped, so the state goes in
+/// the property the window manager reads at map. Sent later as a client
+/// message, Ubuntu Dock had already counted the widget as an open window and
+/// kept showing the app as running (and its "Quit" skipped the widget).
+pub fn decorate_window(w: &creamui::WindowHandle, tool: bool, on_top: bool) {
     use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
     use x11_dl::xlib;
     let (Some(RawWindowHandle::Xlib(window)), Some(RawDisplayHandle::Xlib(display))) = (w.raw_window_handle(), w.raw_display_handle())
@@ -121,26 +127,13 @@ pub fn decorate_window(w: &creamui::WindowHandle, tool: bool) {
             (x.XChangeProperty)(dpy, window, atom(c"_NET_WM_ICON"), xlib::XA_CARDINAL, 32, xlib::PropModeReplace, icon.as_ptr().cast(), icon.len() as i32);
         }
         if tool {
-            // A mapped window asks the window manager (EWMH); writing the property itself is only for unmapped ones.
-            let mut data = xlib::ClientMessageData::new();
-            data.set_long(0, 1); // _NET_WM_STATE_ADD
-            data.set_long(1, atom(c"_NET_WM_STATE_SKIP_TASKBAR") as _);
-            data.set_long(2, atom(c"_NET_WM_STATE_SKIP_PAGER") as _);
-            data.set_long(3, 1); // source: normal application
-            let mut event = xlib::XEvent {
-                client_message: xlib::XClientMessageEvent {
-                    type_: xlib::ClientMessage,
-                    serial: 0,
-                    send_event: xlib::True,
-                    display: dpy,
-                    window,
-                    message_type: atom(c"_NET_WM_STATE"),
-                    format: 32,
-                    data,
-                },
-            };
-            let mask = xlib::SubstructureRedirectMask | xlib::SubstructureNotifyMask;
-            (x.XSendEvent)(dpy, (x.XDefaultRootWindow)(dpy), xlib::False, mask, &mut event);
+            // Atoms are C longs for format 32. winit's own always-on-top request
+            // is a client message, which the WM drops for a not-yet-mapped window.
+            let mut state: Vec<std::os::raw::c_ulong> = vec![atom(c"_NET_WM_STATE_SKIP_TASKBAR"), atom(c"_NET_WM_STATE_SKIP_PAGER")];
+            if on_top {
+                state.push(atom(c"_NET_WM_STATE_ABOVE"));
+            }
+            (x.XChangeProperty)(dpy, window, atom(c"_NET_WM_STATE"), xlib::XA_ATOM, 32, xlib::PropModeAppend, state.as_ptr().cast(), state.len() as i32);
         }
         (x.XFlush)(dpy);
     }

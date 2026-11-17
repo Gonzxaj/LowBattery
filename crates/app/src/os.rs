@@ -159,7 +159,7 @@ mod win {
     /// Gives a window the exe's icon (resource 1) and, for the floating widget
     /// (`tool`), the tool-window style: no taskbar button, no Alt+Tab entry.
     /// Works on the window's own HWND, which creamui exposes.
-    pub fn decorate_window(w: &creamui::WindowHandle, tool: bool) {
+    pub fn decorate_window(w: &creamui::WindowHandle, tool: bool, _on_top: bool) {
         use raw_window_handle::RawWindowHandle;
         use windows_sys::Win32::Foundation::HWND;
         use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -374,7 +374,7 @@ mod stub {
     pub fn open_file(path: &std::path::Path) {
         log::info!("log file: {}", path.display());
     }
-    pub fn decorate_window(_: &creamui::WindowHandle, _: bool) {}
+    pub fn decorate_window(_: &creamui::WindowHandle, _: bool, _: bool) {}
     pub fn launched_at_startup() -> bool {
         false
     }

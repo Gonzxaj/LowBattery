@@ -365,7 +365,10 @@ impl ActiveEventLoop<'_> {
             ))
             .with_resizable(attributes.resizable)
             .with_decorations(attributes.decorations)
-            .with_transparent(attributes.transparent);
+            .with_transparent(attributes.transparent)
+            // creamui-render maps it after `on_window_ready`, so that callback can
+            // set state an X11 window manager only reads at map (`_NET_WM_STATE`).
+            .with_visible(false);
         if let Some(position) = attributes.position {
             inner = inner.with_position(winit::dpi::LogicalPosition::new(position.x, position.y));
         }

@@ -28,3 +28,9 @@ draw (Win32 HWND, Xlib window + display, Wayland surface). LowBattery uses them 
 taskbar / Alt+Tab: Win32 icon + `WS_EX_TOOLWINDOW` on Windows, `_NET_WM_ICON` +
 `_NET_WM_STATE_SKIP_TASKBAR/SKIP_PAGER` on X11. Wayland has no equivalent.
 
+**Map after `on_window_ready` (both crates):** `creamui-platform` creates winit
+windows hidden and `creamui-render` shows top-level windows only after their
+`on_window_ready` callback (popups still show before it). X11 window managers read
+`_NET_WM_STATE` when a window is mapped; set later, Ubuntu Dock kept the widget
+counted as an open window when it was the app's only one (autostart).
+

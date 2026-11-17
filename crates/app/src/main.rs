@@ -132,7 +132,7 @@ impl App {
             },
             ui::Palette::get(cfg.dark).bg,
             move |w| {
-                os::decorate_window(&w, false);
+                os::decorate_window(&w, false, false);
                 // No tray to come back from: closing the window quits.
                 let quit = quit.clone();
                 w.on_close_requested(move || {
@@ -177,7 +177,7 @@ impl App {
             move |w| {
                 w.set_always_on_top(on_top);
                 w.on_moved(move |x, y| mover.widget_moved(x, y));
-                os::decorate_window(&w, true);
+                os::decorate_window(&w, true, on_top);
                 if cfg.widget.position.is_none() {
                     if let Some((mw, _)) = w.monitor_size() {
                         w.set_position(mw - ui::WIDGET_W as i32 - 24, 24);

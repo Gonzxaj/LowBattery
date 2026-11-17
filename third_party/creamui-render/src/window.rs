@@ -4180,8 +4180,12 @@ impl AppHandler {
             window.set_blur_region(Some(region));
         }
         // Show the window immediately; the presenter's first frame replaces
-        // the platform's placeholder surface moments later.
-        window.set_visible(true);
+        // the platform's placeholder surface moments later. Top-level windows
+        // wait for `on_window_ready` (below), which may set map-time state.
+        let is_popup = spec.popup.is_some();
+        if is_popup {
+            window.set_visible(true);
+        }
         log::debug!(
             "creamui-render: window created ({}x{} logical, scale factor {}) in {:?}",
             spec.options.width,
@@ -4258,6 +4262,9 @@ impl AppHandler {
             #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
             gpu_device,
         });
+        if !is_popup {
+            window.set_visible(true);
+        }
 
         let now = Instant::now();
         let frameless_resizable = spec.options.resizable
