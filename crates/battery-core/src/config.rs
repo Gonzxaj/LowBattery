@@ -31,6 +31,9 @@ pub struct Config {
     pub autostart: bool,
     pub dark: bool,
     pub widget: WidgetConfig,
+    /// Devices with their own system-tray icon; hidden ids keep only the
+    /// aggregate icon. New devices show by default.
+    pub tray: TrayConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -45,9 +48,25 @@ pub struct WidgetConfig {
     pub hidden: BTreeSet<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct TrayConfig {
+    /// Device ids without their own tray icon; new devices show by default.
+    pub hidden: BTreeSet<String>,
+}
+
 impl Default for Config {
     fn default() -> Self {
-        Self { lang: Lang::En, poll_secs: 60, low_threshold: 20, notify: true, autostart: false, dark: true, widget: WidgetConfig::default() }
+        Self {
+            lang: Lang::En,
+            poll_secs: 60,
+            low_threshold: 20,
+            notify: true,
+            autostart: false,
+            dark: true,
+            widget: WidgetConfig::default(),
+            tray: TrayConfig::default(),
+        }
     }
 }
 
