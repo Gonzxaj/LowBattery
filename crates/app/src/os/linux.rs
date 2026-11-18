@@ -211,6 +211,10 @@ fn argb(mut px: Vec<u8>) -> Vec<u8> {
 
 /// State the tray service thread renders; menu clicks go back over `tx`.
 struct Model {
+    /// SNI id: "lowbattery" for the aggregate icon, "lowbattery-<device>" per device.
+    id: String,
+    /// Passive items are hidden by GNOME's AppIndicator and tucked away by KDE.
+    passive: bool,
     lang: Lang,
     tooltip: String,
     /// Shown at the top of the menu: GNOME's AppIndicator draws no tooltip.
@@ -221,7 +225,10 @@ struct Model {
 
 impl ksni::Tray for Model {
     fn id(&self) -> String {
-        "lowbattery".into()
+        self.id.clone()
+    }
+    fn status(&self) -> ksni::Status {
+        if self.passive { ksni::Status::Passive } else { ksni::Status::Active }
     }
     fn title(&self) -> String {
         "LowBattery".into()
@@ -275,6 +282,17 @@ pub struct Tray {
     handle: ksni::blocking::Handle<Model>,
     rx: Mutex<Option<mpsc::Receiver<TrayAction>>>,
     last: std::cell::Cell<Option<Option<u8>>>,
+    /// Per-device icons: device id, tray service, last RGBA pixels drawn.
+    devices: std::cell::RefCell<Vec<DeviceIcon>>,
+    tx: mpsc::Sender<TrayAction>,
+    lang: std::cell::Cell<Lang>,
+}
+
+type DeviceIcon = (String, ksni::blocking::Handle<Model>, Vec<u8>);
+
+fn spawn(model: Model) -> Result<ksni::blocking::Handle<Model>, String> {
+    // Sandboxes can't own the well-known org.kde.StatusNotifierItem-<pid> name.
+    model.disable_dbus_name(sandboxed()).spawn().map_err(|e| e.to_string())
 }
 
 impl Tray {
@@ -282,14 +300,25 @@ impl Tray {
     /// AppIndicator extension); main.rs then keeps the window visible.
     pub fn new(lang: Lang) -> Result<Self, String> {
         let (tx, rx) = mpsc::channel();
-        let model = Model { lang, tooltip: "lowbattery".into(), devices: Vec::new(), icon: argb(battery_icon(None, 0)), tx };
-        // Sandboxes can't own the well-known org.kde.StatusNotifierItem-<pid> name.
-        let handle = model.disable_dbus_name(sandboxed()).spawn().map_err(|e| e.to_string())?;
-        Ok(Self { handle, rx: Mutex::new(Some(rx)), last: Default::default() })
+        let model = Model {
+            id: "lowbattery".into(),
+            passive: false,
+            lang,
+            tooltip: "lowbattery".into(),
+            devices: Vec::new(),
+            icon: argb(battery_icon(None, 0)),
+            tx: tx.clone(),
+        };
+        let handle = spawn(model)?;
+        Ok(Self { handle, rx: Mutex::new(Some(rx)), last: Default::default(), devices: Default::default(), tx, lang: lang.into() })
     }
 
     pub fn set_lang(&self, lang: Lang) {
+        self.lang.set(lang);
         self.handle.update(|m| m.lang = lang);
+        for (_, h, _) in self.devices.borrow().iter() {
+            h.update(|m| m.lang = lang);
+        }
     }
 
     /// Clicks arrive on the ksni thread; forward them to the UI thread.
@@ -299,17 +328,58 @@ impl Tray {
         crate::forward(handle, Arc::new(move || rx.lock().ok()?.recv().ok()), Rc::new(on));
     }
 
-    pub fn update(&self, states: &[DeviceState], threshold: u8) {
+    pub fn update(&self, states: &[DeviceState], cfg: &Config) {
         let tip = tooltip(states);
-        let devices = device_lines(states);
+        let lines = device_lines(states);
         let level = worst(states);
         let icon = (self.last.get() != Some(level)).then(|| {
             self.last.set(Some(level));
-            argb(battery_icon(level, threshold))
+            argb(battery_icon(level, cfg.low_threshold))
         });
+
+        let wanted = device_icons(states, cfg);
+        let mut devices = self.devices.borrow_mut();
+        devices.retain(|(id, h, _)| {
+            let keep = wanted.iter().any(|(w, ..)| w == id);
+            if !keep {
+                let _ = h.shutdown(); // drops the item from the panel; no need to wait
+            }
+            keep
+        });
+        for (id, dev_tip, px) in wanted {
+            if let Some((_, h, last)) = devices.iter_mut().find(|(d, ..)| *d == id) {
+                let icon = (*last != px).then(|| argb(px.clone()));
+                *last = px;
+                let lines = lines.clone();
+                h.update(move |m| {
+                    m.tooltip = dev_tip;
+                    m.devices = lines;
+                    if let Some(icon) = icon {
+                        m.icon = icon;
+                    }
+                });
+                continue;
+            }
+            let model = Model {
+                id: format!("lowbattery-{id}"),
+                passive: false,
+                lang: self.lang.get(),
+                tooltip: dev_tip,
+                devices: lines.clone(),
+                icon: argb(px.clone()),
+                tx: self.tx.clone(),
+            };
+            match spawn(model) {
+                Ok(h) => devices.push((id, h, px)),
+                Err(e) => log::error!("tray icon for {id}: {e}"),
+            }
+        }
+        // The aggregate icon only fills in while no device has its own.
+        let passive = !devices.is_empty();
         self.handle.update(move |m| {
             m.tooltip = tip;
-            m.devices = devices;
+            m.devices = lines;
+            m.passive = passive;
             if let Some(icon) = icon {
                 m.icon = icon;
             }

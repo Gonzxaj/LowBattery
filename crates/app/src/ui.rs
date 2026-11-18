@@ -317,24 +317,24 @@ fn dot(color: Color) -> BoxedWidget {
     Box::new(Flex::row().size(7.0, 7.0).background(color).corner_radius(3.5))
 }
 
-fn widget_pill(app: &App, p: &Palette, l: Lang, id: String, on: bool) -> BoxedWidget {
+/// On/off chip under a device card; `flip` toggles the setting.
+fn pill(app: &App, p: &Palette, label: &str, on: bool, flip: impl Fn(&mut Config) + Clone + 'static) -> BoxedWidget {
     let toggle = app.clone();
     let (bg, fg, border) = if on { (p.accent.mix(p.card, 0.82), p.accent, p.accent.mix(p.card, 0.55)) } else { (p.card, p.muted, p.line) };
-    let label = if on { l.t("In widget", "En widget") } else { l.t("Hidden", "Oculto") };
     Box::new(
         creamui::RawButton::new(
             creamui::Style::new().padding("4px 10px").background(bg).border(border, 1.0).corner_radius(999.0),
-            move || {
-                let id = id.clone();
-                toggle.set_config(move |c| {
-                    if !c.widget.hidden.remove(&id) {
-                        c.widget.hidden.insert(id);
-                    }
-                })
-            },
+            move || toggle.set_config(flip.clone()),
         )
         .child(text(label, 11.0, fg)),
     )
+}
+
+/// Adds `id` to `set` if absent, removes it otherwise.
+fn flip_id(set: &mut std::collections::BTreeSet<String>, id: &str) {
+    if !set.remove(id) {
+        set.insert(id.to_owned());
+    }
 }
 
 fn device_card(app: &App, p: &Palette, cfg: &Config, s: &DeviceState, width: f32) -> BoxedWidget {
@@ -401,7 +401,17 @@ fn device_card(app: &App, p: &Palette, cfg: &Config, s: &DeviceState, width: f32
         .child(text(when, 12.0, p.muted))
         .child(spacer());
     if !generic {
-        footer = footer.child(widget_pill(app, p, l, s.device.id.clone(), !cfg.widget.hidden.contains(&s.device.id)));
+        let id = s.device.id.clone();
+        let on = !cfg.widget.hidden.contains(&id);
+        let label = if on { l.t("In widget", "En widget") } else { l.t("No widget", "Sin widget") };
+        footer = footer.child(pill(app, p, label, on, move |c| flip_id(&mut c.widget.hidden, &id)));
+        // Only where a tray actually runs (Windows, Linux with an SNI host).
+        if app.tray.borrow().is_some() {
+            let id = s.device.id.clone();
+            let on = !cfg.tray.hidden.contains(&id);
+            let label = if on { l.t("In tray", "En bandeja") } else { l.t("No tray", "Sin bandeja") };
+            footer = footer.child(pill(app, p, label, on, move |c| flip_id(&mut c.tray.hidden, &id)));
+        }
     }
     let (middle, middle_h): (BoxedWidget, f32) = if generic {
         let note = l.t(

@@ -1,7 +1,7 @@
 //! OS integration: tray icon, toast notifications, autostart, single instance.
 //! Real implementations on Windows and Linux; inert stubs elsewhere.
 
-use battery_core::config::Lang;
+use battery_core::config::{Config, Lang};
 use battery_core::monitor::DeviceState;
 use battery_core::{Charge, Link};
 
@@ -41,14 +41,41 @@ fn device_lines(states: &[DeviceState]) -> Vec<String> {
     states
         .iter()
         .filter(|s| s.status.link == Link::Connected && s.device.provider != battery_core::diag::GENERIC)
+        .map(device_line)
+        .collect()
+}
+
+fn device_line(s: &DeviceState) -> String {
+    let bolt = if matches!(s.status.charge, Charge::Charging | Charge::Full) { " ⚡" } else { "" };
+    match s.status.level {
+        Some(l) => format!("{} {l}%{bolt}", s.device.name),
+        None => format!("{} —", s.device.name),
+    }
+}
+
+/// One tray icon per device with a battery, unless hidden in settings:
+/// (device id, tooltip, 32x32 RGBA). Offline devices keep their last level, grayed.
+fn device_icons(states: &[DeviceState], cfg: &Config) -> Vec<(String, String, Vec<u8>)> {
+    states
+        .iter()
+        .filter(|s| s.device.provider != battery_core::diag::GENERIC && !cfg.tray.hidden.contains(&s.device.id))
         .map(|s| {
-            let bolt = if matches!(s.status.charge, Charge::Charging | Charge::Full) { " ⚡" } else { "" };
-            match s.status.level {
-                Some(l) => format!("{} {l}%{bolt}", s.device.name),
-                None => format!("{} —", s.device.name),
-            }
+            let live = s.status.link == Link::Connected && s.status.level.is_some();
+            let level = s.status.level.or(s.last_level);
+            let color = level_color(level.filter(|_| live), cfg.low_threshold);
+            (s.device.id.clone(), device_line(s), crate::icons::tray_icon(s.device.kind, level, color))
         })
         .collect()
+}
+
+/// Gray when unknown, then red / amber / green like the main window.
+fn level_color(level: Option<u8>, threshold: u8) -> [u8; 4] {
+    match level {
+        None => [0x8A, 0x8C, 0x91, 0xFF],
+        Some(l) if l <= threshold => [0xFF, 0x63, 0x5C, 0xFF],
+        Some(l) if l <= 50 => [0xF2, 0xB5, 0x4A, 0xFF],
+        Some(_) => [0x5C, 0xD6, 0x9A, 0xFF],
+    }
 }
 
 fn tooltip(states: &[DeviceState]) -> String {
@@ -78,12 +105,7 @@ pub fn battery_icon(level: Option<u8>, threshold: u8) -> Vec<u8> {
     const S: usize = 32;
     let mut px = vec![0u8; S * S * 4];
     let outline = [0xEC, 0xEB, 0xE6, 0xFF];
-    let fill = match level {
-        None => [0x8A, 0x8C, 0x91, 0xFF],
-        Some(l) if l <= threshold => [0xFF, 0x63, 0x5C, 0xFF],
-        Some(l) if l <= 50 => [0xF2, 0xB5, 0x4A, 0xFF],
-        Some(_) => [0x5C, 0xD6, 0x9A, 0xFF],
-    };
+    let fill = level_color(level, threshold);
     let mut put = |x: usize, y: usize, c: [u8; 4]| px[(y * S + x) * 4..(y * S + x) * 4 + 4].copy_from_slice(&c);
     // body 2..27 x 8..24, 2px border; nub 27..30 x 13..19
     for y in 8..24 {
@@ -274,9 +296,12 @@ mod win {
 
     pub struct Tray {
         icon: TrayIcon,
+        menu: Menu,
         items: [MenuItem; 5],
         ids: [MenuId; 5],
         last: std::cell::Cell<Option<Option<u8>>>,
+        /// Per-device icons: device id, icon, last pixels drawn.
+        devices: std::cell::RefCell<Vec<(String, TrayIcon, Vec<u8>)>>,
     }
 
     impl Tray {
@@ -292,7 +317,7 @@ mod win {
             menu.append_items(&[&open, &refresh, &widget, &log, &PredefinedMenuItem::separator(), &quit])
                 .map_err(|e| e.to_string())?;
             let icon = TrayIconBuilder::new()
-                .with_menu(Box::new(menu))
+                .with_menu(Box::new(menu.clone()))
                 .with_menu_on_left_click(false)
                 .with_tooltip("lowbattery")
                 .with_icon(Icon::from_rgba(battery_icon(None, 0), 32, 32).map_err(|e| e.to_string())?)
@@ -303,6 +328,8 @@ mod win {
                 ids: [open.id().clone(), refresh.id().clone(), widget.id().clone(), log.id().clone(), quit.id().clone()],
                 items: [open, refresh, widget, log, quit],
                 last: Default::default(),
+                menu,
+                devices: Default::default(),
             })
         }
 
@@ -336,15 +363,46 @@ mod win {
             );
         }
 
-        pub fn update(&self, states: &[DeviceState], threshold: u8) {
+        pub fn update(&self, states: &[DeviceState], cfg: &Config) {
             let _ = self.icon.set_tooltip(Some(tooltip(states)));
             let level = worst(states);
             if self.last.get() != Some(level) {
                 self.last.set(Some(level));
-                if let Ok(icon) = Icon::from_rgba(battery_icon(level, threshold), 32, 32) {
+                if let Ok(icon) = Icon::from_rgba(battery_icon(level, cfg.low_threshold), 32, 32) {
                     let _ = self.icon.set_icon(Some(icon));
                 }
             }
+            let wanted = device_icons(states, cfg);
+            let mut devices = self.devices.borrow_mut();
+            // Dropping a TrayIcon removes it from the taskbar.
+            devices.retain(|(id, ..)| wanted.iter().any(|(w, ..)| w == id));
+            for (id, tip, px) in wanted {
+                if let Some((_, icon, last)) = devices.iter_mut().find(|(d, ..)| *d == id) {
+                    let _ = icon.set_tooltip(Some(&tip));
+                    if *last != px {
+                        if let Ok(i) = Icon::from_rgba(px.clone(), 32, 32) {
+                            let _ = icon.set_icon(Some(i));
+                        }
+                        *last = px;
+                    }
+                    continue;
+                }
+                let built = Icon::from_rgba(px.clone(), 32, 32).map_err(|e| e.to_string()).and_then(|i| {
+                    TrayIconBuilder::new()
+                        .with_menu(Box::new(self.menu.clone()))
+                        .with_menu_on_left_click(false)
+                        .with_tooltip(&tip)
+                        .with_icon(i)
+                        .build()
+                        .map_err(|e| e.to_string())
+                });
+                match built {
+                    Ok(icon) => devices.push((id, icon, px)),
+                    Err(e) => log::error!("tray icon for {id}: {e}"),
+                }
+            }
+            // The aggregate icon only fills in while no device has its own.
+            let _ = self.icon.set_visible(devices.is_empty());
         }
     }
 }
@@ -385,8 +443,8 @@ mod stub {
             Err("tray is not implemented on this OS".into())
         }
         pub fn listen(&self, _: &creamui::AppHandle, _: impl Fn(TrayAction) + 'static) {}
-        pub fn update(&self, states: &[DeviceState], threshold: u8) {
-            let _ = (worst(states), tooltip(states), battery_icon(None, threshold));
+        pub fn update(&self, states: &[DeviceState], cfg: &Config) {
+            let _ = (worst(states), tooltip(states), battery_icon(None, cfg.low_threshold), device_icons(states, cfg));
         }
     }
 }

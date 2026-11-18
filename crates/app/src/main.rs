@@ -92,9 +92,12 @@ impl App {
                 self.fit_widget();
             }
         }
-        if new.lang != old.lang {
-            if let Some(tray) = self.tray.borrow().as_ref() {
+        if let Some(tray) = self.tray.borrow().as_ref() {
+            if new.lang != old.lang {
                 tray.set_lang(new.lang);
+            }
+            if new.tray != old.tray || new.low_threshold != old.low_threshold {
+                tray.update(&self.devices.get(), &new);
             }
         }
         if new.dark != old.dark {
@@ -221,7 +224,7 @@ impl App {
             alerts.check(&states, cfg.low_threshold); // keep state so enabling later doesn't replay
         }
         if let Some(tray) = self.tray.borrow().as_ref() {
-            tray.update(&states, cfg.low_threshold);
+            tray.update(&states, &cfg);
         }
         self.devices.set(states);
         if ui::widget_rows(self).len() != rows_before {
