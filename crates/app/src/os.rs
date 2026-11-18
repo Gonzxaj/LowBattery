@@ -53,12 +53,13 @@ fn device_line(s: &DeviceState) -> String {
     }
 }
 
-/// One tray icon per device with a battery, unless hidden in settings:
-/// (device id, tooltip, 32x32 RGBA). Offline devices keep their last level, grayed.
+/// One tray icon per device pinned in settings: (device id, tooltip,
+/// 32x32 RGBA). Opt-in because each icon costs a D-Bus connection on Linux.
+/// Offline devices keep their last level, grayed.
 fn device_icons(states: &[DeviceState], cfg: &Config) -> Vec<(String, String, Vec<u8>)> {
     states
         .iter()
-        .filter(|s| s.device.provider != battery_core::diag::GENERIC && !cfg.tray.hidden.contains(&s.device.id))
+        .filter(|s| s.device.provider != battery_core::diag::GENERIC && cfg.tray.shown.contains(&s.device.id))
         .map(|s| {
             let live = s.status.link == Link::Connected && s.status.level.is_some();
             let level = s.status.level.or(s.last_level);

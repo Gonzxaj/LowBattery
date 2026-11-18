@@ -210,7 +210,8 @@ impl App {
     /// New readings from the monitor thread.
     fn on_snapshot(&self, states: Vec<DeviceState>, alerts: &mut LowBatteryAlerts) {
         let cfg = self.config.get();
-        let rows_before = ui::widget_rows(self).len();
+        let prev = self.devices.get();
+        let rows_before = ui::widget_row_count(&prev, &cfg);
         if cfg.notify {
             for s in alerts.check(&states, cfg.low_threshold) {
                 let level = s.status.level.unwrap_or(0);
@@ -223,11 +224,17 @@ impl App {
         } else {
             alerts.check(&states, cfg.low_threshold); // keep state so enabling later doesn't replay
         }
+        // Identical readings (battery % unchanged between polls) need no
+        // tray refresh and no widget-tree rebuild.
+        if prev == states {
+            return;
+        }
+        let rows_after = ui::widget_row_count(&states, &cfg);
         if let Some(tray) = self.tray.borrow().as_ref() {
             tray.update(&states, &cfg);
         }
         self.devices.set(states);
-        if ui::widget_rows(self).len() != rows_before {
+        if rows_after != rows_before {
             self.fit_widget();
         }
     }

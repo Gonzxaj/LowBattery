@@ -105,10 +105,18 @@ pub mod native {
     thread_local! {
         // Providers only run on the monitor thread; one enumerator for all.
         static API: RefCell<Option<HidApi>> = const { RefCell::new(None) };
+        /// Interface list shared by every provider during one monitor poll;
+        /// `refresh()` rebuilds it so ~50 discover() calls cost one sysfs scan.
+        static SNAPSHOT: RefCell<Option<Vec<DeviceInfo>>> = const { RefCell::new(None) };
     }
 
-    /// Fresh enumeration of HID interfaces (no admin rights needed).
-    pub fn enumerate() -> Vec<DeviceInfo> {
+    /// Re-scan HID interfaces and cache the list for this poll. `Monitor::poll`
+    /// calls it once; `enumerate()` then hands out clones of the snapshot.
+    pub fn refresh() {
+        SNAPSHOT.with(|s| *s.borrow_mut() = Some(enumerate_fresh()));
+    }
+
+    fn enumerate_fresh() -> Vec<DeviceInfo> {
         API.with(|cell| {
             let mut slot = cell.borrow_mut();
             match slot.as_mut() {
@@ -127,6 +135,17 @@ pub mod native {
             }
             slot.as_ref().map(|a| a.device_list().cloned().collect()).unwrap_or_default()
         })
+    }
+
+    /// HID interfaces for this poll (see `refresh`). Outside a poll it scans
+    /// once and caches, so standalone callers (diagnostics) still work.
+    pub fn enumerate() -> Vec<DeviceInfo> {
+        if let Some(list) = SNAPSHOT.with(|s| s.borrow().clone()) {
+            return list;
+        }
+        let list = enumerate_fresh();
+        SNAPSHOT.with(|s| *s.borrow_mut() = Some(list.clone()));
+        list
     }
 
     pub fn open(path: &str) -> Option<Dev> {

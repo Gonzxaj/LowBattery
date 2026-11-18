@@ -408,9 +408,9 @@ fn device_card(app: &App, p: &Palette, cfg: &Config, s: &DeviceState, width: f32
         // Only where a tray actually runs (Windows, Linux with an SNI host).
         if app.tray.borrow().is_some() {
             let id = s.device.id.clone();
-            let on = !cfg.tray.hidden.contains(&id);
+            let on = cfg.tray.shown.contains(&id);
             let label = if on { l.t("In tray", "En bandeja") } else { l.t("No tray", "Sin bandeja") };
-            footer = footer.child(pill(app, p, label, on, move |c| flip_id(&mut c.tray.hidden, &id)));
+            footer = footer.child(pill(app, p, label, on, move |c| flip_id(&mut c.tray.shown, &id)));
         }
     }
     let (middle, middle_h): (BoxedWidget, f32) = if generic {
@@ -615,14 +615,19 @@ pub fn widget_height(rows: usize) -> u32 {
     (WIDGET_PAD * 2.0 + WIDGET_ROW * rows.max(1) as f32) as u32
 }
 
+fn in_widget(s: &DeviceState, cfg: &Config) -> bool {
+    // Battery-less generic cards have nothing to show in the widget.
+    s.device.provider != battery_core::diag::GENERIC && !cfg.widget.hidden.contains(&s.device.id)
+}
+
 pub fn widget_rows(app: &App) -> Vec<DeviceState> {
     let cfg = app.config.get();
-    app.devices
-        .get()
-        .into_iter()
-        // Battery-less generic cards have nothing to show in the widget.
-        .filter(|s| s.device.provider != battery_core::diag::GENERIC && !cfg.widget.hidden.contains(&s.device.id))
-        .collect()
+    app.devices.get().into_iter().filter(|s| in_widget(s, &cfg)).collect()
+}
+
+/// How many rows the widget would show for a snapshot, without cloning it.
+pub fn widget_row_count(states: &[DeviceState], cfg: &Config) -> usize {
+    states.iter().filter(|s| in_widget(s, cfg)).count()
 }
 
 pub fn widget(app: &App, view: Size) -> BoxedWidget {

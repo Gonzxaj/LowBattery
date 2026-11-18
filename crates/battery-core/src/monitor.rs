@@ -39,6 +39,9 @@ impl Monitor {
 
     /// One full cycle: discover + read every device, sequentially.
     pub fn poll(&mut self) -> Vec<DeviceState> {
+        // One HID scan per cycle, shared by every provider's discover().
+        #[cfg(any(windows, target_os = "linux"))]
+        crate::hid::native::refresh();
         let now = SystemTime::now();
         let mut seen = HashSet::new();
         let mut readings = Vec::new();
@@ -65,6 +68,14 @@ impl Monitor {
                 }
                 state.status = BatteryStatus::GONE;
             }
+        }
+        // Providers' per-poll churn stays in malloc arenas; hand the slack back.
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        {
+            extern "C" {
+                fn malloc_trim(pad: usize) -> i32;
+            }
+            unsafe { malloc_trim(0) };
         }
         self.states.values().cloned().collect()
     }

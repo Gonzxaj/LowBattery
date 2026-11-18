@@ -31,8 +31,8 @@ pub struct Config {
     pub autostart: bool,
     pub dark: bool,
     pub widget: WidgetConfig,
-    /// Devices with their own system-tray icon; hidden ids keep only the
-    /// aggregate icon. New devices show by default.
+    /// Devices with their own system-tray icon; empty means only the
+    /// aggregate icon shows. New devices stay off until pinned in settings.
     pub tray: TrayConfig,
 }
 
@@ -51,8 +51,9 @@ pub struct WidgetConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct TrayConfig {
-    /// Device ids without their own tray icon; new devices show by default.
-    pub hidden: BTreeSet<String>,
+    /// Device ids with their own tray icon; each one costs a D-Bus
+    /// connection on Linux, so devices stay off until pinned in settings.
+    pub shown: BTreeSet<String>,
 }
 
 impl Default for Config {
