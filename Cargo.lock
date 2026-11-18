@@ -1240,6 +1240,7 @@ dependencies = [
  "creamui",
  "embed-resource",
  "ksni",
+ "libc",
  "log",
  "raw-window-handle",
  "tauri-winrt-notification",

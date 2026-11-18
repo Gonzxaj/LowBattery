@@ -75,7 +75,7 @@ Differences when the app runs packaged:
 - `--demo`: uses simulated devices, no hardware.
 - `--debug`: verbose logging.
 - Configuration: `%APPDATA%\LowBattery\config.json` (packaged: see above).
-- Each poll shares a single HID scan across all providers, and battery reads open the device node only for the duration of the query — so an unplugged device is reported as gone on the next cycle.
+- Each poll shares a single HID scan across all providers, and battery reads open the device node only for the duration of the query — so an unplugged device is reported as gone on the next cycle. Device plug/unplug events (USB on Windows, sysfs on Linux) trigger an early refresh; the interval stays the fallback.
 
 ## Linux
 

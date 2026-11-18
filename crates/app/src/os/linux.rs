@@ -203,6 +203,54 @@ pub fn open_file(path: &std::path::Path) {
     });
 }
 
+/// inotify on the sysfs class dirs: kernfs emits create/delete when a HID
+/// device or a power_supply node appears/disappears (USB, Bluetooth). The
+/// events are only a hint — the periodic poll stays the source of truth.
+pub fn watch_hotplug(cmd: mpsc::Sender<Command>) {
+    std::thread::Builder::new()
+        .name("hotplug".into())
+        .spawn(move || unsafe {
+            let fd = libc::inotify_init1(libc::IN_CLOEXEC);
+            if fd < 0 {
+                log::error!("hotplug: inotify_init1: {}", std::io::Error::last_os_error());
+                return;
+            }
+            for path in ["/sys/class/hidraw", "/sys/class/power_supply"] {
+                let Ok(c) = std::ffi::CString::new(path) else { continue };
+                let mask = libc::IN_CREATE | libc::IN_DELETE | libc::IN_MOVED_FROM | libc::IN_MOVED_TO | libc::IN_ONLYDIR;
+                if libc::inotify_add_watch(fd, c.as_ptr(), mask) < 0 {
+                    log::warn!("hotplug: watching {path}: {}", std::io::Error::last_os_error());
+                }
+            }
+            let hotplug = super::Hotplug::default();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = libc::read(fd, buf.as_mut_ptr().cast(), buf.len());
+                if n < 0 {
+                    let e = std::io::Error::last_os_error();
+                    if e.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    log::error!("hotplug: inotify read: {e}");
+                    return;
+                }
+                // inotify_event: i32 wd, u32 mask, u32 cookie, u32 len, name[len]
+                let mut off = 0usize;
+                while off + 16 <= n as usize {
+                    let mask = u32::from_ne_bytes(buf[off + 4..off + 8].try_into().unwrap());
+                    let len = u32::from_ne_bytes(buf[off + 12..off + 16].try_into().unwrap()) as usize;
+                    const TRIGGER: u32 = libc::IN_CREATE | libc::IN_DELETE | libc::IN_MOVED_FROM | libc::IN_MOVED_TO | libc::IN_Q_OVERFLOW;
+                    if mask & TRIGGER != 0 {
+                        hotplug.trigger(&cmd);
+                    }
+                    off += 16 + len;
+                }
+            }
+        })
+        .map(|_| ())
+        .unwrap_or_else(|e| log::error!("hotplug thread: {e}"));
+}
+
 /// SNI wants ARGB32 in network byte order; battery_icon is RGBA.
 fn argb(mut px: Vec<u8>) -> Vec<u8> {
     px.as_chunks_mut::<4>().0.iter_mut().for_each(|p| p.rotate_right(1));

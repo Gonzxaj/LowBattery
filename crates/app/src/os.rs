@@ -2,8 +2,9 @@
 //! Real implementations on Windows and Linux; inert stubs elsewhere.
 
 use battery_core::config::{Config, Lang};
-use battery_core::monitor::DeviceState;
+use battery_core::monitor::{Command, DeviceState};
 use battery_core::{Charge, Link};
+use std::sync::mpsc;
 
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))] // only real trays emit these
@@ -13,6 +14,39 @@ pub enum TrayAction {
     ToggleWidget,
     OpenLog,
     Quit,
+}
+
+/// Coalesces hotplug bursts (plugging a hub fires many events at once) into
+/// one monitor refresh ~700ms after the last event.
+#[derive(Clone, Default)]
+pub struct Hotplug(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+impl Hotplug {
+    /// Call on each OS device event.
+    pub fn trigger(&self, cmd: &mpsc::Sender<Command>) {
+        use std::sync::atomic::Ordering;
+        let gen = self.0.fetch_add(1, Ordering::Relaxed) + 1;
+        let (this, cmd) = (self.clone(), cmd.clone());
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(700));
+            if this.0.load(Ordering::Relaxed) == gen {
+                log::info!("device hotplug: refreshing");
+                let _ = cmd.send(Command::Refresh);
+            }
+        });
+    }
+}
+
+/// Listens for device plug/unplug and triggers an early monitor poll on each
+/// burst. The periodic poll stays the source of truth: events are only a hint
+/// (they can be lost), so nothing depends on them arriving.
+pub fn watch_hotplug(cmd: mpsc::Sender<Command>) {
+    #[cfg(windows)]
+    win::watch_hotplug(cmd);
+    #[cfg(target_os = "linux")]
+    linux::watch_hotplug(cmd);
+    #[cfg(not(any(windows, target_os = "linux")))]
+    let _ = cmd;
 }
 
 /// Window app ID: Linux docks match it to our .desktop file (name, icon).
@@ -216,6 +250,89 @@ mod win {
                 }
             }
         }
+    }
+
+    /// Channel + debouncer shared with the hotplug wndproc (see `watch_hotplug`).
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    static HOTPLUG: std::sync::OnceLock<(mpsc::Sender<Command>, super::Hotplug)> = std::sync::OnceLock::new();
+
+    unsafe extern "system" fn hotplug_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        use windows_sys::Win32::UI::WindowsAndMessaging::*;
+        if msg == WM_DEVICECHANGE && matches!(wparam as u32, DBT_DEVICEARRIVAL | DBT_DEVICEREMOVECOMPLETE) {
+            if let Some((cmd, hotplug)) = HOTPLUG.get() {
+                hotplug.trigger(cmd);
+            }
+        }
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
+
+    /// Message-only window + RegisterDeviceNotification: USB arrivals/removals
+    /// post WM_DEVICECHANGE to our own wndproc, independent of any creamui
+    /// window (the main window may not even exist yet).
+    pub fn watch_hotplug(cmd: mpsc::Sender<Command>) {
+        use windows_sys::Win32::Devices::Usb::GUID_DEVINTERFACE_USB_DEVICE;
+        use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::*;
+
+        if HOTPLUG.set((cmd, super::Hotplug::default())).is_err() {
+            return;
+        }
+        std::thread::spawn(|| unsafe {
+            let class = wide("LowBatteryHotplug");
+            let wc = WNDCLASSW {
+                style: 0,
+                lpfnWndProc: Some(hotplug_wndproc),
+                cbClsExtra: 0,
+                cbWndExtra: 0,
+                hInstance: GetModuleHandleW(std::ptr::null()),
+                hIcon: std::ptr::null_mut(),
+                hCursor: std::ptr::null_mut(),
+                hbrBackground: std::ptr::null_mut(),
+                lpszMenuName: std::ptr::null(),
+                lpszClassName: class.as_ptr(),
+            };
+            if RegisterClassW(&wc) == 0 {
+                log::error!("hotplug: RegisterClassW: {}", GetLastError());
+                return;
+            }
+            let hwnd = CreateWindowExW(
+                0,
+                class.as_ptr(),
+                class.as_ptr(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                HWND_MESSAGE,
+                std::ptr::null_mut(),
+                wc.hInstance,
+                std::ptr::null(),
+            );
+            if hwnd.is_null() {
+                log::error!("hotplug: CreateWindowExW: {}", GetLastError());
+                return;
+            }
+            let filter = DEV_BROADCAST_HANDLE {
+                dbch_size: std::mem::size_of::<DEV_BROADCAST_HANDLE>() as u32,
+                dbch_devicetype: DBT_DEVTYP_DEVICEINTERFACE,
+                dbch_reserved: 0,
+                dbch_handle: hwnd,
+                dbch_hdevnotify: std::ptr::null_mut(),
+                dbch_eventguid: GUID_DEVINTERFACE_USB_DEVICE,
+                dbch_nameoffset: 0,
+                dbch_data: [0],
+            };
+            if RegisterDeviceNotificationW(hwnd, &filter as *const _ as *const core::ffi::c_void, DEVICE_NOTIFY_WINDOW_HANDLE).is_null() {
+                log::error!("hotplug: RegisterDeviceNotificationW: {}", GetLastError());
+                return;
+            }
+            let mut msg: MSG = std::mem::zeroed();
+            while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        });
     }
 
     /// Opens a file with its default handler (Notepad for .log).

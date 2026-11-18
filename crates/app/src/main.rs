@@ -341,6 +341,9 @@ fn main() {
                 Rc::new(move |states| ui_app.on_snapshot(states, &mut alerts.borrow_mut())),
             );
 
+            // Plug/unplug events trigger an early poll; the interval stays the fallback.
+            os::watch_hotplug(app.cmd.clone());
+
             match os::Tray::new(app.config.get().lang) {
                 Ok(tray) => {
                     let ui_app = app.clone();
