@@ -25,13 +25,13 @@ opt-level = 2
 # includes upstream's restore repaint, Wayland resize and app_id fixes (PRs #4-#6)
 # plus what we still carry (Moved event, native handles).
 [patch.crates-io]
-creamui = { git = "https://github.com/sammwyy/creamui", rev = "cbc63b9c10d7a68171b6c91af23c7433439b664a" }
-creamui-core = { git = "https://github.com/sammwyy/creamui", rev = "cbc63b9c10d7a68171b6c91af23c7433439b664a" }
-creamui-fonts = { git = "https://github.com/sammwyy/creamui", rev = "cbc63b9c10d7a68171b6c91af23c7433439b664a" }
-creamui-image = { git = "https://github.com/sammwyy/creamui", rev = "cbc63b9c10d7a68171b6c91af23c7433439b664a" }
-creamui-reactive = { git = "https://github.com/sammwyy/creamui", rev = "cbc63b9c10d7a68171b6c91af23c7433439b664a" }
-creamui-theme = { git = "https://github.com/sammwyy/creamui", rev = "cbc63b9c10d7a68171b6c91af23c7433439b664a" }
-creamui-widgets = { git = "https://github.com/sammwyy/creamui", rev = "cbc63b9c10d7a68171b6c91af23c7433439b664a" }
+creamui = { git = "https://github.com/sammwyy/creamui", rev = "335824c350b4eb4d986efd25546d0f21e337f83e" }
+creamui-core = { git = "https://github.com/sammwyy/creamui", rev = "335824c350b4eb4d986efd25546d0f21e337f83e" }
+creamui-fonts = { git = "https://github.com/sammwyy/creamui", rev = "335824c350b4eb4d986efd25546d0f21e337f83e" }
+creamui-image = { git = "https://github.com/sammwyy/creamui", rev = "335824c350b4eb4d986efd25546d0f21e337f83e" }
+creamui-reactive = { git = "https://github.com/sammwyy/creamui", rev = "335824c350b4eb4d986efd25546d0f21e337f83e" }
+creamui-theme = { git = "https://github.com/sammwyy/creamui", rev = "335824c350b4eb4d986efd25546d0f21e337f83e" }
+creamui-widgets = { git = "https://github.com/sammwyy/creamui", rev = "335824c350b4eb4d986efd25546d0f21e337f83e" }
 creamui-render = { path = "third_party/creamui-render" }
 creamui-platform = { path = "third_party/creamui-platform" }
 

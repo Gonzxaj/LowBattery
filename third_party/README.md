@@ -1,18 +1,18 @@
 # third_party
 
-Both copies come from creamui `main` at commit `cbc63b9` (2026-11-13; newer than the
+All copies come from creamui `main` at commit `335824c` (2026-11-13; newer than the
 0.3.0 release on crates.io but still numbered 0.3.0), packaged with `cargo package`
 so they build outside creamui's workspace. The root `Cargo.toml` pulls the rest of
-creamui from that same commit and swaps these two in for both crates.io and git.
+creamui from that same commit and swaps these in for both crates.io and git.
 
-To move to a newer commit: package `creamui-render` and `creamui-platform` from it,
-re-apply our diff (what differs from the packaged sources), and bump the `rev`.
-Only what the build reads is kept: no `examples/`, `tests/`, `Cargo.lock` or
-`Cargo.toml.orig` (and their `[[example]]`/`[[test]]` entries are removed).
+To move to a newer commit: package `creamui-render` and `creamui-platform` from it, re-apply our diff (what differs from the packaged
+sources), and bump the `rev`. Only what the build reads is kept: no `examples/`,
+`tests/`, `Cargo.lock` or `Cargo.toml.orig` (and their `[[example]]`/`[[test]]`
+entries are removed).
 
 The restore repaint (Windows, X11 map), Wayland programmatic resize and Linux
 `app_id` fixes we used to carry are upstream since `cbc63b9` (PRs #4, #5, #6).
-What is left is below. Remove both directories and their `[patch]` entries in the
+What is left is below. Remove the directories and their `[patch]` entries in the
 root Cargo.toml once creamui ships these too (or LowBattery stops needing them).
 
 **Window moved event (both crates):** creamui dropped winit's `WindowEvent::Moved`.
@@ -33,4 +33,3 @@ windows hidden and `creamui-render` shows top-level windows only after their
 `on_window_ready` callback (popups still show before it). X11 window managers read
 `_NET_WM_STATE` when a window is mapped; set later, Ubuntu Dock kept the widget
 counted as an open window when it was the app's only one (autostart).
-

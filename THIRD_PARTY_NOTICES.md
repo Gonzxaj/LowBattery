@@ -6,7 +6,7 @@ following third-party work.
 ## CreamUI (Apache-2.0), modified copy
 
 `third_party/creamui-render/` is a copy of **creamui-render 0.3.0** (GitHub `main`, commit
-`a36a4bc`; the rest of CreamUI is used from that commit unmodified), part of
+`335824c`; the rest of CreamUI is used from that commit unmodified), part of
 [CreamUI](https://github.com/sammwyy/creamui) by Sammwy, licensed under the
 Apache License 2.0 (full text in `third_party/creamui-render/LICENSE`).
 
