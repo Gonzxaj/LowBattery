@@ -150,7 +150,7 @@ mod native {
         }
 
         fn discover(&self) -> Vec<Device> {
-            let infos: Vec<_> = enumerate().into_iter().filter(|d| d.vendor_id() == VID).collect();
+            let infos: Vec<_> = enumerate().iter().filter(|d| d.vendor_id() == VID).cloned().collect();
             let mut out: Vec<Device> = Vec::new();
             let mut pids: Vec<u16> = infos.iter().map(|d| d.product_id()).collect();
             pids.sort_unstable();

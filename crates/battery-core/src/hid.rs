@@ -101,19 +101,29 @@ pub mod native {
     use hidapi::{DeviceInfo, HidApi, HidDevice};
     use std::cell::RefCell;
     use std::io;
+    use std::rc::Rc;
 
     thread_local! {
         // Providers only run on the monitor thread; one enumerator for all.
         static API: RefCell<Option<HidApi>> = const { RefCell::new(None) };
         /// Interface list shared by every provider during one monitor poll;
-        /// `refresh()` rebuilds it so ~50 discover() calls cost one sysfs scan.
-        static SNAPSHOT: RefCell<Option<Vec<DeviceInfo>>> = const { RefCell::new(None) };
+        /// `refresh()` rebuilds it so ~50 discover() calls cost one sysfs scan
+        /// and zero clones (callers share the `Rc`).
+        static SNAPSHOT: RefCell<Option<Rc<Vec<DeviceInfo>>>> = const { RefCell::new(None) };
+        /// Bumped by `refresh()`; `diag` memos key off it.
+        static EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
 
     /// Re-scan HID interfaces and cache the list for this poll. `Monitor::poll`
-    /// calls it once; `enumerate()` then hands out clones of the snapshot.
+    /// calls it once; `enumerate()` then hands out the shared snapshot.
     pub fn refresh() {
-        SNAPSHOT.with(|s| *s.borrow_mut() = Some(enumerate_fresh()));
+        SNAPSHOT.with(|s| *s.borrow_mut() = Some(Rc::new(enumerate_fresh())));
+        EPOCH.with(|e| e.set(e.get() + 1));
+    }
+
+    /// Poll counter for per-cycle memos (see `diag::candidates`).
+    pub fn epoch() -> u64 {
+        EPOCH.with(|e| e.get())
     }
 
     fn enumerate_fresh() -> Vec<DeviceInfo> {
@@ -137,13 +147,13 @@ pub mod native {
         })
     }
 
-    /// HID interfaces for this poll (see `refresh`). Outside a poll it scans
-    /// once and caches, so standalone callers (diagnostics) still work.
-    pub fn enumerate() -> Vec<DeviceInfo> {
+    /// HID interfaces for this poll (see `refresh`). Shared, read-only:
+    /// cloning the `Rc` is a refcount bump, not a device-list copy.
+    pub fn enumerate() -> Rc<Vec<DeviceInfo>> {
         if let Some(list) = SNAPSHOT.with(|s| s.borrow().clone()) {
             return list;
         }
-        let list = enumerate_fresh();
+        let list = Rc::new(enumerate_fresh());
         SNAPSHOT.with(|s| *s.borrow_mut() = Some(list.clone()));
         list
     }

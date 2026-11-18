@@ -102,7 +102,7 @@ mod native {
             let mut known = self.known.lock().unwrap();
             let mut names = self.names.lock().unwrap();
             let mut out = Vec::new();
-            for d in enumerate() {
+            for d in enumerate().iter() {
                 if !(supported(d.vendor_id(), d.product_id()) && d.usage_page() == 0xFF01 && d.usage() == 0x0002) {
                     continue;
                 }

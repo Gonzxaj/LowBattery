@@ -79,7 +79,7 @@ mod native {
         fn discover(&self) -> Vec<Device> {
             let mut known = self.known.lock().unwrap();
             let mut out = Vec::new();
-            for d in enumerate() {
+            for d in enumerate().iter() {
                 if !(d.vendor_id() == VID && d.product_id() == PID && d.usage_page() == 0xFFA0 && d.usage() == 1) {
                     continue;
                 }

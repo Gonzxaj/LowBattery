@@ -172,7 +172,7 @@ mod native {
             let mut known = self.known.lock().unwrap();
             let mut out = Vec::new();
             let mut pids: Vec<u16> = Vec::new();
-            for d in &infos {
+            for d in infos.iter() {
                 if d.vendor_id() == VID && !NAPE_PIDS.contains(&d.product_id()) && !pids.contains(&d.product_id()) {
                     pids.push(d.product_id());
                 }
@@ -233,7 +233,7 @@ mod native {
         fn discover(&self) -> Vec<Device> {
             let mut known = self.known.lock().unwrap();
             let mut out = Vec::new();
-            for d in enumerate() {
+            for d in enumerate().iter() {
                 if !(d.vendor_id() == VID && NAPE_PIDS.contains(&d.product_id()) && d.usage_page() == NAPE_PAGE && d.usage() == NAPE_USAGE) {
                     continue;
                 }

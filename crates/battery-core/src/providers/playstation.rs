@@ -142,13 +142,13 @@ mod native {
 
     fn collections() -> Vec<hidapi::DeviceInfo> {
         enumerate()
-            .into_iter()
+            .iter()
             .filter(|d| {
                 d.vendor_id() == VID
                     && PIDS.contains(&d.product_id())
                     && (d.usage_page(), d.usage()) == (0x0001, 0x0005)
             })
-            .collect()
+            .cloned().collect()
     }
 
     impl BatteryProvider for PlayStation {

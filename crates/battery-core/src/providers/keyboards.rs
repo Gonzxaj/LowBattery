@@ -102,7 +102,7 @@ mod native {
         fn discover(&self) -> Vec<Device> {
             let mut by_vid: BTreeMap<u16, Links> = BTreeMap::new();
             let mut models = self.models.lock().unwrap();
-            for d in enumerate() {
+            for d in enumerate().iter() {
                 if (d.usage_page(), d.usage()) != (USAGE_PAGE, USAGE) {
                     continue;
                 }

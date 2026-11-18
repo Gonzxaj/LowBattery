@@ -106,7 +106,7 @@ mod native {
 
         fn discover(&self) -> Vec<Device> {
             let infos: Vec<_> =
-                enumerate().into_iter().filter(|d| supported(d.vendor_id(), d.product_id()) && d.usage_page() == 0xFF00).collect();
+                enumerate().iter().filter(|d| supported(d.vendor_id(), d.product_id()) && d.usage_page() == 0xFF00).cloned().collect();
             let mut known = self.known.lock().unwrap();
             let mut names = self.names.lock().unwrap();
             let mut out = Vec::new();

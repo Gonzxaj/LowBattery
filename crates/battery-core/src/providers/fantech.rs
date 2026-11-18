@@ -106,15 +106,15 @@ mod native {
             let mut known = self.known.lock().unwrap();
             let mut out = Vec::new();
             let mut seen_pids = std::collections::HashSet::new();
-            for info in enumerate() {
+            for info in enumerate().iter() {
                 if info.vendor_id() != VID || !PIDS.contains(&info.product_id()) || !seen_pids.insert(info.product_id()) {
                     continue;
                 }
                 let pid = info.product_id();
                 let cols: Vec<_> = enumerate()
-                    .into_iter()
+                    .iter()
                     .filter(|d| d.vendor_id() == VID && d.product_id() == pid)
-                    .collect();
+                    .cloned().collect();
                 // (path, opened handle) per collection.
                 let mut ios: Vec<(String, Option<Dev>)> = Vec::new();
                 for c in &cols {

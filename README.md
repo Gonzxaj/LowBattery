@@ -22,7 +22,7 @@ Battery monitor for wireless peripherals on Windows 10/11 and Linux, written in 
 - **Keyboards with the `FF1C:0092` battery channel, any brand:** Telink/Evision firmware sold by FEKER, VGN, Rainy and others. They are recognized by that channel, not by brand, over both 2.4G and cable, with level and charging state. There is a single card per keyboard, whether it uses the cable or the receiver.
 - **Generic 2.4G receivers without battery** (for example YICHIP): they show as connected, with a note that they do not report battery, and they are not shown in the widget.
 - **Any brand:** HID devices that declare the standard "Battery Strength" usage.
-- **Tray:** the icon shows the lowest level and the tooltip lists all devices. A Windows toast warns when a device reaches low battery.
+- **Tray:** the icon shows the lowest level and the tooltip lists all devices. Devices can be pinned to the tray individually from the app (off by default, since each icon is a separate tray service); devices that disappear keep their last level until unpinned. A Windows toast warns when a device reaches low battery.
 - **Floating widget:** borderless, with configurable opacity, an always-on-top option and a choice of which devices to show.
 
 ## Build (Ubuntu, Docker only)
@@ -75,6 +75,7 @@ Differences when the app runs packaged:
 - `--demo`: uses simulated devices, no hardware.
 - `--debug`: verbose logging.
 - Configuration: `%APPDATA%\LowBattery\config.json` (packaged: see above).
+- Each poll shares a single HID scan across all providers, and battery reads open the device node only for the duration of the query — so an unplugged device is reported as gone on the next cycle.
 
 ## Linux
 

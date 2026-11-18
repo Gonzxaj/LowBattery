@@ -118,7 +118,7 @@ mod win {
         fn discover(&self) -> Vec<Device> {
             let mut caps = self.caps.lock().unwrap();
             let mut out: Vec<Device> = Vec::new();
-            for d in crate::hid::native::enumerate() {
+            for d in crate::hid::native::enumerate().iter() {
                 if crate::diag::claimed(d.vendor_id(), d.product_id()) {
                     continue;
                 }

@@ -201,7 +201,7 @@ mod native {
     }
 
     fn collections(vid: u16, pid: u16) -> Vec<hidapi::DeviceInfo> {
-        let mut cols: Vec<_> = enumerate().into_iter().filter(|d| d.vendor_id() == vid && d.product_id() == pid && d.usage_page() >= 0xFF00).collect();
+        let mut cols: Vec<_> = enumerate().iter().filter(|d| d.vendor_id() == vid && d.product_id() == pid && d.usage_page() >= 0xFF00).cloned().collect();
         cols.sort_by_key(|d| d.interface_number());
         cols
     }
@@ -217,7 +217,7 @@ mod native {
             let mut out = Vec::new();
             let mut names: Vec<String> = Vec::new();
             // Pelta headset.
-            for d in enumerate() {
+            for d in enumerate().iter() {
                 if d.vendor_id() == VID && d.product_id() == PELTA_PID && d.interface_number() == 3 && d.usage_page() == 0xFF00 && d.usage() == 1 {
                     let path = d.path().to_string_lossy().into_owned();
                     let Some(io) = open(&path) else { continue };
@@ -281,7 +281,7 @@ mod native {
             }
             // Direct devices (receiver or cable) by model table.
             let mut pids: Vec<u16> = Vec::new();
-            for d in enumerate() {
+            for d in enumerate().iter() {
                 if d.vendor_id() == VID && MODELS.iter().any(|m| m.pid == d.product_id()) && !pids.contains(&d.product_id()) {
                     pids.push(d.product_id());
                 }

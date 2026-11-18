@@ -90,9 +90,9 @@ mod native {
 
         fn discover(&self) -> Vec<Device> {
             let infos: Vec<_> = enumerate()
-                .into_iter()
+                .iter()
                 .filter(|d| supported(d.vendor_id(), d.product_id()) && d.usage_page() == 0xFF00 && d.usage() == 0x0001)
-                .collect();
+                .cloned().collect();
             if infos.is_empty() {
                 self.known.lock().unwrap().take();
                 return Vec::new();

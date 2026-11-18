@@ -128,19 +128,19 @@ mod native {
             let mut names = self.names.lock().unwrap();
             let mut out = Vec::new();
             let mut ids: Vec<(u16, u16)> = Vec::new();
-            for d in enumerate() {
+            for d in enumerate().iter() {
                 if supported(d.vendor_id(), d.product_id()) && !ids.contains(&(d.vendor_id(), d.product_id())) {
                     ids.push((d.vendor_id(), d.product_id()));
                 }
             }
             for &(vid, pid) in &ids {
                 let product = enumerate()
-                    .into_iter()
+                    .iter()
                     .find(|d| d.vendor_id() == vid && d.product_id() == pid)
                     .and_then(|d| d.product_string().map(str::to_string))
                     .unwrap_or_default();
                 let found = enumerate()
-                    .into_iter()
+                    .iter()
                     .filter(|d| {
                         d.vendor_id() == vid
                             && d.product_id() == pid

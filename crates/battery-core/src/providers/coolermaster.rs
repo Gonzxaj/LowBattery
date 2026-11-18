@@ -77,9 +77,9 @@ mod native {
     /// link (which names the real model) is probed first.
     fn collections() -> Vec<hidapi::DeviceInfo> {
         let mut out: Vec<_> = enumerate()
-            .into_iter()
+            .iter()
             .filter(|d| d.vendor_id() == VID && PIDS.contains(&d.product_id()) && d.usage_page() == USAGE_PAGE)
-            .collect();
+            .cloned().collect();
         out.sort_by_key(|d| (d.product_id() == 0x01B7, d.interface_number() != 3));
         out
     }

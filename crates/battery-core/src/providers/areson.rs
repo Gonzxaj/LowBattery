@@ -71,7 +71,7 @@ mod native {
     }
 
     fn collections(vid: u16, pid: u16) -> Option<(String, String)> {
-        let infos: Vec<_> = enumerate().into_iter().filter(|d| d.vendor_id() == vid && d.product_id() == pid).collect();
+        let infos: Vec<_> = enumerate().iter().filter(|d| d.vendor_id() == vid && d.product_id() == pid).cloned().collect();
         let feat = infos.iter().find(|d| {
             d.interface_number() == 1 && d.usage_page() == 0xFF02 && d.usage() == 2
         })?;
@@ -90,7 +90,7 @@ mod native {
             let mut known = self.known.lock().unwrap();
             let mut out = Vec::new();
             let mut pids: Vec<u16> = Vec::new();
-            for d in enumerate() {
+            for d in enumerate().iter() {
                 if supported(d.vendor_id(), d.product_id()) && !pids.contains(&d.product_id()) {
                     pids.push(d.product_id());
                 }
@@ -101,7 +101,7 @@ mod native {
                 match poll(&cmd, &input) {
                     Some(_) => {
                         let product = enumerate()
-                            .into_iter()
+                            .iter()
                             .find(|d| d.product_id() == pid)
                             .and_then(|d| d.product_string().map(str::to_string))
                             .unwrap_or_default();

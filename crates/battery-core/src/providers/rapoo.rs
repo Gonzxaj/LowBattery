@@ -97,7 +97,7 @@ mod native {
             let mut known = self.known.lock().unwrap();
             let mut out = Vec::new();
             let mut pids: Vec<u16> = Vec::new();
-            for d in enumerate() {
+            for d in enumerate().iter() {
                 if supported(d.vendor_id(), d.product_id()) && !pids.contains(&d.product_id()) {
                     pids.push(d.product_id());
                 }
@@ -105,7 +105,7 @@ mod native {
             for &pid in &pids {
                 let legacy = LEGACY_PIDS.contains(&pid);
                 let found = enumerate()
-                    .into_iter()
+                    .iter()
                     .filter(|d| {
                         d.vendor_id() == VID
                             && d.product_id() == pid
@@ -122,7 +122,7 @@ mod native {
                 match found {
                     Some((path, _)) => {
                         let product = enumerate()
-                            .into_iter()
+                            .iter()
                             .find(|d| d.vendor_id() == VID && d.product_id() == pid)
                             .and_then(|d| d.product_string().map(str::to_string))
                             .unwrap_or_default();

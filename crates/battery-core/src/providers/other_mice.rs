@@ -362,7 +362,7 @@ mod native {
     }
 
     fn cols(vid: u16, pid: u16) -> Vec<hidapi::DeviceInfo> {
-        let mut v: Vec<_> = enumerate().into_iter().filter(|d| d.vendor_id() == vid && d.product_id() == pid).collect();
+        let mut v: Vec<_> = enumerate().iter().filter(|d| d.vendor_id() == vid && d.product_id() == pid).cloned().collect();
         v.sort_by_key(|d| d.interface_number());
         v
     }
@@ -419,7 +419,7 @@ mod native {
 
             // Ajazz AJ179.
             for vid in AJ179_VIDS {
-                for info in enumerate() {
+                for info in enumerate().iter() {
                     if info.vendor_id() != vid {
                         continue;
                     }
@@ -433,7 +433,7 @@ mod native {
             }
 
             // AJAZZ AJ-series on 3151 (FFFF:0002, 65-byte feature).
-            for info in enumerate() {
+            for info in enumerate().iter() {
                 if info.vendor_id() != 0x3151 {
                     continue;
                 }

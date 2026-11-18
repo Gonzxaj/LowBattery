@@ -128,7 +128,7 @@ mod native {
     /// EC-CW collection: any vendor-ish page with 65-byte output.
     fn cw_path(vid: u16, pid: u16) -> Option<String> {
         enumerate()
-            .into_iter()
+            .iter()
             .find(|d| {
                 d.vendor_id() == vid
                     && d.product_id() == pid
@@ -139,7 +139,7 @@ mod native {
 
     /// DW: command collection FF03 (16B out) + reply FF04 (16B in).
     fn dw_paths(vid: u16, pid: u16) -> Option<(String, String)> {
-        let infos: Vec<_> = enumerate().into_iter().filter(|d| d.vendor_id() == vid && d.product_id() == pid).collect();
+        let infos: Vec<_> = enumerate().iter().filter(|d| d.vendor_id() == vid && d.product_id() == pid).cloned().collect();
         let cmd = infos.iter().find(|d| d.usage_page() == 0xFF03)?;
         let rep = infos.iter().find(|d| d.usage_page() == 0xFF04)?;
         Some((cmd.path().to_string_lossy().into_owned(), rep.path().to_string_lossy().into_owned()))
@@ -155,7 +155,7 @@ mod native {
             let mut trends = self.trends.lock().unwrap();
             let mut out = Vec::new();
             let mut pids: Vec<u16> = Vec::new();
-            for d in enumerate() {
+            for d in enumerate().iter() {
                 if d.vendor_id() == VID && !pids.contains(&d.product_id()) {
                     pids.push(d.product_id());
                 }
@@ -183,7 +183,7 @@ mod native {
                             "ZOWIE EC-CW".into()
                         } else {
                             let p = enumerate()
-                                .into_iter()
+                                .iter()
                                 .find(|d| d.vendor_id() == VID && d.product_id() == pid)
                                 .and_then(|d| d.product_string().map(str::to_string))
                                 .unwrap_or_default();

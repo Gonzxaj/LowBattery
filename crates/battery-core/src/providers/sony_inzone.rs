@@ -171,9 +171,9 @@ mod native {
 
         fn discover(&self) -> Vec<Device> {
             let infos: Vec<_> = enumerate()
-                .into_iter()
+                .iter()
                 .filter(|d| supported(d.vendor_id(), d.product_id()) && d.usage_page() == 0xFF04)
-                .collect();
+                .cloned().collect();
             let mut known = self.known.lock().unwrap();
             let mut out = Vec::new();
             let mut pids: Vec<u16> = infos.iter().map(|d| d.product_id()).collect();

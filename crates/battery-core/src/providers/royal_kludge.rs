@@ -83,7 +83,7 @@ mod native {
             let mut known = self.known.lock().unwrap();
             let mut out = Vec::new();
             let mut pids: Vec<u16> = Vec::new();
-            for d in enumerate() {
+            for d in enumerate().iter() {
                 if supported(d.vendor_id(), d.product_id()) && !pids.contains(&d.product_id()) {
                     pids.push(d.product_id());
                 }
@@ -92,7 +92,7 @@ mod native {
                 let Some((_, cable)) = product(pid) else { continue };
                 let page = if cable { 0xFFF2 } else { 0xFF00 };
                 let found = enumerate()
-                    .into_iter()
+                    .iter()
                     .filter(|d| d.vendor_id() == VID && d.product_id() == pid && d.usage_page() == page && d.usage() == 1)
                     .find_map(|d| {
                         let path = d.path().to_string_lossy().into_owned();

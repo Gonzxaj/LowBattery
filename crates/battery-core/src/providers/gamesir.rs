@@ -92,7 +92,7 @@ mod native {
             let mut known = self.known.lock().unwrap();
             let mut out = Vec::new();
             let mut pids: Vec<u16> = Vec::new();
-            for d in enumerate() {
+            for d in enumerate().iter() {
                 if d.vendor_id() == VID && (NOVA_PIDS.contains(&d.product_id()) || d.product_id() == CYCLONE2_PID) && !pids.contains(&d.product_id()) {
                     pids.push(d.product_id());
                 }
@@ -101,7 +101,7 @@ mod native {
                 let is_nova = NOVA_PIDS.contains(&pid);
                 let (page, usage) = if is_nova { (0xFF7A, 0) } else { (0xFFF0, 0x0040) };
                 let found = enumerate()
-                    .into_iter()
+                    .iter()
                     .filter(|d| d.vendor_id() == VID && d.product_id() == pid && d.usage_page() == page)
                     .find_map(|d| {
                         if !is_nova && d.usage() != usage {

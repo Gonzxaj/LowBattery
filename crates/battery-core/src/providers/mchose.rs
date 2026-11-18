@@ -139,7 +139,7 @@ mod native {
             let mut known = self.known.lock().unwrap();
             let mut out = Vec::new();
             let mut pids: Vec<u16> = Vec::new();
-            for d in &infos {
+            for d in infos.iter() {
                 if d.vendor_id() == VID_MCHOSE && !pids.contains(&d.product_id()) {
                     pids.push(d.product_id());
                 }
@@ -205,7 +205,7 @@ mod native {
             let mut out = Vec::new();
             let mut wired = None;
             let mut dongle = None;
-            for d in enumerate() {
+            for d in enumerate().iter() {
                 if !(d.vendor_id() == VID_G3 && (d.product_id() == G3_WIRED || d.product_id() == G3_DONGLE) && d.usage_page() == 0xFF01 && d.usage() == 0x0010) {
                     continue;
                 }

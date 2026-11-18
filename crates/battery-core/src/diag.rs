@@ -4,7 +4,50 @@
 use crate::monitor::DeviceState;
 use crate::{Device, DeviceKind};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
+
+thread_local! {
+    /// Per-poll memos. `Monitor::poll` bumps the HID epoch once per cycle
+    /// (`hid::native::refresh`), so `candidates()` and `usb_keys()` build
+    /// once per poll instead of once per caller. Standalone callers that
+    /// never refresh just keep epoch 0 and memoize forever — same staleness
+    /// the HID snapshot itself already has off the monitor thread.
+    static MEMO: RefCell<PollMemo> = RefCell::new(PollMemo::default());
+}
+
+#[derive(Default)]
+struct PollMemo {
+    epoch: Option<u64>,
+    candidates: Option<Rc<Vec<Candidate>>>,
+    keys: HashMap<String, Vec<String>>,
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+fn poll_epoch() -> u64 {
+    crate::hid::native::epoch()
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn poll_epoch() -> u64 {
+    0
+}
+
+/// Runs `f` against the per-epoch memo, resetting it when the HID snapshot
+/// was rebuilt. `f` gets `&mut PollMemo` and must return the memoized value.
+fn with_memo<T>(f: impl FnOnce(&mut PollMemo) -> T) -> T {
+    let epoch = poll_epoch();
+    MEMO.with(|cell| {
+        let mut m = cell.borrow_mut();
+        if m.epoch != Some(epoch) {
+            m.epoch = Some(epoch);
+            m.candidates = None;
+            m.keys.clear();
+        }
+        f(&mut m)
+    })
+}
 
 /// Full snapshot of vendor HID interfaces and the OS battery nodes
 /// (Bluetooth devnodes on Windows, power_supply on Linux).
@@ -12,7 +55,7 @@ pub fn diagnostics() -> Value {
     #[cfg(any(windows, target_os = "linux"))]
     {
         let hid: Vec<Value> = crate::hid::native::enumerate()
-            .into_iter()
+            .iter()
             .filter(|d| {
                 use crate::providers::keyboards::{USAGE, USAGE_PAGE};
                 VENDORS.contains(&d.vendor_id()) || (d.usage_page(), d.usage()) == (USAGE_PAGE, USAGE)
@@ -91,6 +134,17 @@ pub fn usb_key(path: &str) -> Option<String> {
 /// Linux sysfs paths name each HID node `BBBB:VVVV:PPPP.NNNN` (a receiver
 /// and its paired device both appear), and `/dev/hidrawN` resolves to one.
 pub fn usb_keys(locator: &str) -> Vec<String> {
+    with_memo(|m| {
+        if let Some(k) = m.keys.get(locator) {
+            return k.clone();
+        }
+        let v = usb_keys_fresh(locator);
+        m.keys.insert(locator.to_string(), v.clone());
+        v
+    })
+}
+
+fn usb_keys_fresh(locator: &str) -> Vec<String> {
     let mut out = Vec::new();
     for field in locator.split('\t') {
         out.extend(usb_key(field));
@@ -118,8 +172,8 @@ impl UnsupportedReporter {
         // Generic cards carry no battery protocol either: keep reporting them.
         let handled: HashSet<String> =
             shown.iter().filter(|s| s.device.provider != GENERIC).flat_map(|s| usb_keys(&s.device.locator)).collect();
-        for c in candidates() {
-            if !handled.contains(&c.key) && !has_protocol(&c) && self.reported.insert(c.key.clone()) {
+        for c in candidates().iter() {
+            if !handled.contains(&c.key) && !has_protocol(c) && self.reported.insert(c.key.clone()) {
                 log::info!(
                     "UNSUPPORTED peripheral {} \"{}\" by \"{}\" collections [{}] - detected but no battery protocol for it yet. \
                      If it is wireless and should show up, send this log file to add support.",
@@ -142,16 +196,16 @@ pub const GENERIC: &str = "generic";
 pub fn generic_devices(shown: &[Device]) -> Vec<Device> {
     let handled: HashSet<String> = shown.iter().flat_map(|d| usb_keys(&d.locator)).collect();
     candidates()
-        .into_iter()
+        .iter()
         .filter(|c| !handled.contains(&c.key) && !has_protocol(c) && looks_wireless(&c.product))
         .map(|c| Device {
             id: format!("{GENERIC}:{}", c.key),
             kind: generic_kind(&c.product, &c.cols),
-            name: c.product,
-            vendor: c.manufacturer,
+            name: c.product.clone(),
+            vendor: c.manufacturer.clone(),
             model: None,
             provider: GENERIC,
-            locator: c.key,
+            locator: c.key.clone(),
         })
         .collect()
 }
@@ -195,11 +249,24 @@ pub struct Candidate {
     pub cols: Vec<String>,
 }
 
+/// Peripheral candidates for this poll, shared between `generic_devices`
+/// and `UnsupportedReporter::check` (both run once per `Monitor::poll`).
+fn candidates() -> Rc<Vec<Candidate>> {
+    with_memo(|m| {
+        if let Some(c) = &m.candidates {
+            return c.clone();
+        }
+        let c = Rc::new(candidates_fresh());
+        m.candidates = Some(c.clone());
+        c
+    })
+}
+
 #[cfg(any(windows, target_os = "linux"))]
-fn candidates() -> Vec<Candidate> {
+fn candidates_fresh() -> Vec<Candidate> {
     use std::collections::BTreeMap;
     let mut by_key: BTreeMap<String, Candidate> = BTreeMap::new();
-    for d in crate::hid::native::enumerate() {
+    for d in crate::hid::native::enumerate().iter() {
         #[cfg(windows)]
         let Some(key) = usb_key(&d.path().to_string_lossy()) else { continue };
         // hidraw paths carry no ids; hidapi reads them from sysfs.
@@ -217,7 +284,7 @@ fn candidates() -> Vec<Candidate> {
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
-fn candidates() -> Vec<Candidate> {
+fn candidates_fresh() -> Vec<Candidate> {
     Vec::new()
 }
 

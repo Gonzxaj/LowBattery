@@ -357,9 +357,9 @@ mod native {
 
     fn collections(vid: u16, pid: u16) -> Vec<hidapi::DeviceInfo> {
         let mut cols: Vec<_> = enumerate()
-            .into_iter()
+            .iter()
             .filter(|d| d.vendor_id() == vid && d.product_id() == pid)
-            .collect();
+            .cloned().collect();
         cols.sort_by_key(|d| d.interface_number());
         cols
     }

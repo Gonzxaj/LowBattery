@@ -540,7 +540,7 @@ mod native {
             // Devices that answered now, then silent receiver slots shown as asleep.
             let (mut found, mut silent): (Vec<Device>, Vec<Device>) = (Vec::new(), Vec::new());
             let mut known = self.known.lock().unwrap();
-            let interfaces: Vec<_> = enumerate().into_iter().filter(is_hidpp_collection).collect();
+            let interfaces: Vec<_> = enumerate().iter().filter(|d| is_hidpp_collection(d)).cloned().collect();
             for info in &interfaces {
                 let path = info.path().to_string_lossy().into_owned();
                 let Some(io) = open(&path) else { continue };
@@ -581,9 +581,9 @@ mod native {
         /// platform through hidraw/hidapi.
         fn discover_g435(&self, out: &mut Vec<Device>) {
             let infos: Vec<_> = enumerate()
-                .into_iter()
+                .iter()
                 .filter(|d| g435::supported(d.vendor_id(), d.product_id()) && d.usage_page() == 0xFF00 && d.usage() == 0x0001)
-                .collect();
+                .cloned().collect();
             if infos.is_empty() {
                 self.g435_known.lock().unwrap().take();
                 return;
